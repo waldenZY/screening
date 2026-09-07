@@ -8,6 +8,8 @@
 
 三个分支共享模型并发上限、Prompt 快照、日志、运行清单和最终发布门禁。P1 补样审核的是新候选，不会重新审核旧 REJECT，也不会降低统一质检标准。
 
+实现方案文档： [v0 历史链路](artifacts/docs/screening_pipeline_technical_design_v0.md) · [v1 当前链路](artifacts/docs/screening_pipeline_technical_design_v1.md)
+
 ## 一键运行
 
 先配置 OpenAI 兼容模型服务：
