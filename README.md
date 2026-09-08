@@ -12,12 +12,15 @@
 
 ## 一键运行
 
-先配置 OpenAI 兼容模型服务：
+先安装运行依赖，并复制唯一的本地 LLM 配置模板：
 
 ```powershell
-$env:LLM_API_URL = "https://example.test/v1/chat/completions"
-$env:LLM_API_KEY = "..."
+python -m pip install -r filter_v2/requirements.txt
+Copy-Item filter_v2/artifacts/config/llm_config.example.json `
+  filter_v2/artifacts/config/llm_config.local.json
 ```
+
+然后在 `llm_config.local.json` 中填写 API URL、Key、模型和固定请求参数。该文件已被 Git 忽略；所有命令只读取这一处，不读取环境变量。
 
 然后提供周数据、taxonomy 和 cluster 全集：
 
@@ -175,7 +178,9 @@ REVIEW 必须填写 `TESTABLE_DIFFICULTY` 或 `UNUSABLE`；非 REVIEW 必须为 
 
 ## 配置与诊断
 
-默认配置位于 `artifacts/config/pipeline.default.json`。优先级为 `CLI > --config 指定 JSON > 包内默认配置`。常用 P1 覆盖参数包括：
+链路配置位于 `artifacts/config/pipeline.default.json`，优先级为 `CLI > --config 指定 JSON > 包内默认配置`。LLM 连接、模型、`max_tokens`、超时和流式选项统一位于被忽略的 `artifacts/config/llm_config.local.json`，不接受 CLI 或环境变量覆盖。
+
+常用 P1 覆盖参数包括：
 
 - `--p1-supplement/--no-p1-supplement`
 - `--p1-alpha`

@@ -33,9 +33,6 @@ def setup_logger(
     logger = logging.getLogger(name)
     logger.setLevel(numeric_level)
     logger.propagate = False
-
-    # Reconfiguration is common in tests and CLI entry points. Only replace
-    # handlers created by this module, leaving application-owned handlers alone.
     for handler in list(logger.handlers):
         if getattr(handler, _HANDLER_MARKER, False):
             logger.removeHandler(handler)
@@ -45,7 +42,6 @@ def setup_logger(
         f"%(asctime)s [%(levelname)s] [{run_id}] [{stage}] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(numeric_level)
     console_handler.setFormatter(formatter)
@@ -60,5 +56,4 @@ def setup_logger(
         file_handler.setFormatter(formatter)
         setattr(file_handler, _HANDLER_MARKER, True)
         logger.addHandler(file_handler)
-
     return logger

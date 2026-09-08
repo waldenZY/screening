@@ -31,7 +31,7 @@ from .core import (
 )
 from .cluster_index import identity_sha256, read_indexed_record, record_sha256
 from .coverage import TaxonomyMappings, load_taxonomy_mappings, stable_take
-from .shared import setup_logger
+from .logging_config import setup_logger
 
 logger = logging.getLogger(__name__)
 

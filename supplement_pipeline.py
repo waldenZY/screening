@@ -42,20 +42,13 @@ from .coverage import (
     allocate_largest_remainder,
     load_taxonomy_mappings,
 )
-from .inference import LlmCall, run_inference_batch, validate_llm_environment
-from .shared import chat_completion, setup_logger
+from .inference import LlmCall, run_inference_batch
+from .llm_client import load_llm_config, validate_llm_dependency
+from .logging_config import setup_logger
 
 logger = logging.getLogger(__name__)
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_PROMPT_PATH = PACKAGE_DIR / "artifacts" / "prompts" / "validity_filter_prompt.md"
-DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Flash/Cluster-1"
-DEFAULT_LLM_OPTIONS: JsonObject = {
-    "max_tokens": 32_768,
-    "timeout": 300.0,
-    "stream": True,
-    "enable_thinking": False,
-    "skip_special_tokens": False,
-}
 RoundCallback = Callable[[list[JsonObject]], None]
 
 
@@ -454,13 +447,13 @@ def run_supplement(
     min_pass_rate: float = 0.10,
     max_pass_rate: float = 0.95,
     safety_factor: float = 1.10,
-    model: str = DEFAULT_MODEL,
+    model: str,
     workers: int = 3,
     sleep_sec: float = 1.0,
     max_retries: int = 3,
-    llm_options: JsonObject | None = None,
+    llm_options: JsonObject,
     stage_logger: logging.Logger | None = None,
-    llm_call: LlmCall = chat_completion,
+    llm_call: LlmCall,
     round_callback: RoundCallback | None = None,
     prepared: PreparedSupplement | None = None,
 ) -> SupplementOutcome:
@@ -604,7 +597,7 @@ def run_supplement(
             workers=workers,
             sleep_sec=sleep_sec,
             max_retries=max_retries,
-            llm_options=llm_options or DEFAULT_LLM_OPTIONS,
+            llm_options=llm_options,
             selected_sets=["P1"],
             logger=active_logger,
             llm_call=llm_call,
@@ -742,7 +735,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--taxonomy", type=Path, required=True)
     parser.add_argument("--upstream-cluster-population", type=Path, required=True)
     parser.add_argument("--prompt", type=Path, default=DEFAULT_PROMPT_PATH)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--target-n", type=positive_int, default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -755,11 +747,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=positive_int, default=3)
     parser.add_argument("--sleep", type=non_negative_float, default=1.0)
     parser.add_argument("--max-retries", type=positive_int, default=3)
-    parser.add_argument("--max-tokens", type=positive_int, default=32_768)
-    parser.add_argument("--timeout", type=non_negative_float, default=300.0)
-    parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--skip-special-tokens", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     parser.add_argument("--log-file", type=Path, default=None)
     return parser.parse_args()
@@ -776,7 +763,8 @@ def main() -> int:
         __name__, args.log_level, log_path, run_id=run_root.name, stage="p1_coverage"
     )
     try:
-        validate_llm_environment()
+        llm_config = load_llm_config()
+        validate_llm_dependency()
         outcome = run_supplement(
             source_root, run_root,
             taxonomy_path=args.taxonomy,
@@ -791,16 +779,13 @@ def main() -> int:
             min_pass_rate=args.min_pass_rate,
             max_pass_rate=args.max_pass_rate,
             safety_factor=args.safety_factor,
-            model=args.model,
+            model=llm_config.model,
             workers=args.workers,
             sleep_sec=args.sleep,
             max_retries=args.max_retries,
-            llm_options={
-                "max_tokens": args.max_tokens, "timeout": args.timeout,
-                "stream": args.stream, "enable_thinking": args.enable_thinking,
-                "skip_special_tokens": args.skip_special_tokens,
-            },
+            llm_options=llm_config.options(),
             stage_logger=active_logger,
+            llm_call=llm_config.bind(),
         )
         return 0 if outcome.complete else 2
     except (OSError, ValueError, RuntimeError, KeyError) as exc:

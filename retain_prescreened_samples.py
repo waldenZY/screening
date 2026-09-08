@@ -27,7 +27,7 @@ from .core import (
     validate_source_run_roots,
     write_jsonl,
 )
-from .shared import setup_logger
+from .logging_config import setup_logger
 from .coverage import load_taxonomy_mappings
 
 logger = logging.getLogger(__name__)

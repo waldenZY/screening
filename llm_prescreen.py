@@ -24,24 +24,15 @@ from .core import (
     validate_selected_sets,
     validate_source_run_roots,
 )
-from .inference import BatchOutcome, LlmCall, run_inference_batch, validate_llm_environment
-from .shared import chat_completion, setup_logger
+from .inference import BatchOutcome, LlmCall, run_inference_batch
+from .llm_client import load_llm_config, validate_llm_dependency
+from .logging_config import setup_logger
 
 logger = logging.getLogger(__name__)
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_PROMPT_PATH = (
     PACKAGE_DIR / "artifacts" / "prompts" / "validity_filter_prompt.md"
 )
-DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Flash/Cluster-1"
-DEFAULT_LLM_OPTIONS: JsonObject = {
-    "max_tokens": 32_768,
-    "timeout": 300.0,
-    "stream": True,
-    "enable_thinking": False,
-    "skip_special_tokens": False,
-}
-
-
 def render_record(
     set_name: str,
     source_line: int,
@@ -105,9 +96,9 @@ def run_prescreen(
     sleep_sec: float,
     max_retries: int,
     limit: int,
-    llm_options: JsonObject | None = None,
+    llm_options: JsonObject,
     stage_logger: logging.Logger | None = None,
-    llm_call: LlmCall = chat_completion,
+    llm_call: LlmCall,
 ) -> BatchOutcome:
     """Execute or resume pre-screening inside ``run_root``."""
     source_root, run_root = validate_source_run_roots(source_root, run_root)
@@ -135,7 +126,7 @@ def run_prescreen(
                 workers=workers,
                 sleep_sec=sleep_sec,
                 max_retries=max_retries,
-                llm_options=llm_options or DEFAULT_LLM_OPTIONS,
+                llm_options=llm_options,
                 selected_sets=[set_name],
                 logger=active_logger,
                 llm_call=llm_call,
@@ -158,7 +149,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-root", type=Path, required=True, help="只读原始周目录")
     parser.add_argument("--run-root", type=Path, required=True, help="运行工作目录")
     parser.add_argument("--prompt", type=Path, default=DEFAULT_PROMPT_PATH)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--sets", default="P0,P1,P2")
     parser.add_argument(
         "--scores",
@@ -173,19 +163,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sleep", type=non_negative_float, default=1.0)
     parser.add_argument("--max-retries", type=positive_int, default=3)
     parser.add_argument("--limit", type=non_negative_int, default=0)
-    parser.add_argument("--max-tokens", type=positive_int, default=32_768)
-    parser.add_argument("--timeout", type=non_negative_float, default=300.0)
-    parser.add_argument(
-        "--stream", action=argparse.BooleanOptionalAction, default=True
-    )
-    parser.add_argument(
-        "--enable-thinking", action=argparse.BooleanOptionalAction, default=False
-    )
-    parser.add_argument(
-        "--skip-special-tokens",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
     parser.add_argument("--generate-only", action="store_true")
     parser.add_argument(
         "--log-level",
@@ -234,7 +211,8 @@ def main() -> int:
             active_logger.info("预筛任务总数: %d", len(records))
             active_logger.info("各集合任务数: %s", dict(Counter(r["set"] for r in records)))
             return 0
-        validate_llm_environment()
+        llm_config = load_llm_config()
+        validate_llm_dependency()
         outcome = run_prescreen(
             source_root,
             run_root,
@@ -242,19 +220,14 @@ def main() -> int:
             scores=args.scores,
             scores_by_set=scores_by_set,
             prompt_path=args.prompt.expanduser().resolve(),
-            model=args.model,
+            model=llm_config.model,
             workers=args.workers,
             sleep_sec=args.sleep,
             max_retries=args.max_retries,
             limit=args.limit,
-            llm_options={
-                "max_tokens": args.max_tokens,
-                "timeout": args.timeout,
-                "stream": args.stream,
-                "enable_thinking": args.enable_thinking,
-                "skip_special_tokens": args.skip_special_tokens,
-            },
+            llm_options=llm_config.options(),
             stage_logger=active_logger,
+            llm_call=llm_config.bind(),
         )
         active_logger.info(
             "预筛完成度: expected=%d, existing=%d, new=%d, parse_fail=%d, call_fail=%d",

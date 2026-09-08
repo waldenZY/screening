@@ -36,7 +36,7 @@ from .coverage import load_taxonomy_mappings
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = PACKAGE_DIR / "outputs"
 DEFAULT_CONFIG_PATH = PACKAGE_DIR / "artifacts" / "config" / "pipeline.default.json"
-PIPELINE_VERSION = 4
+PIPELINE_VERSION = 5
 _MANIFEST_LOCK = threading.RLock()
 
 INCOMPLETE_STATUSES = {"created", "running", "incomplete", "publish_failed"}
@@ -134,10 +134,16 @@ def _validate_config(config: JsonObject) -> None:
         for key, nested in value.items():
             normalized = str(key).lower().replace("-", "_")
             if normalized in {"api_key", "llm_api_key", "authorization"}:
-                raise ValueError(f"{location}.{key} 不得写入配置；请使用环境变量")
+                raise ValueError(
+                    f"{location}.{key} 不得写入链路配置；请填写 llm_config.local.json"
+                )
             reject_secrets(nested, f"{location}.{key}")
 
     reject_secrets(config)
+    if "llm" in config:
+        raise ValueError(
+            "llm 分组已移至 artifacts/config/llm_config.local.json"
+        )
     required = {
         "common",
         "inputs",
@@ -145,7 +151,6 @@ def _validate_config(config: JsonObject) -> None:
         "p0",
         "p1_coverage",
         "p2",
-        "llm",
         "publication",
         "large_inputs",
     }
@@ -161,8 +166,12 @@ def _validate_config(config: JsonObject) -> None:
     resolve_selected_sets(config)
 
     qc = config["quality_control"]
-    if not str(qc.get("prompt") or "").strip() or not str(qc.get("model") or "").strip():
-        raise ValueError("quality_control.prompt/model 不能为空")
+    if "model" in qc:
+        raise ValueError(
+            "quality_control.model 已移至 artifacts/config/llm_config.local.json"
+        )
+    if not str(qc.get("prompt") or "").strip():
+        raise ValueError("quality_control.prompt 不能为空")
     for key in ("workers", "max_retries"):
         if type(qc.get(key)) is not int or qc[key] < 1:
             raise ValueError(f"quality_control.{key} 必须是正整数")
@@ -219,14 +228,6 @@ def _validate_config(config: JsonObject) -> None:
     safety = p1.get("safety_factor")
     if not isinstance(safety, (int, float)) or safety <= 0:
         raise ValueError("p1_coverage.safety_factor 必须大于 0")
-    llm = config["llm"]
-    if type(llm.get("max_tokens")) is not int or llm["max_tokens"] < 1:
-        raise ValueError("llm.max_tokens 必须是正整数")
-    if not isinstance(llm.get("timeout"), (int, float)) or llm["timeout"] <= 0:
-        raise ValueError("llm.timeout 必须大于 0")
-    for key in ("stream", "enable_thinking", "skip_special_tokens"):
-        if type(llm.get(key)) is not bool:
-            raise ValueError(f"llm.{key} 必须是布尔值")
     if type(config["publication"].get("enabled")) is not bool:
         raise ValueError("publication.enabled 必须是布尔值")
     large = config["large_inputs"]
@@ -509,9 +510,11 @@ def _prompt_metadata(config: JsonObject) -> JsonObject:
 
 
 def compute_config_id(
-    config: JsonObject, prompts: JsonObject, inputs: JsonObject | None = None
+    config: JsonObject,
+    prompts: JsonObject,
+    inputs: JsonObject | None = None,
+    llm_metadata: JsonObject | None = None,
 ) -> str:
-    qc = config["quality_control"]
     p1 = config["p1_coverage"]
     raw_inputs = inputs or {}
     semantic_inputs: JsonObject = {}
@@ -527,14 +530,11 @@ def compute_config_id(
         "pipeline_version": PIPELINE_VERSION,
         "sets": config["common"]["sets"],
         "inputs": semantic_inputs,
-        "quality_control": {"model": qc["model"], "limit": qc["limit"]},
+        "quality_control": {"limit": config["quality_control"]["limit"]},
         "p0": config["p0"],
         "p1_coverage": p1,
         "p2": config["p2"],
-        "llm": {
-            key: config["llm"][key]
-            for key in ("max_tokens", "stream", "enable_thinking", "skip_special_tokens")
-        },
+        "llm": llm_metadata or {},
         "prompt_hashes": {name: value["sha256"] for name, value in prompts.items()},
     }
     return stable_hash(semantic, 8)
@@ -651,6 +651,7 @@ def prepare_run_context(
     *,
     run_id: str | None = None,
     new_run: bool = False,
+    llm_metadata: JsonObject | None = None,
 ) -> RunContext:
     if run_id and new_run:
         raise ValueError("--run-id 与 --new-run 不能同时使用")
@@ -666,7 +667,7 @@ def prepare_run_context(
     source = build_source_snapshot(source_root, selected_sets)
     prompts = _prompt_metadata(config)
     inputs = _input_metadata(config, selected_sets, output_root)
-    config_id = compute_config_id(config, prompts, inputs)
+    config_id = compute_config_id(config, prompts, inputs, llm_metadata)
     dataset_root = resolved_output / f"{_slug(str(source['name']))}__{source['source_id']}"
     runs_root = dataset_root / "runs"
 
@@ -713,7 +714,7 @@ def prepare_run_context(
         snapshots = _snapshot_prompts(run_root, prompts)
         now = utc_now()
         manifest: JsonObject = {
-            "schema_version": 4,
+            "schema_version": 5,
             "pipeline_version": PIPELINE_VERSION,
             "run_id": run_root.name,
             "config_id": config_id,
@@ -723,6 +724,7 @@ def prepare_run_context(
             "source": source,
             "inputs": inputs,
             "configuration": config,
+            "llm": llm_metadata or {},
             "prompts": snapshots,
             "artifacts": _artifact_map(selected_sets, config),
             "stages": {

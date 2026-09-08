@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 
 from .core import JsonObject, ensure_within, load_jsonl, set_workspace, supplement_artifact_path, write_text
-from .shared import setup_logger
+from .logging_config import setup_logger
 
 logger = logging.getLogger(__name__)
 

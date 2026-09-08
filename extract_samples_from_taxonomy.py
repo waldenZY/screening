@@ -25,7 +25,7 @@ from .coverage import (
     allocate_largest_remainder,
     load_taxonomy_mappings,
 )
-from .shared import setup_logger
+from .logging_config import setup_logger
 
 
 def distribution_snapshot(

@@ -30,7 +30,8 @@ from .core import (
     write_text,
 )
 from .generate_supplement_report import generate_report
-from .inference import LlmCall, validate_llm_environment
+from .inference import LlmCall
+from .llm_client import LlmConfig, load_llm_config, validate_llm_dependency
 from .llm_prescreen import run_prescreen
 from .publish_screened_samples import (
     publish_screened_samples,
@@ -52,7 +53,7 @@ from .run_context import (
     update_manifest,
     validate_source_unchanged,
 )
-from .shared import chat_completion, setup_logger
+from .logging_config import setup_logger
 from .supplement_pipeline import (
     PreparedSupplement,
     SupplementOutcome,
@@ -94,7 +95,7 @@ def _config_overrides(args: argparse.Namespace) -> dict[str, Any]:
         str(args.upstream_cluster_population.expanduser().resolve())
         if args.upstream_cluster_population else None,
     )
-    for key in ("model", "workers", "sleep", "max_retries", "limit"):
+    for key in ("workers", "sleep", "max_retries", "limit"):
         _set_nested(overrides, "quality_control", key, getattr(args, f"qc_{key}"))
     _set_nested(
         overrides, "quality_control", "prompt",
@@ -117,8 +118,6 @@ def _config_overrides(args: argparse.Namespace) -> dict[str, Any]:
         }
     if args.p2_scores is not None:
         _set_nested(overrides, "p2", "scores", sorted(args.p2_scores))
-    for key in ("max_tokens", "timeout", "stream", "enable_thinking", "skip_special_tokens"):
-        _set_nested(overrides, "llm", key, getattr(args, f"llm_{key}"))
     _set_nested(overrides, "publication", "enabled", args.publish)
     _set_nested(
         overrides, "large_inputs", "cluster_cache_root",
@@ -196,8 +195,10 @@ class _GlobalLlmGate:
 
     @staticmethod
     def _is_global_failure(exc: Exception) -> bool:
-        response = getattr(exc, "response", None)
-        status = getattr(response, "status_code", None)
+        status = getattr(exc, "status_code", None)
+        if not isinstance(status, int):
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
         if isinstance(status, int) and 400 <= status < 500 and status not in {408, 409, 425, 429}:
             return True
         text = str(exc).lower()
@@ -255,6 +256,8 @@ def _run_branch(
     context: RunContext,
     set_name: str,
     gated_llm: LlmCall,
+    model: str,
+    llm_options: JsonObject,
     p1_preparation: Future[PreparedSupplement] | None = None,
 ) -> BranchOutcome:
     completed = _completed_branch(context, set_name)
@@ -262,7 +265,6 @@ def _run_branch(
         return completed
     config = context.config
     qc = config["quality_control"]
-    llm_options = config["llm"]
     policy_key = {"P0": "p0", "P1": "p1_coverage", "P2": "p2"}[set_name]
     policy = config[policy_key]
     stage_logger = _stage_logger(context, f"{set_name.lower()}_branch")
@@ -276,7 +278,7 @@ def _run_branch(
             selected_sets=[set_name],
             scores_by_set={set_name: set(policy["scores"])},
             prompt_path=snapshot_prompt_path(context.run_root),
-            model=str(qc["model"]),
+            model=model,
             workers=int(qc["workers"]),
             sleep_sec=float(qc["sleep"]),
             max_retries=int(qc["max_retries"]),
@@ -349,7 +351,7 @@ def _run_branch(
                 min_pass_rate=float(policy["min_pass_rate"]),
                 max_pass_rate=float(policy["max_pass_rate"]),
                 safety_factor=float(policy["safety_factor"]),
-                model=str(qc["model"]),
+                model=model,
                 workers=int(qc["workers"]),
                 sleep_sec=float(qc["sleep"]),
                 max_retries=int(qc["max_retries"]),
@@ -491,12 +493,29 @@ def execute_pipeline(
     *,
     publish: bool,
     publish_root: Path | None = None,
-    llm_call: LlmCall = chat_completion,
-    validate_environment: bool = True,
+    llm_config: LlmConfig | None = None,
+    llm_call: LlmCall | None = None,
     verify_full_cluster_hash: bool | None = None,
 ) -> int:
     """Execute, resume, reuse, or republish a managed run."""
     config = context.config
+    if llm_config is not None:
+        model = llm_config.model
+        llm_options = llm_config.options()
+        active_llm = llm_call or llm_config.bind()
+    elif llm_call is not None:
+        # Explicit call injection is retained for deterministic tests and embedding.
+        model = "injected-llm"
+        llm_options = {
+            "max_tokens": 1,
+            "timeout": 1.0,
+            "stream": False,
+            "enable_thinking": False,
+            "skip_special_tokens": False,
+        }
+        active_llm = llm_call
+    else:
+        raise RuntimeError("未加载固定 LLM 本地配置")
     strict_cluster_hash = (
         bool(config["large_inputs"]["verify_full_cluster_hash"])
         if verify_full_cluster_hash is None
@@ -568,14 +587,12 @@ def execute_pipeline(
                     "error": None,
                 },
             )
-        if validate_environment:
-            validate_llm_environment()
         active_stage = "quality_control"
         update_manifest(
             context.run_root, status="running", stage="quality_control",
             stage_status="running", stage_details={"error": None},
         )
-        gate = _GlobalLlmGate(int(qc["workers"]), llm_call)
+        gate = _GlobalLlmGate(int(qc["workers"]), active_llm)
         outcomes: dict[str, BranchOutcome] = {}
         preparation_future: Future[PreparedSupplement] | None = None
         worker_count = len(selected_sets) + (1 if p1_needs_work else 0)
@@ -596,6 +613,8 @@ def execute_pipeline(
                     context,
                     set_name,
                     gate,
+                    model,
+                    llm_options,
                     preparation_future if set_name == "P1" else None,
                 ): set_name
                 for set_name in selected_sets
@@ -744,7 +763,6 @@ def parse_args() -> argparse.Namespace:
         "--verify-full-cluster-hash", action="store_true", default=None
     )
     parser.add_argument("--qc-prompt", type=Path, default=None)
-    parser.add_argument("--qc-model", default=None)
     parser.add_argument("--qc-workers", type=int, default=None)
     parser.add_argument("--qc-sleep", type=float, default=None)
     parser.add_argument("--qc-max-retries", type=int, default=None)
@@ -762,11 +780,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p1-safety-factor", type=float, default=None)
     parser.add_argument("--p1-supplement", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--p2-scores", type=parse_scores, default=None)
-    parser.add_argument("--llm-max-tokens", type=int, default=None)
-    parser.add_argument("--llm-timeout", type=float, default=None)
-    parser.add_argument("--llm-stream", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--llm-enable-thinking", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--llm-skip-special-tokens", action=argparse.BooleanOptionalAction, default=None)
     return parser.parse_args()
 
 
@@ -786,9 +799,13 @@ def main() -> int:
                 "cluster full scan/index NOT performed"
             )
             return 0
+        llm_config = load_llm_config()
+        if not args.prepare_only:
+            validate_llm_dependency()
         context = prepare_run_context(
             args.source_root, args.output_root, config,
             run_id=args.run_id, new_run=args.new_run,
+            llm_metadata=llm_config.public_metadata(),
         )
         if args.prepare_only:
             handle = ensure_context_cluster_index(context)
@@ -813,6 +830,7 @@ def main() -> int:
             context,
             publish=bool(config["publication"]["enabled"]),
             publish_root=args.publish_root,
+            llm_config=llm_config,
             verify_full_cluster_hash=args.verify_full_cluster_hash,
         )
     except (OSError, ValueError, RuntimeError, KeyError) as exc:

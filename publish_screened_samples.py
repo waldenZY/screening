@@ -42,7 +42,7 @@ from .run_context import (
     utc_now,
     validate_source_unchanged,
 )
-from .shared import setup_logger
+from .logging_config import setup_logger
 
 
 def _load_manifest(run_root: Path) -> JsonObject:

@@ -9,7 +9,6 @@
   },
   "quality_control": {
     "prompt": "../prompts/validity_filter_prompt.md",
-    "model": "deepseek-ai/DeepSeek-V4-Flash/Cluster-1",
     "workers": 2,
     "sleep": 1.0,
     "max_retries": 3,
@@ -38,13 +37,6 @@
     "scores": [3, 4, 5],
     "accept": ["KEEP", "TESTABLE_DIFFICULTY_REVIEW"],
     "supplement": {"enabled": false, "strategy": "none"}
-  },
-  "llm": {
-    "max_tokens": 32768,
-    "timeout": 300.0,
-    "stream": true,
-    "enable_thinking": false,
-    "skip_special_tokens": false
   },
   "large_inputs": {
     "cluster_cache_root": null,

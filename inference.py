@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import time
 import uuid
@@ -22,7 +21,6 @@ from .core import (
     validate_qc_result,
     write_jsonl,
 )
-from .shared import chat_completion
 
 TERMINAL_DECISIONS = {"KEEP", "REJECT", "REVIEW"}
 LlmCall = Callable[..., tuple[str, float, float]]
@@ -44,21 +42,15 @@ class BatchOutcome:
         return not self.engineering_failures and self.fatal_error is None
 
 
-def validate_llm_environment() -> None:
-    """Fail before scheduling calls when required endpoint configuration is absent."""
-    for name in ("LLM_API_URL", "LLM_API_KEY"):
-        value = os.getenv(name, "")
-        if not value or value == "xxxx":
-            raise RuntimeError(f"缺少配置：请设置环境变量 {name}")
-
-
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def _classify_exception(exc: Exception) -> tuple[str, bool]:
-    response = getattr(exc, "response", None)
-    status_code = getattr(response, "status_code", None)
+    status_code = getattr(exc, "status_code", None)
+    if not isinstance(status_code, int):
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
     if isinstance(status_code, int):
         if 400 <= status_code < 500 and status_code not in {408, 409, 425, 429}:
             return f"http_{status_code}", True
@@ -235,10 +227,12 @@ def run_inference_batch(
     llm_options: JsonObject,
     selected_sets: list[str],
     logger: logging.Logger,
-    llm_call: LlmCall = chat_completion,
+    llm_call: LlmCall | None = None,
     result_validator: ResultValidator = validate_qc_result,
 ) -> BatchOutcome:
     """Run pending records, append attempts, and atomically materialize terminals."""
+    if llm_call is None:
+        raise RuntimeError("未绑定 LLM 客户端")
     canonical = _canonical_by_id(results_path)
     for filter_id, existing in canonical.items():
         valid, _, error = result_validator(existing.get("parsed_result"))
