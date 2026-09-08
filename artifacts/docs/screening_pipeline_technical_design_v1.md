@@ -94,7 +94,10 @@ Cluster 严格预检必须在任何模型调用前完成。之后三个分支并
 - Cluster 行数不覆盖 taxonomy Population；
 - `frequency` 只进入诊断，不参与配额；
 - `cluster_prob` 不参与 Population、配额或默认抽样；
-- 噪音簇和未映射 Cluster 不进入配额或候选池。
+- 噪音簇和 taxonomy 未映射 Cluster 不进入配额或候选池；
+- taxonomy-only Cluster 保留所在 L1 的 Population 与配额，候选不足按既有短缺逻辑处理；
+- taxonomy `_meta` 仅原样审计，不从 `coverage`、`assigned`、`total` 等字段推断 Cluster 完整覆盖；
+- L2 `size` 与父 L1 `total_size` 的差异仅作诊断，因为没有上游文档证明两者同口径。
 
 #### L1 权重与整数配额
 
@@ -278,6 +281,8 @@ QUALIFIED + quota
 - UTF-8、空行、CRLF 和 JSONL 校验；
 - 物理行号、字节偏移和字节长度记录；
 - taxonomy 映射、噪音和未映射统计；
+- taxonomy/Cluster 双向 ID 差集与 ID 类型分布；
+- Cluster ID、目标 Query、去重身份和身份冲突校验；
 - frequency、行数和 taxonomy 总量诊断；
 - 身份去重；
 - SQLite 候选定位索引写入。
@@ -307,6 +312,7 @@ SQLite 不复制完整 JSON，只保存：
 - 运行中默认保留至少 1GB 安全余量；
 - 每 10 万条记录输出行数、字节数、吞吐量、耗时、预计剩余时间、索引大小和磁盘余量；
 - taxonomy、seed 或索引语义版本变化时建立兼容的新索引。
+- 同一 source 的旧索引版本只删除缓存根目录内的生成数据库，保留失效元数据，避免同时占用两份大索引空间。
 
 ### 5.4 定点读取与清理
 
@@ -344,6 +350,7 @@ P0、P1、P2 分支并行，但共享一个全局信号量。配置的 worker �
 ```text
 run_root/
 ├── manifest.json
+├── input_audit.json
 ├── logs/pipeline.log
 ├── prompts/validity_filter_prompt.md
 ├── screening_summary.json
@@ -404,6 +411,7 @@ P1 最终构建同步生成来源账本，每条最终样本记录：
 | 产物 | 职责 |
 |---|---|
 | `manifest.json` | 整条运行的输入、哈希、配置、阶段状态、产物和发布状态 |
+| `input_audit.json` | 原始 taxonomy `_meta`、实际统计、双向差集、字段质量与固定业务口径 |
 | 总体 screening summary | P0/P1/P2 的输入、判断和最终数量汇总 |
 | P1 supplement summary | Population、配额、通过率、逐轮补样、最终缺口和停止原因 |
 | Markdown 报告 | 面向人工核查的集合结果、P1 L1 配额/缺口、轮次、L2 与 Cluster 诊断 |

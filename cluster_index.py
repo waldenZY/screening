@@ -16,14 +16,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .core import JsonObject, record_fingerprint, sample_identity, stable_hash, write_json
-from .coverage import L1_ONLY, TaxonomyMappings, _declares_full_coverage
+from .core import (
+    JsonObject,
+    build_cluster_candidate,
+    record_fingerprint,
+    sample_identity,
+    stable_hash,
+    write_json,
+)
+from .coverage import L1_ONLY, TaxonomyMappings
 
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 DATABASE_NAME = "cluster_index.sqlite"
 BUILDING_DATABASE_NAME = "cluster_index.building.sqlite"
 METADATA_NAME = "metadata.json"
+INPUT_AUDIT_NAME = "input_audit.json"
 LOCK_NAME = "build.lock"
+MAX_ISSUE_SAMPLES = 20
 
 
 @dataclass(frozen=True)
@@ -230,7 +239,10 @@ def _initialize(connection: sqlite3.Connection, source: JsonObject) -> None:
             value TEXT NOT NULL
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS seen (
-            identity_sha256 TEXT PRIMARY KEY
+            identity_sha256 TEXT PRIMARY KEY,
+            target_sha256 TEXT NOT NULL,
+            cluster_json TEXT NOT NULL,
+            source_line INTEGER NOT NULL
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS candidates (
             identity_sha256 TEXT PRIMARY KEY,
@@ -271,6 +283,13 @@ def _initialize(connection: sqlite3.Connection, source: JsonObject) -> None:
         "frequency_sum": 0.0,
         "mapped_frequency_sum": 0.0,
         "invalid_frequency_rows": 0,
+        "invalid_records": 0,
+        "empty_query_rows": 0,
+        "empty_identity_rows": 0,
+        "dangerous_duplicate_rows": 0,
+        "cluster_id_type_counts": {"integer": 0, "string": 0},
+        "invalid_field_counts": {},
+        "issue_samples": [],
     }
     connection.execute(
         "INSERT OR IGNORE INTO build_state(key, value) VALUES('checkpoint', ?)",
@@ -315,20 +334,140 @@ def _disk_free(path: Path) -> int:
     return shutil.disk_usage(path).free
 
 
+def _record_contract_issue(
+    checkpoint: JsonObject,
+    *,
+    line: int,
+    code: str,
+    cluster_id: Any = None,
+    related_line: int | None = None,
+) -> None:
+    checkpoint["invalid_records"] = int(checkpoint.get("invalid_records", 0)) + 1
+    field_counts = checkpoint.setdefault("invalid_field_counts", {})
+    for issue_code in code.split(","):
+        field_counts[issue_code] = int(field_counts.get(issue_code, 0)) + 1
+    samples = checkpoint.setdefault("issue_samples", [])
+    if isinstance(samples, list) and len(samples) < MAX_ISSUE_SAMPLES:
+        sample: JsonObject = {"source_line": line, "code": code}
+        if cluster_id is not None and isinstance(cluster_id, (int, str)):
+            sample["cluster"] = cluster_id
+        if related_line is not None:
+            sample["related_source_line"] = related_line
+        samples.append(sample)
+
+
+def _taxonomy_audit(mappings: TaxonomyMappings) -> JsonObject:
+    return {
+        "file": mappings.source_path,
+        "meta": mappings.meta,
+        "computed": {
+            "l1_count": len(mappings.l1_population),
+            "l2_count": len(mappings.l2_population),
+            "assigned_cluster_count": len(mappings.cluster_to_l1),
+            "cluster_id_type": mappings.cluster_id_type,
+            "l1_total_size_sum": sum(mappings.l1_population.values()),
+            "l2_size_sum": sum(mappings.l2_population.values()),
+        },
+        "l2_size_differences": mappings.l2_size_differences,
+        "meta_semantics": "opaque_unverified",
+    }
+
+
+def _input_audit(
+    mappings: TaxonomyMappings,
+    population: JsonObject,
+    source: JsonObject,
+) -> JsonObject:
+    unmapped = population.get("unmapped_clusters", {})
+    missing = population.get("missing_taxonomy_clusters", [])
+    return {
+        "schema_version": 1,
+        "taxonomy": _taxonomy_audit(mappings),
+        "cluster": {
+            "file": source.get("path"),
+            **{
+                key: population.get(key)
+                for key in (
+                    "physical_lines",
+                    "total_rows",
+                    "observed_cluster_count",
+                    "mapped_cluster_count",
+                    "unique_rows",
+                    "duplicate_rows",
+                    "mapped_rows",
+                    "unmapped_rows",
+                    "noise_rows",
+                    "invalid_frequency_rows",
+                    "cluster_id_type_counts",
+                    "invalid_records",
+                    "empty_query_rows",
+                    "empty_identity_rows",
+                    "dangerous_duplicate_rows",
+                    "invalid_field_counts",
+                    "issue_samples",
+                )
+            },
+        },
+        "mapping": {
+            "cluster_only_count": len(unmapped) if isinstance(unmapped, dict) else 0,
+            "cluster_only": unmapped,
+            "taxonomy_only_count": len(missing) if isinstance(missing, list) else 0,
+            "taxonomy_only": missing,
+        },
+        "assumptions": {
+            "population_basis": "taxonomy.categories[].total_size",
+            "target_n_basis": "all P1 JSONL records when target_n is null",
+            "dedup_basis": "session_id/session + text/target_query/raw_query",
+            "unmapped_cluster_policy": "warn_and_exclude",
+        },
+    }
+
+
+def _warn_mapping_differences(
+    logger: logging.Logger,
+    population: JsonObject,
+    audit_path: Path,
+) -> None:
+    unmapped = population.get("unmapped_clusters", {})
+    missing = population.get("missing_taxonomy_clusters", [])
+    if isinstance(unmapped, dict) and unmapped:
+        top = sorted(
+            unmapped.items(),
+            key=lambda item: (-int(item[1]), str(item[0])),
+        )[:MAX_ISSUE_SAMPLES]
+        logger.warning(
+            "cluster 存在 %d 个 taxonomy 未映射 ID、%d 条去重记录，已排除；top20=%s；审计=%s",
+            len(unmapped),
+            int(population.get("unmapped_rows", 0)),
+            top,
+            audit_path,
+        )
+    if isinstance(missing, list) and missing:
+        logger.warning(
+            "taxonomy 存在 %d 个 cluster 文件未观测 ID；top20=%s；审计=%s",
+            len(missing),
+            missing[:MAX_ISSUE_SAMPLES],
+            audit_path,
+        )
+
+
 def _invalidate_changed_source_caches(
     cache_root: Path,
     current_source: JsonObject,
     current_cache_dir: Path,
 ) -> None:
-    """Remove unusable large DBs for the same path after immutable input changed."""
+    """Remove only generated stale DBs for this source and retain invalidation metadata."""
     for directory in cache_root.iterdir():
         if not directory.is_dir() or directory == current_cache_dir or directory.name == "_io_locks":
             continue
         metadata_path = directory / METADATA_NAME
         metadata = _load_metadata(metadata_path)
         stale_source: JsonObject | None = None
+        stale_version: int | None = None
         if metadata and isinstance(metadata.get("source"), dict):
             stale_source = metadata["source"]
+            value = metadata.get("index_version")
+            stale_version = value if type(value) is int else None
         else:
             building = directory / BUILDING_DATABASE_NAME
             if building.is_file() and _quick_check(building):
@@ -337,12 +476,17 @@ def _invalidate_changed_source_caches(
                         checkpoint = _checkpoint(connection)
                     value = checkpoint.get("source")
                     stale_source = value if isinstance(value, dict) else None
+                    version = checkpoint.get("index_version")
+                    stale_version = version if type(version) is int else None
                 except (sqlite3.DatabaseError, ValueError, OSError, json.JSONDecodeError):
                     stale_source = None
         if (
             not stale_source
             or stale_source.get("path") != current_source.get("path")
-            or _same_source(stale_source, current_source)
+            or (
+                _same_source(stale_source, current_source)
+                and stale_version == INDEX_VERSION
+            )
         ):
             continue
         for name in (
@@ -355,11 +499,17 @@ def _invalidate_changed_source_caches(
             BUILDING_DATABASE_NAME + "-shm",
         ):
             (directory / name).unlink(missing_ok=True)
-        if metadata:
-            metadata["index_status"] = "invalidated_source_changed"
-            metadata["cleanup_status"] = "completed"
-            metadata["invalidated_at"] = time.time()
-            write_json(metadata_path, metadata)
+        invalidated = dict(metadata or {})
+        invalidated["source"] = stale_source
+        invalidated["index_version"] = stale_version
+        invalidated["index_status"] = (
+            "invalidated_index_version"
+            if _same_source(stale_source, current_source)
+            else "invalidated_source_changed"
+        )
+        invalidated["cleanup_status"] = "completed"
+        invalidated["invalidated_at"] = time.time()
+        write_json(metadata_path, invalidated)
 
 
 def _progress(
@@ -414,11 +564,6 @@ def _finalize_population(
         )
     }
     missing = sorted(taxonomy_clusters - observed)
-    if _declares_full_coverage(mappings.meta):
-        if unmapped:
-            raise ValueError("taxonomy 声明完整覆盖，但 cluster 全集存在非噪音未映射 cluster")
-        if missing:
-            raise ValueError("taxonomy 声明完整覆盖，但部分 assigned cluster 在全集中不存在")
 
     taxonomy_total = sum(mappings.l1_population.values())
     total_rows = int(checkpoint["total_rows"])
@@ -449,6 +594,9 @@ def _finalize_population(
         "taxonomy_meta": mappings.meta,
         "taxonomy_total": taxonomy_total,
         "total_rows": total_rows,
+        "physical_lines": int(checkpoint["physical_line"]),
+        "observed_cluster_count": len(observed),
+        "mapped_cluster_count": len(cluster_counts),
         "unique_rows": total_rows - duplicate_rows,
         "row_count_vs_taxonomy_delta": total_rows - taxonomy_total,
         "duplicate_rows": duplicate_rows,
@@ -469,6 +617,17 @@ def _finalize_population(
         "pct_differences": pct_differences,
         "l2_counts": dict(mappings.l2_population),
         "cluster_counts": cluster_counts,
+        "taxonomy_cluster_id_type": mappings.cluster_id_type,
+        "l2_size_differences": mappings.l2_size_differences,
+        "cluster_id_type_counts": dict(checkpoint.get("cluster_id_type_counts", {})),
+        "invalid_records": int(checkpoint.get("invalid_records", 0)),
+        "empty_query_rows": int(checkpoint.get("empty_query_rows", 0)),
+        "empty_identity_rows": int(checkpoint.get("empty_identity_rows", 0)),
+        "dangerous_duplicate_rows": int(
+            checkpoint.get("dangerous_duplicate_rows", 0)
+        ),
+        "issue_samples": list(checkpoint.get("issue_samples", [])),
+        "invalid_field_counts": dict(checkpoint.get("invalid_field_counts", {})),
     }
 
 
@@ -546,15 +705,6 @@ def _scan(
                             f"{source_path}:{physical_line} 必须是 JSON 对象，字节偏移 {byte_offset}"
                         )
                     checkpoint["total_rows"] += 1
-                    cluster_id = row.get("cluster")
-                    cluster_key = _cluster_key(cluster_id)
-                    is_noise = cluster_id == -1 or str(cluster_id) == "-1"
-                    if not is_noise:
-                        connection.execute(
-                            "INSERT OR IGNORE INTO observed_clusters(cluster_json) VALUES(?)",
-                            (cluster_key,),
-                        )
-
                     frequency = row.get("frequency")
                     valid_frequency = (
                         isinstance(frequency, (int, float))
@@ -567,13 +717,104 @@ def _scan(
                         else:
                             checkpoint["invalid_frequency_rows"] += 1
 
+                    cluster_id = row.get("cluster")
+                    issue_codes: list[str] = []
+                    if "cluster" not in row:
+                        issue_codes.append("missing_cluster")
+                    elif type(cluster_id) is int:
+                        cluster_type = "integer"
+                    elif isinstance(cluster_id, str) and cluster_id and cluster_id == cluster_id.strip():
+                        cluster_type = "string"
+                    else:
+                        issue_codes.append("invalid_cluster_type")
+                        cluster_type = "invalid"
+                    is_noise = cluster_id == -1 or cluster_id == "-1"
+                    cluster_key = _cluster_key(cluster_id)
+                    if not issue_codes:
+                        type_counts = checkpoint.setdefault(
+                            "cluster_id_type_counts", {"integer": 0, "string": 0}
+                        )
+                        type_counts[cluster_type] = int(type_counts.get(cluster_type, 0)) + 1
+                    if not issue_codes and not is_noise:
+                        connection.execute(
+                            "INSERT OR IGNORE INTO observed_clusters(cluster_json) VALUES(?)",
+                            (cluster_key,),
+                        )
+                        if cluster_type != mappings.cluster_id_type:
+                            issue_codes.append("cluster_id_type_mismatch")
+
+                    candidate = build_cluster_candidate(row)
+                    target_query = str(candidate.get("target_query") or "").strip()
+                    if not target_query:
+                        checkpoint["empty_query_rows"] = int(
+                            checkpoint.get("empty_query_rows", 0)
+                        ) + 1
+                        issue_codes.append("empty_target_query")
+                    identity = sample_identity(row)
+                    if not identity[0] or not identity[1]:
+                        checkpoint["empty_identity_rows"] = int(
+                            checkpoint.get("empty_identity_rows", 0)
+                        ) + 1
+                        issue_codes.append("empty_dedup_identity")
+                    if issue_codes:
+                        _record_contract_issue(
+                            checkpoint,
+                            line=physical_line,
+                            code=",".join(issue_codes),
+                            cluster_id=cluster_id,
+                        )
+                        processed_since_commit += 1
+                        if processed_since_commit >= batch_size:
+                            _save_checkpoint(connection, checkpoint)
+                            connection.commit()
+                            processed_since_commit = 0
+                            if _disk_free(building_path.parent) < reserve_free_bytes:
+                                raise OSError(
+                                    "cluster 索引工作区剩余空间低于安全余量；已保存可恢复检查点"
+                                )
+                            if int(checkpoint["total_rows"]) >= next_progress:
+                                _progress(
+                                    logger,
+                                    checkpoint=checkpoint,
+                                    started_at=started_at,
+                                    source_size=int(source_at_start["size"]),
+                                    database_path=building_path,
+                                )
+                                next_progress += progress_every
+                        continue
+
                     identity_hash = identity_sha256(row)
+                    target_hash = hashlib.sha256(target_query.encode("utf-8")).hexdigest()
                     inserted = connection.execute(
-                        "INSERT OR IGNORE INTO seen(identity_sha256) VALUES(?)",
-                        (identity_hash,),
+                        """
+                        INSERT OR IGNORE INTO seen(
+                            identity_sha256, target_sha256, cluster_json, source_line
+                        ) VALUES(?, ?, ?, ?)
+                        """,
+                        (identity_hash, target_hash, cluster_key, physical_line),
                     ).rowcount
                     if not inserted:
                         checkpoint["duplicate_rows"] += 1
+                        existing = connection.execute(
+                            """
+                            SELECT target_sha256, cluster_json, source_line
+                            FROM seen WHERE identity_sha256=?
+                            """,
+                            (identity_hash,),
+                        ).fetchone()
+                        if existing and (
+                            existing[0] != target_hash or existing[1] != cluster_key
+                        ):
+                            checkpoint["dangerous_duplicate_rows"] = int(
+                                checkpoint.get("dangerous_duplicate_rows", 0)
+                            ) + 1
+                            _record_contract_issue(
+                                checkpoint,
+                                line=physical_line,
+                                code="dedup_identity_collision",
+                                cluster_id=cluster_id,
+                                related_line=int(existing[2]),
+                            )
                     elif is_noise:
                         checkpoint["noise_rows"] += 1
                     else:
@@ -693,6 +934,7 @@ def ensure_cluster_index(
     database_path = cache_dir / DATABASE_NAME
     building_path = cache_dir / BUILDING_DATABASE_NAME
     metadata_path = cache_dir / METADATA_NAME
+    audit_path = cache_dir / INPUT_AUDIT_NAME
     lock_path = cache_dir / LOCK_NAME
     io_lock_dir = cache_root / "_io_locks"
     io_lock_dir.mkdir(parents=True, exist_ok=True)
@@ -705,19 +947,20 @@ def ensure_cluster_index(
         and metadata.get("seed") == seed
         and _same_source(metadata.get("source", {}), source)
         and isinstance(metadata.get("sha256"), str)
+        and audit_path.is_file()
+        and hashlib.sha256(audit_path.read_bytes()).hexdigest()
+        == metadata.get("input_audit_sha256")
     )
     if compatible and metadata is not None:
         samples_match = metadata.get("sample_fingerprints") == _sample_fingerprints(source_path)
         if samples_match and database_path.is_file() and _quick_check(database_path):
             metadata["index_status"] = "complete"
+            _warn_mapping_differences(active_logger, metadata["population"], audit_path)
             return ClusterIndexHandle(cache_dir, database_path, metadata_path, metadata)
         if samples_match and not require_database and metadata.get("index_status") == "deleted":
+            _warn_mapping_differences(active_logger, metadata["population"], audit_path)
             return ClusterIndexHandle(cache_dir, database_path, metadata_path, metadata)
 
-    if _disk_free(cache_dir) < min_free_bytes:
-        raise OSError(
-            f"cluster 索引工作区可用空间不足 {min_free_bytes / 1024**3:.1f} GiB: {cache_dir}"
-        )
     _acquire_lock(io_lock_path, source)
     try:
         _acquire_lock(lock_path, source)
@@ -729,6 +972,10 @@ def ensure_cluster_index(
             _invalidate_changed_source_caches(cache_root, source, cache_dir)
         except OSError as exc:
             active_logger.warning("旧 cluster 索引失效清理未完成: %s", exc)
+        if _disk_free(cache_dir) < min_free_bytes:
+            raise OSError(
+                f"cluster 索引工作区可用空间不足 {min_free_bytes / 1024**3:.1f} GiB: {cache_dir}"
+            )
         if database_path.exists() and not building_path.exists() and _quick_check(database_path):
             try:
                 with closing(sqlite3.connect(database_path)) as connection:
@@ -762,6 +1009,16 @@ def ensure_cluster_index(
             cache_mb=cache_mb,
             logger=active_logger,
         )
+        audit = _input_audit(mappings, population, source)
+        write_json(audit_path, audit)
+        invalid_records = int(population.get("invalid_records", 0))
+        if invalid_records:
+            issue_samples = population.get("issue_samples", [])
+            raise ValueError(
+                f"cluster 输入契约存在 {invalid_records} 个歧义问题（文件 {source_path}）；"
+                f"样例={issue_samples!r}；审计文件: {audit_path}"
+            )
+        _warn_mapping_differences(active_logger, population, audit_path)
         database_path.unlink(missing_ok=True)
         os.replace(building_path, database_path)
         metadata = {
@@ -776,6 +1033,10 @@ def ensure_cluster_index(
             "index_status": "complete",
             "cleanup_status": "pending",
             "database": DATABASE_NAME,
+            "input_audit": INPUT_AUDIT_NAME,
+            "input_audit_sha256": hashlib.sha256(
+                audit_path.read_bytes()
+            ).hexdigest(),
             "index_size_bytes": database_path.stat().st_size,
             "population": population,
             "completed_at": time.time(),

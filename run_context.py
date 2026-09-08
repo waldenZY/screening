@@ -19,15 +19,18 @@ from .core import (
     SET_FILES,
     SUPPLEMENT_FILES,
     JsonObject,
+    build_candidate,
     ensure_within,
     iter_jsonl,
     load_prompt_template,
+    sample_identity,
     sha256_file,
     stable_hash,
     write_json,
 )
 from .cluster_index import (
     ClusterIndexHandle,
+    INPUT_AUDIT_NAME,
     ensure_cluster_index,
     validate_cluster_source,
 )
@@ -36,7 +39,7 @@ from .coverage import load_taxonomy_mappings
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = PACKAGE_DIR / "outputs"
 DEFAULT_CONFIG_PATH = PACKAGE_DIR / "artifacts" / "config" / "pipeline.default.json"
-PIPELINE_VERSION = 5
+PIPELINE_VERSION = 6
 _MANIFEST_LOCK = threading.RLock()
 
 INCOMPLETE_STATUSES = {"created", "running", "incomplete", "publish_failed"}
@@ -253,11 +256,40 @@ def resolve_selected_sets(config: JsonObject) -> list[str]:
     return selected
 
 
-def build_source_snapshot(source_root: Path, selected_sets: list[str]) -> JsonObject:
+def build_source_snapshot(
+    source_root: Path,
+    selected_sets: list[str],
+    *,
+    failure_audit_path: Path | None = None,
+) -> JsonObject:
     resolved_root = source_root.expanduser().resolve()
     if not resolved_root.is_dir():
         raise FileNotFoundError(f"原始数据目录不存在: {resolved_root}")
     files: JsonObject = {}
+    field_audit: JsonObject = {
+        "sets": {},
+        "duplicate_identities": 0,
+        "invalid_field_counts": {},
+        "issue_count": 0,
+        "issue_samples": [],
+    }
+    identity_observations: dict[tuple[str, str], tuple[str, str, str, int]] = {}
+    issues: list[JsonObject] = field_audit["issue_samples"]
+
+    def record_issue(path: Path, set_name: str, line: int, code: str, **extra: Any) -> None:
+        field_audit["issue_count"] = int(field_audit["issue_count"]) + 1
+        counts = field_audit["invalid_field_counts"]
+        counts[code] = int(counts.get(code, 0)) + 1
+        if len(issues) < 20:
+            issues.append(
+                {
+                    "file": str(path),
+                    "set": set_name,
+                    "source_line": line,
+                    "code": code,
+                    **extra,
+                }
+            )
     snapshot_sets = list(selected_sets)
     if "P1" in selected_sets:
         snapshot_sets.extend(
@@ -269,13 +301,96 @@ def build_source_snapshot(source_root: Path, selected_sets: list[str]) -> JsonOb
         path = resolved_root / SET_FILES[set_name]
         if not path.is_file():
             raise FileNotFoundError(f"缺少 {set_name} labeled 文件: {path}")
-        records = sum(1 for _ in iter_jsonl(path))
+        records = 0
+        score_counts: dict[str, int] = {}
+        nonempty_query_rows = 0
+        nonempty_identity_rows = 0
+        cluster_id_type_counts = {"integer": 0, "string": 0, "missing": 0}
+        for line, row in iter_jsonl(path):
+            records += 1
+            score = row.get("quality_overall_score")
+            if type(score) is not int or not 1 <= score <= 5:
+                record_issue(path, set_name, line, "invalid_quality_overall_score")
+            else:
+                score_counts[str(score)] = score_counts.get(str(score), 0) + 1
+            candidate = build_candidate(row)
+            target_query = str(candidate.get("target_query") or "").strip()
+            if target_query:
+                nonempty_query_rows += 1
+            else:
+                record_issue(path, set_name, line, "empty_target_query")
+            identity = sample_identity(row)
+            if identity[0] and identity[1]:
+                nonempty_identity_rows += 1
+            else:
+                record_issue(path, set_name, line, "empty_dedup_identity")
+            cluster_id = row.get("cluster")
+            if "cluster" not in row:
+                cluster_id_type_counts["missing"] += 1
+            elif type(cluster_id) is int:
+                cluster_id_type_counts["integer"] += 1
+            elif (
+                isinstance(cluster_id, str)
+                and cluster_id
+                and cluster_id == cluster_id.strip()
+            ):
+                cluster_id_type_counts["string"] += 1
+            else:
+                record_issue(path, set_name, line, "invalid_cluster_type")
+            if identity[0] and identity[1] and target_query:
+                target_hash = stable_hash(target_query)
+                cluster_key = json.dumps(cluster_id, ensure_ascii=False, sort_keys=True)
+                previous = identity_observations.get(identity)
+                if previous is None:
+                    identity_observations[identity] = (
+                        target_hash, cluster_key, set_name, line
+                    )
+                elif previous[:2] != (target_hash, cluster_key):
+                    record_issue(
+                        path,
+                        set_name,
+                        line,
+                        "dedup_identity_collision",
+                        related_set=previous[2],
+                        related_source_line=previous[3],
+                    )
+                else:
+                    field_audit["duplicate_identities"] += 1
+        field_audit["sets"][set_name] = {
+            "file": str(path),
+            "records": records,
+            "quality_score_counts": dict(sorted(score_counts.items())),
+            "valid_quality_score_rows": sum(score_counts.values()),
+            "nonempty_query_rows": nonempty_query_rows,
+            "empty_query_rows": records - nonempty_query_rows,
+            "nonempty_identity_rows": nonempty_identity_rows,
+            "empty_identity_rows": records - nonempty_identity_rows,
+            "cluster_id_type_counts": cluster_id_type_counts,
+        }
         files[set_name] = {
             "path": SET_FILES[set_name].as_posix(),
             "size": path.stat().st_size,
             "sha256": sha256_file(path),
             "records": records,
         }
+    if issues:
+        audit_suffix = ""
+        if failure_audit_path is not None:
+            resolved_audit = failure_audit_path.expanduser().resolve()
+            write_json(
+                resolved_audit,
+                {
+                    "schema_version": 1,
+                    "status": "failed",
+                    "source_root": str(resolved_root),
+                    "source": field_audit,
+                },
+            )
+            audit_suffix = f"；审计文件: {resolved_audit}"
+        raise ValueError(
+            f"source 输入契约存在 {field_audit['issue_count']} 个歧义问题；"
+            f"样例={issues!r}；未启动任何 LLM 调用{audit_suffix}"
+        )
     identity = {"source_root": str(resolved_root), "files": files}
     return {
         "name": resolved_root.name,
@@ -283,6 +398,7 @@ def build_source_snapshot(source_root: Path, selected_sets: list[str]) -> JsonOb
         "source_id": stable_hash(identity, 8),
         "sets": files,
         "selected_sets": list(selected_sets),
+        "field_audit": field_audit,
     }
 
 
@@ -380,10 +496,103 @@ def _cluster_cache_root(config: JsonObject, output_root: Path) -> Path:
     )
 
 
+def _validate_p1_source_mapping(
+    source_root: Path,
+    mappings: Any,
+    *,
+    failure_audit_path: Path | None = None,
+    source_audit: JsonObject | None = None,
+) -> JsonObject:
+    path = source_root / SET_FILES["P1"]
+    stats: JsonObject = {
+        "mapped_rows": 0,
+        "unmapped_rows": 0,
+        "rows_without_cluster_using_l1": 0,
+    }
+    issues: list[JsonObject] = []
+    issue_count = 0
+
+    def record_issue(line: int, code: str, **extra: Any) -> None:
+        nonlocal issue_count
+        issue_count += 1
+        if len(issues) < 20:
+            issues.append(
+                {
+                    "file": str(path),
+                    "source_line": line,
+                    "code": code,
+                    **extra,
+                }
+            )
+
+    for line, row in iter_jsonl(path):
+        raw_l1 = str(row.get("L1") or "").strip()
+        if "cluster" not in row:
+            if raw_l1 in mappings.l1_population:
+                stats["rows_without_cluster_using_l1"] += 1
+            else:
+                record_issue(line, "missing_cluster_and_unknown_l1")
+            continue
+        cluster_id = row.get("cluster")
+        if cluster_id in {-1, "-1"}:
+            stats["unmapped_rows"] += 1
+            continue
+        cluster_type = (
+            "integer" if type(cluster_id) is int
+            else "string" if isinstance(cluster_id, str) else "invalid"
+        )
+        if cluster_type != mappings.cluster_id_type:
+            record_issue(
+                line,
+                "cluster_id_type_mismatch",
+                cluster=cluster_id,
+            )
+            continue
+        mapped_l1 = mappings.cluster_to_l1.get(cluster_id)
+        if mapped_l1 is None:
+            stats["unmapped_rows"] += 1
+        elif raw_l1 and raw_l1 != mapped_l1:
+            record_issue(
+                line,
+                "l1_mapping_conflict",
+                cluster=cluster_id,
+            )
+        else:
+            stats["mapped_rows"] += 1
+    if issues:
+        audit_suffix = ""
+        if failure_audit_path is not None:
+            resolved_audit = failure_audit_path.expanduser().resolve()
+            write_json(
+                resolved_audit,
+                {
+                    "schema_version": 1,
+                    "status": "failed",
+                    "source_root": str(source_root),
+                    "source": source_audit or {},
+                    "p1_source_mapping": {
+                        **stats,
+                        "issue_count": issue_count,
+                        "issue_samples": issues,
+                    },
+                },
+            )
+            audit_suffix = f"；审计文件: {resolved_audit}"
+        raise ValueError(
+            f"P1 source 与 taxonomy 契约存在 {issue_count} 个歧义问题；"
+            f"样例={issues!r}；未启动任何 LLM 调用{audit_suffix}"
+        )
+    return stats
+
+
 def _input_metadata(
     config: JsonObject,
     selected_sets: list[str],
     output_root: Path,
+    source_root: Path,
+    *,
+    failure_audit_path: Path | None = None,
+    source_audit: JsonObject | None = None,
 ) -> JsonObject:
     if "P1" not in selected_sets:
         return {}
@@ -400,7 +609,34 @@ def _input_metadata(
     if not upstream_path.is_file():
         raise FileNotFoundError(f"P1 cluster 文件不存在: {upstream_path}")
     taxonomy_hash = sha256_file(taxonomy_path)
-    mappings = load_taxonomy_mappings(taxonomy_path)
+    try:
+        mappings = load_taxonomy_mappings(taxonomy_path)
+    except ValueError as exc:
+        audit_suffix = ""
+        if failure_audit_path is not None:
+            resolved_audit = failure_audit_path.expanduser().resolve()
+            write_json(
+                resolved_audit,
+                {
+                    "schema_version": 1,
+                    "status": "failed",
+                    "source_root": str(source_root),
+                    "source": source_audit or {},
+                    "taxonomy": {
+                        "file": str(taxonomy_path),
+                        "issue_count": 1,
+                        "issue_samples": [{"code": "invalid_taxonomy_contract"}],
+                    },
+                },
+            )
+            audit_suffix = f"；审计文件: {resolved_audit}"
+        raise ValueError(f"{exc}{audit_suffix}") from exc
+    p1_source_mapping = _validate_p1_source_mapping(
+        source_root,
+        mappings,
+        failure_audit_path=failure_audit_path,
+        source_audit=source_audit,
+    )
     large = config["large_inputs"]
     handle = ensure_cluster_index(
         upstream_path,
@@ -436,6 +672,7 @@ def _input_metadata(
             "metadata_size": handle.metadata_path.stat().st_size,
             "metadata_sha256": sha256_file(handle.metadata_path),
             "database_path": str(handle.database_path),
+            "input_audit_path": str(handle.cache_dir / INPUT_AUDIT_NAME),
         },
     }
     metadata["validation"] = {
@@ -447,6 +684,7 @@ def _input_metadata(
         "noise_rows": population["noise_rows"],
         "frequency_sum": population["frequency_sum"],
         "mapped_frequency_sum": population["mapped_frequency_sum"],
+        "p1_source_mapping": p1_source_mapping,
     }
     return metadata
 
@@ -548,6 +786,7 @@ def _slug(value: str) -> str:
 def _artifact_map(selected_sets: list[str], config: JsonObject) -> JsonObject:
     artifacts: JsonObject = {
         "log": "logs/pipeline.log",
+        "input_audit": "input_audit.json",
         "screening_summary": "screening_summary.json",
         "report": "supplement_report.md",
         "sets": {},
@@ -573,6 +812,55 @@ def _artifact_map(selected_sets: list[str], config: JsonObject) -> JsonObject:
                 branch["supplement"] = f"P1/{SUPPLEMENT_FILES['P1'].name}"
         artifacts["sets"][name] = branch
     return artifacts
+
+
+def _run_input_audit(source: JsonObject, inputs: JsonObject) -> JsonObject:
+    cluster = inputs.get("upstream_cluster_population")
+    if isinstance(cluster, dict):
+        cache_path = Path(str(cluster.get("input_audit_path") or ""))
+        if not cache_path.is_file():
+            raise FileNotFoundError(f"缺少 cluster 输入审计: {cache_path}")
+        audit = _read_manifest(cache_path)
+    else:
+        audit = {
+            "schema_version": 1,
+            "taxonomy": None,
+            "cluster": None,
+            "mapping": None,
+            "assumptions": {},
+        }
+    audit["source"] = source.get("field_audit", {})
+    audit["assumptions"] = {
+        **dict(audit.get("assumptions") or {}),
+        "population_basis": "taxonomy.categories[].total_size",
+        "target_n_basis": "all P1 JSONL records when target_n is null",
+        "dedup_basis": "session_id/session + text/target_query/raw_query",
+        "unmapped_cluster_policy": "warn_and_exclude",
+    }
+    validation = inputs.get("validation")
+    if isinstance(validation, dict):
+        audit["p1_source_mapping"] = validation.get("p1_source_mapping")
+    return audit
+
+
+def _input_audit_summary(audit: JsonObject) -> JsonObject:
+    taxonomy = audit.get("taxonomy")
+    computed = taxonomy.get("computed", {}) if isinstance(taxonomy, dict) else {}
+    cluster = audit.get("cluster") if isinstance(audit.get("cluster"), dict) else {}
+    mapping = audit.get("mapping") if isinstance(audit.get("mapping"), dict) else {}
+    source = audit.get("source") if isinstance(audit.get("source"), dict) else {}
+    return {
+        "actual_l1_count": computed.get("l1_count"),
+        "actual_l2_count": computed.get("l2_count"),
+        "taxonomy_cluster_count": computed.get("assigned_cluster_count"),
+        "cluster_rows": cluster.get("total_rows"),
+        "observed_cluster_count": cluster.get("observed_cluster_count"),
+        "cluster_only_count": mapping.get("cluster_only_count"),
+        "taxonomy_only_count": mapping.get("taxonomy_only_count"),
+        "cluster_invalid_records": cluster.get("invalid_records"),
+        "source_invalid_records": source.get("issue_count", 0),
+        "source_duplicate_identities": source.get("duplicate_identities", 0),
+    }
 
 
 def _read_manifest(path: Path) -> JsonObject:
@@ -644,6 +932,19 @@ def _validate_prompt_snapshots(run_root: Path, manifest: JsonObject) -> None:
         load_prompt_template(snapshot)
 
 
+def _validate_input_audit_snapshot(run_root: Path, manifest: JsonObject) -> None:
+    contract = manifest.get("input_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("manifest 缺少输入契约审计信息")
+    path = ensure_within(
+        run_root / str(contract.get("audit", "")),
+        run_root,
+        "输入审计快照",
+    )
+    if not path.is_file() or sha256_file(path) != contract.get("audit_sha256"):
+        raise ValueError(f"输入审计快照缺失或已被修改: {path}")
+
+
 def prepare_run_context(
     source_root: Path,
     output_root: Path,
@@ -661,12 +962,31 @@ def prepare_run_context(
     if resolved_output == resolved_source or resolved_output.is_relative_to(resolved_source):
         raise ValueError("output_root 不能等于或位于 source_root 内部")
     if "P1" in selected_sets:
+        for key in ("taxonomy", "upstream_cluster_population"):
+            if not str(config["inputs"].get(key) or "").strip():
+                raise ValueError(f"处理 P1 时必须配置 inputs.{key}")
         cache_root = _cluster_cache_root(config, resolved_output)
         if cache_root == resolved_source or cache_root.is_relative_to(resolved_source):
             raise ValueError("cluster_cache_root 不能等于或位于 source_root 内部")
-    source = build_source_snapshot(source_root, selected_sets)
+    failure_audit_path = (
+        resolved_output
+        / "_input_audits"
+        / f"{_slug(resolved_source.name)}__latest_failed.json"
+    )
+    source = build_source_snapshot(
+        source_root,
+        selected_sets,
+        failure_audit_path=failure_audit_path,
+    )
     prompts = _prompt_metadata(config)
-    inputs = _input_metadata(config, selected_sets, output_root)
+    inputs = _input_metadata(
+        config,
+        selected_sets,
+        output_root,
+        resolved_source,
+        failure_audit_path=failure_audit_path,
+        source_audit=source.get("field_audit", {}),
+    )
     config_id = compute_config_id(config, prompts, inputs, llm_metadata)
     dataset_root = resolved_output / f"{_slug(str(source['name']))}__{source['source_id']}"
     runs_root = dataset_root / "runs"
@@ -712,9 +1032,12 @@ def prepare_run_context(
         run_root = runs_root / _new_run_id(config_id)
         run_root.mkdir(parents=True, exist_ok=False)
         snapshots = _snapshot_prompts(run_root, prompts)
+        input_audit = _run_input_audit(source, inputs)
+        input_audit_path = run_root / "input_audit.json"
+        write_json(input_audit_path, input_audit)
         now = utc_now()
         manifest: JsonObject = {
-            "schema_version": 5,
+            "schema_version": 6,
             "pipeline_version": PIPELINE_VERSION,
             "run_id": run_root.name,
             "config_id": config_id,
@@ -723,6 +1046,15 @@ def prepare_run_context(
             "updated_at": now,
             "source": source,
             "inputs": inputs,
+            "input_contract": {
+                "audit": "input_audit.json",
+                "audit_sha256": sha256_file(input_audit_path),
+                "summary": _input_audit_summary(input_audit),
+                "population_basis": "taxonomy.categories[].total_size",
+                "target_n_basis": "all P1 JSONL records when target_n is null",
+                "dedup_basis": "session_id/session + text/target_query/raw_query",
+                "unmapped_cluster_policy": "warn_and_exclude",
+            },
             "configuration": config,
             "llm": llm_metadata or {},
             "prompts": snapshots,
@@ -761,6 +1093,7 @@ def prepare_run_context(
 
     selected_run_root, manifest = selected
     _validate_prompt_snapshots(selected_run_root, manifest)
+    _validate_input_audit_snapshot(selected_run_root, manifest)
     if disposition != "created" and manifest.get("configuration") != config:
         manifest.setdefault("configuration_history", []).append(
             {"changed_at": utc_now(), "previous": manifest.get("configuration")}
@@ -845,7 +1178,9 @@ def validate_source_unchanged(
     manifest = _read_manifest(run_root / "manifest.json")
     source = manifest["source"]
     current_source = build_source_snapshot(
-        Path(source["source_root"]), list(source.get("selected_sets", source["sets"]))
+        Path(source["source_root"]),
+        list(source.get("selected_sets", source["sets"])),
+        failure_audit_path=run_root / "input_audit.validation_failed.json",
     )
     if current_source["source_id"] != source["source_id"] or current_source["sets"] != source["sets"]:
         raise ValueError("原始 labeled 文件在运行期间发生变化，拒绝继续或发布")

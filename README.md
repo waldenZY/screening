@@ -72,6 +72,7 @@ P2-对抗集/P2_adversarial_set_v4_labeled.jsonl
 ```text
 <package>/outputs/<week>__<source_id>/runs/<timestamp>__<config_id>/
 ├── manifest.json
+├── input_audit.json
 ├── logs/pipeline.log
 ├── prompts/validity_filter_prompt.md
 ├── screening_summary.json
@@ -107,10 +108,11 @@ P2-对抗集/P2_adversarial_set_v4_labeled.jsonl
 ```text
 <output_root>/_cluster_cache/<cluster_stat_id>/
 ├── metadata.json
+├── input_audit.json
 └── cluster_index.sqlite
 ```
 
-构建中还会暂存可恢复数据库和排他锁。未完成、`--no-publish` 或发布失败时保留索引；发布成功后默认删除 SQLite 和锁，只保留小型元信息。可用 `--cluster-cache-root` 将其放到容量更大的本地 SSD。
+构建中还会暂存可恢复数据库和排他锁。未完成、`--no-publish` 或发布失败时保留索引；发布成功后默认删除 SQLite 和锁，只保留小型元信息与输入审计。索引契约升级时，仅清理已确认属于该缓存根目录、同一 source 的旧版生成数据库，并保留失效元数据；不会修改原始 cluster、taxonomy 或已发布数据。可用 `--cluster-cache-root` 将其放到容量更大的本地 SSD。
 
 P0/P2 不生成 supplement 空文件。只有所有选中分支完成后，才将各集合 `*_screened.jsonl` 以事务式原子替换发布到目标目录；其他文件始终留在 run 工作区。
 
@@ -119,14 +121,20 @@ P0/P2 不生成 supplement 空文件。只有所有选中分支完成后，才�
 ## P1 Population 和增量补样
 
 - L1 Population 以 taxonomy 的 `total_size` 为准；L2 诊断以 `sub_intents.size` 为准。
-- taxonomy 的 `pct` 会按 total_size 重算并校验。
+- taxonomy 的 `pct` 会按 `total_size` 重算并作为诊断展示。
 - cluster JSONL 只提供候选池、追溯和统计诊断，不再用去重行数覆盖 taxonomy Population。首次扫描以二进制逐行处理，内存不随总行数增长。
 - `cluster=-1` 和未映射 cluster 不进入 Population 配额或候选池。
 - `frequency` 仅用于口径诊断，`cluster_prob` 不参与 Population、配额或默认抽样。
-- taxonomy 结构、跨层映射、声明总量或完整覆盖发生关键冲突时，预检直接失败。
+- taxonomy `_meta`（包括 `coverage`、`assigned`、`total` 等）原样写入审计，不附加上游未声明的强业务语义，也不据此判断完整覆盖。
+- taxonomy 与 cluster 会计算完整双向差集：cluster-only 告警并排除；taxonomy-only 告警但保留其 L1 配额，候选不足继续走现有短缺逻辑。
+- L2 `size` 总和与 L1 `total_size` 的差异只记录为诊断；taxonomy 必需结构、唯一归属和父子映射仍严格校验。
 - 初版记录有 cluster 时以 taxonomy 映射为准；原 L1 与映射冲突会失败。没有 cluster 时使用与 taxonomy 精确匹配的原 L1。
 - L1 权重为 `Population ^ alpha`，默认 `alpha=0.5`；最大余数法确保整数配额总和严格等于 `target_n`。
 - `target_n` 默认等于 P1 初版全部合法 JSONL 记录数。
+
+所有 labeled source 记录必须提供 1～5 的整数 `quality_overall_score`，按现有回退规则得到的目标 Query 以及去重身份的 session、文本部分都必须非空。Cluster ID 只能统一使用整数或统一使用非空字符串（噪音值 `-1`/`"-1"` 除外），不自动进行数字/字符串转换。相同去重身份若对应不同目标 Query 或 cluster 会在任何模型调用前失败；完全一致的重复记录仍确定性去重。错误与日志只包含文件、物理行、问题类型和有限样例，不写原始 Query 内容。
+
+完整统计写入缓存和 run 根目录的 `input_audit.json`，manifest 保存审计哈希、摘要和明确采用的 Population、`target_n`、去重口径。源输入在 run 创建前失败时，精简审计写入 `<output_root>/_input_audits/`，异常会给出具体路径。
 
 第一轮按初筛结果估算每个 L1 的通过率：
 

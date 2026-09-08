@@ -813,8 +813,6 @@ def main() -> int:
             )
             return 0
         llm_config = load_llm_config()
-        if not args.prepare_only:
-            validate_llm_dependency()
         context = prepare_run_context(
             source_root, args.output_root, config,
             run_id=args.run_id, new_run=args.new_run,
@@ -839,6 +837,7 @@ def main() -> int:
                 f"config_id={context.config_id}, run_root={context.run_root}"
             )
             return 0
+        validate_llm_dependency()
         return execute_pipeline(
             context,
             publish=bool(config["publication"]["enabled"]),
