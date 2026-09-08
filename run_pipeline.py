@@ -87,6 +87,10 @@ def _config_overrides(args: argparse.Namespace) -> dict[str, Any]:
         _set_nested(overrides, "common", "sets", validate_selected_sets(args.sets))
     _set_nested(overrides, "common", "log_level", args.log_level)
     _set_nested(
+        overrides, "inputs", "source_root",
+        str(args.source_root.expanduser().resolve()) if args.source_root else None,
+    )
+    _set_nested(
         overrides, "inputs", "taxonomy",
         str(args.taxonomy.expanduser().resolve()) if args.taxonomy else None,
     )
@@ -734,7 +738,10 @@ def execute_pipeline(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="一键执行分集合筛选与 P1 Coverage 链路")
-    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument(
+        "--source-root", type=Path, default=None,
+        help="覆盖 pipeline 配置中的 inputs.source_root",
+    )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--publish-root", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
@@ -791,8 +798,14 @@ def main() -> int:
         if args.dry_run and (args.run_id or args.new_run):
             raise ValueError("轻量 --dry-run 不创建或选择 run，不能搭配 --run-id/--new-run")
         config, _ = load_pipeline_config(args.config, _config_overrides(args))
+        source_root_value = str(config["inputs"].get("source_root") or "").strip()
+        if not source_root_value:
+            raise ValueError(
+                "必须配置 inputs.source_root，或通过 --source-root 临时覆盖"
+            )
+        source_root = Path(source_root_value)
         if args.dry_run:
-            result = lightweight_preflight(args.source_root, args.output_root, config)
+            result = lightweight_preflight(source_root, args.output_root, config)
             print(
                 "lightweight preflight ok: "
                 f"sets={','.join(result['selected_sets'])}; "
@@ -803,7 +816,7 @@ def main() -> int:
         if not args.prepare_only:
             validate_llm_dependency()
         context = prepare_run_context(
-            args.source_root, args.output_root, config,
+            source_root, args.output_root, config,
             run_id=args.run_id, new_run=args.new_run,
             llm_metadata=llm_config.public_metadata(),
         )

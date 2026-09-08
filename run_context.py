@@ -79,7 +79,7 @@ def _resolve_paths(value: JsonObject, base_dir: Path) -> JsonObject:
         qc["prompt"] = str((path if path.is_absolute() else base_dir / path).resolve())
     inputs = resolved.get("inputs")
     if isinstance(inputs, dict):
-        for key in ("taxonomy", "upstream_cluster_population"):
+        for key in ("source_root", "taxonomy", "upstream_cluster_population"):
             if not inputs.get(key):
                 continue
             path = Path(str(inputs[key])).expanduser()

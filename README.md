@@ -22,19 +22,28 @@ Copy-Item filter_v2/artifacts/config/llm_config.example.json `
 
 然后在 `llm_config.local.json` 中填写 API URL、Key、模型和固定请求参数。该文件已被 Git 忽略；所有命令只读取这一处，不读取环境变量。
 
-然后提供周数据、taxonomy 和 cluster 全集：
+然后在 `pipeline.default.json` 的 `inputs` 中填写同一个 week 对应的三项输入：
+
+```json
+"inputs": {
+  "source_root": "D:/data/week1",
+  "taxonomy": "D:/data/week1/taxonomy.json",
+  "upstream_cluster_population": "D:/data/week1/cluster.jsonl"
+}
+```
+
+建议使用绝对路径和正斜杠。三个路径必须作为一组同步切换；链路会校验文件、taxonomy 映射和 cluster 内容，但在输入本身没有共同 week 标识时，无法自动证明三个文件来自同一 week。
+
+配置完成后直接运行：
 
 ```powershell
-python -m filter_v2.run_pipeline `
-  --source-root path1\week1 `
-  --taxonomy path3\taxonomy_mapreduce.json `
-  --upstream-cluster-population path3\cluster.jsonl
+python -m filter_v2.run_pipeline
 ```
 
 只处理 P0/P2 时不需要两个 P1 外部输入：
 
 ```powershell
-python -m filter_v2.run_pipeline --source-root path1\week1 --sets P0,P2
+python -m filter_v2.run_pipeline --sets P0,P2
 ```
 
 `--dry-run` 是轻量预检：只检查路径、权限、文件大小、配置、Prompt、taxonomy 和 cluster 头部样本；它不会完整扫描 cluster、不会建立索引、不会创建正式 run，并会明确提示完整数据尚未验证。
@@ -43,9 +52,6 @@ python -m filter_v2.run_pipeline --source-root path1\week1 --sets P0,P2
 
 ```powershell
 python -m filter_v2.run_pipeline `
-  --source-root path1\week1 `
-  --taxonomy path3\taxonomy_mapreduce.json `
-  --upstream-cluster-population path3\clusters.jsonl `
   --prepare-only
 ```
 
@@ -178,7 +184,7 @@ REVIEW 必须填写 `TESTABLE_DIFFICULTY` 或 `UNUSABLE`；非 REVIEW 必须为 
 
 ## 配置与诊断
 
-链路配置位于 `artifacts/config/pipeline.default.json`，优先级为 `CLI > --config 指定 JSON > 包内默认配置`。LLM 连接、模型、`max_tokens`、超时和流式选项统一位于被忽略的 `artifacts/config/llm_config.local.json`，不接受 CLI 或环境变量覆盖。
+链路配置位于 `artifacts/config/pipeline.default.json`，其中 `inputs.source_root`、`inputs.taxonomy` 和 `inputs.upstream_cluster_population` 对应同一个 week。优先级为 `CLI > --config 指定 JSON > 包内默认配置`，三个输入路径仍可通过 CLI 临时覆盖。LLM 连接、模型、`max_tokens`、超时和流式选项统一位于被忽略的 `artifacts/config/llm_config.local.json`，不接受 CLI 或环境变量覆盖。
 
 常用 P1 覆盖参数包括：
 

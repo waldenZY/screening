@@ -4,6 +4,7 @@
     "log_level": "INFO"
   },
   "inputs": {
+    "source_root": "",
     "taxonomy": "",
     "upstream_cluster_population": ""
   },
