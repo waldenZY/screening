@@ -132,7 +132,7 @@ P0/P2 不生成 supplement 空文件。只有所有选中分支完成后，才�
 - L1 权重为 `Population ^ alpha`，默认 `alpha=0.5`；最大余数法确保整数配额总和严格等于 `target_n`。
 - `target_n` 默认等于 P1 初版全部合法 JSONL 记录数。
 
-所有 labeled source 记录必须提供 1～5 的整数 `quality_overall_score`，按现有回退规则得到的目标 Query 以及去重身份的 session、文本部分都必须非空。Cluster ID 只能统一使用整数或统一使用非空字符串（噪音值 `-1`/`"-1"` 除外），不自动进行数字/字符串转换。相同去重身份若对应不同目标 Query 或 cluster 会在任何模型调用前失败；完全一致的重复记录仍确定性去重。错误与日志只包含文件、物理行、问题类型和有限样例，不写原始 Query 内容。
+所有 labeled source 记录必须提供 1～5 的整数 `quality_overall_score`，按现有回退规则得到的目标 Query 以及去重身份的 session、文本部分都必须非空。Cluster ID 只能统一使用整数或统一使用非空字符串（噪音值 `-1`/`"-1"` 除外），不自动进行数字/字符串转换。非噪音 Cluster 记录同样要求 Query 和去重身份非空；`-1`/`"-1"` 会直接按噪音排除，不要求这些候选字段。相同去重身份若对应不同目标 Query 或 cluster 会在任何模型调用前失败；完全一致的重复记录仍确定性去重。错误与日志只包含文件、物理行、问题类型和有限样例，不写原始 Query 内容。
 
 完整统计写入缓存和 run 根目录的 `input_audit.json`，manifest 保存审计哈希、摘要和明确采用的 Population、`target_n`、去重口径。源输入在 run 创建前失败时，精简审计写入 `<output_root>/_input_audits/`，异常会给出具体路径。
 

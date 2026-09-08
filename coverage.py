@@ -75,10 +75,10 @@ def _validated_cluster_record(
         raise ValueError(f"{label} cluster ID 类型与 taxonomy 不一致")
     candidate = build_cluster_candidate(row)
     target_query = str(candidate.get("target_query") or "").strip()
-    if not target_query:
+    if not is_noise and not target_query:
         raise ValueError(f"{label} 归一化后的目标 Query 为空")
     identity = sample_identity(row)
-    if not identity[0] or not identity[1]:
+    if not is_noise and (not identity[0] or not identity[1]):
         raise ValueError(f"{label} 去重身份的 session 或文本部分为空")
     signature = (
         stable_hash(target_query),

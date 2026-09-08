@@ -26,7 +26,7 @@ from .core import (
 )
 from .coverage import L1_ONLY, TaxonomyMappings
 
-INDEX_VERSION = 2
+INDEX_VERSION = 3
 DATABASE_NAME = "cluster_index.sqlite"
 BUILDING_DATABASE_NAME = "cluster_index.building.sqlite"
 METADATA_NAME = "metadata.json"
@@ -419,6 +419,7 @@ def _input_audit(
             "target_n_basis": "all P1 JSONL records when target_n is null",
             "dedup_basis": "session_id/session + text/target_query/raw_query",
             "unmapped_cluster_policy": "warn_and_exclude",
+            "noise_cluster_policy": "exclude_without_query_or_identity_requirements",
         },
     }
 
@@ -745,13 +746,13 @@ def _scan(
 
                     candidate = build_cluster_candidate(row)
                     target_query = str(candidate.get("target_query") or "").strip()
-                    if not target_query:
+                    if not is_noise and not target_query:
                         checkpoint["empty_query_rows"] = int(
                             checkpoint.get("empty_query_rows", 0)
                         ) + 1
                         issue_codes.append("empty_target_query")
                     identity = sample_identity(row)
-                    if not identity[0] or not identity[1]:
+                    if not is_noise and (not identity[0] or not identity[1]):
                         checkpoint["empty_identity_rows"] = int(
                             checkpoint.get("empty_identity_rows", 0)
                         ) + 1

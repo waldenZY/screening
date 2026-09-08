@@ -836,6 +836,7 @@ def _run_input_audit(source: JsonObject, inputs: JsonObject) -> JsonObject:
         "target_n_basis": "all P1 JSONL records when target_n is null",
         "dedup_basis": "session_id/session + text/target_query/raw_query",
         "unmapped_cluster_policy": "warn_and_exclude",
+        "noise_cluster_policy": "exclude_without_query_or_identity_requirements",
     }
     validation = inputs.get("validation")
     if isinstance(validation, dict):
@@ -1054,6 +1055,7 @@ def prepare_run_context(
                 "target_n_basis": "all P1 JSONL records when target_n is null",
                 "dedup_basis": "session_id/session + text/target_query/raw_query",
                 "unmapped_cluster_policy": "warn_and_exclude",
+                "noise_cluster_policy": "exclude_without_query_or_identity_requirements",
             },
             "configuration": config,
             "llm": llm_metadata or {},

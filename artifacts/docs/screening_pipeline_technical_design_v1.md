@@ -283,6 +283,7 @@ QUALIFIED + quota
 - taxonomy 映射、噪音和未映射统计；
 - taxonomy/Cluster 双向 ID 差集与 ID 类型分布；
 - Cluster ID、目标 Query、去重身份和身份冲突校验；
+- 噪音值 `-1`/`"-1"` 直接排除，不要求 Query 或去重身份字段；
 - frequency、行数和 taxonomy 总量诊断；
 - 身份去重；
 - SQLite 候选定位索引写入。
