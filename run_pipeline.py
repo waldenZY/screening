@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,11 +47,14 @@ from .run_context import (
     ensure_context_cluster_index,
     lightweight_preflight,
     load_pipeline_config,
+    measure_manifest_timing,
     prepare_run_context,
+    record_run_execution_timing,
     record_cluster_index_state,
     snapshot_prompt_path,
     update_branch_manifest,
     update_manifest,
+    utc_now_ms,
     validate_source_unchanged,
 )
 from .logging_config import setup_logger
@@ -256,6 +260,46 @@ def _completed_branch(context: RunContext, set_name: str) -> BranchOutcome | Non
     )
 
 
+def _prepare_p1_population(
+    context: RunContext,
+    index_handle: ClusterIndexHandle | None,
+) -> PreparedSupplement:
+    config = context.config
+    update_branch_manifest(
+        context.run_root, "P1", "population_prepare", status="running"
+    )
+    try:
+        with measure_manifest_timing(
+            context.run_root,
+            ("branches", "P1", "population_prepare", "timing"),
+        ):
+            prepared = prepare_supplement_inputs(
+                context.source_root,
+                context.run_root,
+                Path(config["inputs"]["taxonomy"]),
+                Path(config["inputs"]["upstream_cluster_population"]),
+                index_handle=index_handle,
+                seed=int(config["p1_coverage"]["seed"]),
+            )
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        update_branch_manifest(
+            context.run_root,
+            "P1",
+            "population_prepare",
+            status="incomplete",
+            details={"error": str(exc)},
+        )
+        raise
+    update_branch_manifest(
+        context.run_root,
+        "P1",
+        "population_prepare",
+        status="completed",
+        details={"error": None},
+    )
+    return prepared
+
+
 def _run_branch(
     context: RunContext,
     set_name: str,
@@ -276,21 +320,25 @@ def _run_branch(
     active_branch_stage = "prescreen"
     try:
         update_branch_manifest(context.run_root, set_name, "prescreen", status="running")
-        prescreen = run_prescreen(
-            context.source_root,
+        with measure_manifest_timing(
             context.run_root,
-            selected_sets=[set_name],
-            scores_by_set={set_name: set(policy["scores"])},
-            prompt_path=snapshot_prompt_path(context.run_root),
-            model=model,
-            workers=int(qc["workers"]),
-            sleep_sec=float(qc["sleep"]),
-            max_retries=int(qc["max_retries"]),
-            limit=int(qc["limit"]),
-            llm_options=llm_options,
-            stage_logger=stage_logger,
-            llm_call=gated_llm,
-        )
+            ("branches", set_name, "prescreen", "timing"),
+        ):
+            prescreen = run_prescreen(
+                context.source_root,
+                context.run_root,
+                selected_sets=[set_name],
+                scores_by_set={set_name: set(policy["scores"])},
+                prompt_path=snapshot_prompt_path(context.run_root),
+                model=model,
+                workers=int(qc["workers"]),
+                sleep_sec=float(qc["sleep"]),
+                max_retries=int(qc["max_retries"]),
+                limit=int(qc["limit"]),
+                llm_options=llm_options,
+                stage_logger=stage_logger,
+                llm_call=gated_llm,
+            )
         counts = _result_counts(prescreen_results_path(context.run_root, set_name))
         expected = prescreen.expected
         terminal = counts["terminal"]
@@ -340,31 +388,36 @@ def _run_branch(
                         details={"rounds": _compact_rounds(rounds)},
                     )
 
-            supplement_outcome = run_supplement(
-                context.source_root,
+            with measure_manifest_timing(
                 context.run_root,
-                taxonomy_path=Path(config["inputs"]["taxonomy"]),
-                upstream_path=Path(config["inputs"]["upstream_cluster_population"]),
-                prompt_path=snapshot_prompt_path(context.run_root),
-                alpha=float(policy["alpha"]),
-                target_n=policy["target_n"],
-                seed=int(policy["seed"]),
-                max_rounds=int(policy["max_rounds"]) if supplement_config["enabled"] else 0,
-                default_pass_rate=float(policy["default_pass_rate"]),
-                pass_rate_prior_strength=float(policy["pass_rate_prior_strength"]),
-                min_pass_rate=float(policy["min_pass_rate"]),
-                max_pass_rate=float(policy["max_pass_rate"]),
-                safety_factor=float(policy["safety_factor"]),
-                model=model,
-                workers=int(qc["workers"]),
-                sleep_sec=float(qc["sleep"]),
-                max_retries=int(qc["max_retries"]),
-                llm_options=llm_options,
-                stage_logger=stage_logger,
-                llm_call=gated_llm,
-                round_callback=rounds_changed,
-                prepared=p1_preparation.result() if p1_preparation else None,
-            )
+                ("branches", "P1", "supplement", "timing"),
+                ("stages", "p1_coverage", "timing"),
+            ):
+                supplement_outcome = run_supplement(
+                    context.source_root,
+                    context.run_root,
+                    taxonomy_path=Path(config["inputs"]["taxonomy"]),
+                    upstream_path=Path(config["inputs"]["upstream_cluster_population"]),
+                    prompt_path=snapshot_prompt_path(context.run_root),
+                    alpha=float(policy["alpha"]),
+                    target_n=policy["target_n"],
+                    seed=int(policy["seed"]),
+                    max_rounds=int(policy["max_rounds"]) if supplement_config["enabled"] else 0,
+                    default_pass_rate=float(policy["default_pass_rate"]),
+                    pass_rate_prior_strength=float(policy["pass_rate_prior_strength"]),
+                    min_pass_rate=float(policy["min_pass_rate"]),
+                    max_pass_rate=float(policy["max_pass_rate"]),
+                    safety_factor=float(policy["safety_factor"]),
+                    model=model,
+                    workers=int(qc["workers"]),
+                    sleep_sec=float(qc["sleep"]),
+                    max_retries=int(qc["max_retries"]),
+                    llm_options=llm_options,
+                    stage_logger=stage_logger,
+                    llm_call=gated_llm,
+                    round_callback=rounds_changed,
+                    prepared=p1_preparation.result() if p1_preparation else None,
+                )
             summary_path = supplement_artifact_path(context.run_root, "supplement_summary.json")
             supplement_details: JsonObject = {
                 "rounds": _compact_rounds(supplement_outcome.rounds),
@@ -394,10 +447,14 @@ def _run_branch(
 
         active_branch_stage = "build"
         update_branch_manifest(context.run_root, set_name, "build", status="running")
-        branch_summary = build_screened_samples(
-            context.source_root, context.run_root, [set_name], config,
-            write_combined_summary=False,
-        )
+        with measure_manifest_timing(
+            context.run_root,
+            ("branches", set_name, "build", "timing"),
+        ):
+            branch_summary = build_screened_samples(
+                context.source_root, context.run_root, [set_name], config,
+                write_combined_summary=False,
+            )
         artifacts: JsonObject = {
             "prescreen": _metadata(
                 run_prescreen_dataset_path(context.run_root, set_name),
@@ -492,7 +549,7 @@ def _cleanup_after_publish(
         active_logger.warning("screened 已发布，但 cluster 索引清理记账失败: %s", exc)
 
 
-def execute_pipeline(
+def _execute_pipeline_impl(
     context: RunContext,
     *,
     publish: bool,
@@ -545,20 +602,24 @@ def execute_pipeline(
         try:
             validate_authoritative_screened(context.source_root, context.run_root, selected_sets)
             if publish:
-                publication = publish_screened_samples(
-                    context.source_root, context.run_root, selected_sets,
-                    publish_root=publish_root,
-                    verify_full_cluster_hash=False,
-                )
-                update_manifest(
-                    context.run_root, status="published", stage="publish",
-                    stage_status="published", publication=publication,
-                )
-                if (
-                    "P1" in selected_sets
-                    and bool(config["large_inputs"]["cleanup_index_after_publish"])
+                with measure_manifest_timing(
+                    context.run_root,
+                    ("stages", "publish", "timing"),
                 ):
-                    _cleanup_after_publish(context, None, pipeline_logger)
+                    publication = publish_screened_samples(
+                        context.source_root, context.run_root, selected_sets,
+                        publish_root=publish_root,
+                        verify_full_cluster_hash=False,
+                    )
+                    update_manifest(
+                        context.run_root, status="published", stage="publish",
+                        stage_status="published", publication=publication,
+                    )
+                    if (
+                        "P1" in selected_sets
+                        and bool(config["large_inputs"]["cleanup_index_after_publish"])
+                    ):
+                        _cleanup_after_publish(context, None, pipeline_logger)
             pipeline_logger.info("复用已完成 run，不重新调用模型")
             return 0
         except (OSError, ValueError, KeyError) as exc:
@@ -581,7 +642,11 @@ def execute_pipeline(
                 context.run_root, status="running", stage="cluster_prepare",
                 stage_status="running", stage_details={"error": None},
             )
-            cluster_handle = ensure_context_cluster_index(context)
+            with measure_manifest_timing(
+                context.run_root,
+                ("stages", "cluster_prepare", "timing"),
+            ):
+                cluster_handle = ensure_context_cluster_index(context)
             update_manifest(
                 context.run_root, stage="cluster_prepare", stage_status="completed",
                 stage_details={
@@ -600,32 +665,32 @@ def execute_pipeline(
         outcomes: dict[str, BranchOutcome] = {}
         preparation_future: Future[PreparedSupplement] | None = None
         worker_count = len(selected_sets) + (1 if p1_needs_work else 0)
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            if p1_needs_work:
-                preparation_future = executor.submit(
-                    prepare_supplement_inputs,
-                    context.source_root,
-                    context.run_root,
-                    Path(config["inputs"]["taxonomy"]),
-                    Path(config["inputs"]["upstream_cluster_population"]),
-                    index_handle=cluster_handle,
-                    seed=int(config["p1_coverage"]["seed"]),
-                )
-            futures = {
-                executor.submit(
-                    _run_branch,
-                    context,
-                    set_name,
-                    gate,
-                    model,
-                    llm_options,
-                    preparation_future if set_name == "P1" else None,
-                ): set_name
-                for set_name in selected_sets
-            }
-            for future in as_completed(futures):
-                result = future.result()
-                outcomes[result.set_name] = result
+        with measure_manifest_timing(
+            context.run_root,
+            ("stages", "quality_control", "timing"),
+        ):
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                if p1_needs_work:
+                    preparation_future = executor.submit(
+                        _prepare_p1_population,
+                        context,
+                        cluster_handle,
+                    )
+                futures = {
+                    executor.submit(
+                        _run_branch,
+                        context,
+                        set_name,
+                        gate,
+                        model,
+                        llm_options,
+                        preparation_future if set_name == "P1" else None,
+                    ): set_name
+                    for set_name in selected_sets
+                }
+                for future in as_completed(futures):
+                    result = future.result()
+                    outcomes[result.set_name] = result
 
         expected = sum(item.expected for item in outcomes.values())
         terminal = sum(item.terminal for item in outcomes.values())
@@ -683,10 +748,14 @@ def execute_pipeline(
             return 2 if failures and not gate.fatal else 1
 
         active_stage = "build_screened"
-        combined = _combine_branch_summaries(context.run_root, selected_sets)
-        authoritative = screened_artifact_metadata(
-            context.source_root, context.run_root, selected_sets
-        )
+        with measure_manifest_timing(
+            context.run_root,
+            ("stages", "build_screened", "timing"),
+        ):
+            combined = _combine_branch_summaries(context.run_root, selected_sets)
+            authoritative = screened_artifact_metadata(
+                context.source_root, context.run_root, selected_sets
+            )
         update_manifest(
             context.run_root, stage="build_screened", stage_status="completed",
             stage_details={
@@ -698,30 +767,38 @@ def execute_pipeline(
         )
 
         active_stage = "report"
-        report = generate_report(context.run_root)
-        report_path = context.run_root / "supplement_report.md"
-        write_text(report_path, report)
+        with measure_manifest_timing(
+            context.run_root,
+            ("stages", "report", "timing"),
+        ):
+            report = generate_report(context.run_root)
+            report_path = context.run_root / "supplement_report.md"
+            write_text(report_path, report)
         update_manifest(
             context.run_root, status="completed", stage="report", stage_status="completed",
             stage_details={"report": _metadata(report_path, context.run_root), "error": None},
         )
         if publish:
             active_stage = "publish"
-            publication = publish_screened_samples(
-                context.source_root, context.run_root, selected_sets,
-                publish_root=publish_root,
-                verify_full_cluster_hash=False,
-            )
-            update_manifest(
-                context.run_root, status="published", stage="publish",
-                stage_status="published", publication=publication,
-            )
-            pipeline_logger.info("screened 数据集发布完成")
-            if (
-                "P1" in selected_sets
-                and bool(config["large_inputs"]["cleanup_index_after_publish"])
+            with measure_manifest_timing(
+                context.run_root,
+                ("stages", "publish", "timing"),
             ):
-                _cleanup_after_publish(context, cluster_handle, pipeline_logger)
+                publication = publish_screened_samples(
+                    context.source_root, context.run_root, selected_sets,
+                    publish_root=publish_root,
+                    verify_full_cluster_hash=False,
+                )
+                update_manifest(
+                    context.run_root, status="published", stage="publish",
+                    stage_status="published", publication=publication,
+                )
+                pipeline_logger.info("screened 数据集发布完成")
+                if (
+                    "P1" in selected_sets
+                    and bool(config["large_inputs"]["cleanup_index_after_publish"])
+                ):
+                    _cleanup_after_publish(context, cluster_handle, pipeline_logger)
         return 0
     except (OSError, ValueError, RuntimeError, KeyError) as exc:
         failure_status = "publish_failed" if active_stage == "publish" else "incomplete"
@@ -734,6 +811,67 @@ def execute_pipeline(
         )
         pipeline_logger.error("链路停止: %s", exc)
         return 1
+
+
+def _refresh_final_report(context: RunContext) -> None:
+    """Refresh the human report after final timing and publication are recorded."""
+    report_path = context.run_root / "supplement_report.md"
+    if not report_path.is_file():
+        return
+    manifest = json.loads(
+        (context.run_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    if manifest.get("stages", {}).get("report", {}).get("status") != "completed":
+        return
+    active_logger = _stage_logger(context, "report")
+    try:
+        write_text(report_path, generate_report(context.run_root))
+        update_manifest(
+            context.run_root,
+            stage="report",
+            stage_details={
+                "report": _metadata(report_path, context.run_root),
+                "error": None,
+            },
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        active_logger.warning("最终时延报告刷新失败，保留预发布报告: %s", exc)
+
+
+def execute_pipeline(
+    context: RunContext,
+    *,
+    publish: bool,
+    publish_root: Path | None = None,
+    llm_config: LlmConfig | None = None,
+    llm_call: LlmCall | None = None,
+    verify_full_cluster_hash: bool | None = None,
+) -> int:
+    """Execute the pipeline and accumulate active time across resumptions."""
+    started_at = utc_now_ms()
+    started_ns = time.monotonic_ns()
+    result: int | None = None
+    try:
+        result = _execute_pipeline_impl(
+            context,
+            publish=publish,
+            publish_root=publish_root,
+            llm_config=llm_config,
+            llm_call=llm_call,
+            verify_full_cluster_hash=verify_full_cluster_hash,
+        )
+    finally:
+        record_run_execution_timing(
+            context.run_root,
+            started_at=started_at,
+            finished_at=utc_now_ms(),
+            duration_ms=max(
+                0, round((time.monotonic_ns() - started_ns) / 1_000_000)
+            ),
+            completed=result == 0,
+        )
+    _refresh_final_report(context)
+    return result
 
 
 def parse_args() -> argparse.Namespace:

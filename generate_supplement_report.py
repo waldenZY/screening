@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 from collections import Counter
 from pathlib import Path
 
@@ -12,6 +13,72 @@ from .core import JsonObject, ensure_within, load_jsonl, set_workspace, suppleme
 from .logging_config import setup_logger
 
 logger = logging.getLogger(__name__)
+
+
+def _format_duration(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "—"
+    milliseconds = max(0.0, float(value))
+    if milliseconds >= 60_000:
+        return f"{milliseconds / 60_000:.2f} min"
+    if milliseconds >= 1_000:
+        return f"{milliseconds / 1_000:.2f} s"
+    return f"{milliseconds:.0f} ms"
+
+
+def _latency_stats(rows: list[JsonObject], field: str) -> JsonObject:
+    values = sorted(
+        float(row[field])
+        for row in rows
+        if isinstance(row.get(field), (int, float))
+        and not isinstance(row.get(field), bool)
+        and float(row[field]) >= 0
+    )
+    if not values:
+        return {"count": 0, "average_ms": None, "p50_ms": None, "p95_ms": None, "max_ms": None}
+
+    def nearest_rank(percentile: float) -> float:
+        return values[max(0, math.ceil(percentile * len(values)) - 1)]
+
+    return {
+        "count": len(values),
+        "average_ms": sum(values) / len(values),
+        "p50_ms": nearest_rank(0.50),
+        "p95_ms": nearest_rank(0.95),
+        "max_ms": values[-1],
+    }
+
+
+def _llm_stage_group(stage: str) -> str:
+    if stage.startswith("p1_coverage_round_"):
+        return "p1_supplement"
+    return stage
+
+
+def _llm_stage_label(stage: str) -> str:
+    labels = {
+        "p0_prescreen": "P0 prescreen",
+        "p1_prescreen": "P1 prescreen",
+        "p2_prescreen": "P2 prescreen",
+        "p1_supplement": "P1 supplement",
+    }
+    return labels.get(stage, stage)
+
+
+def _timing_entry_lines(
+    rows: list[tuple[str, JsonObject]],
+) -> list[str]:
+    lines: list[str] = []
+    for label, entry in rows:
+        if not isinstance(entry, dict) or "active_duration_ms" not in entry:
+            continue
+        lines.append(
+            f"| {label} | {entry.get('execution_count', 0)} | "
+            f"{_format_duration(entry.get('active_duration_ms'))} | "
+            f"{_format_duration(entry.get('last_duration_ms'))} | "
+            f"{entry.get('last_started_at', '—')} | {entry.get('last_finished_at', '—')} |"
+        )
+    return lines
 
 
 def load_json(path: Path) -> JsonObject:
@@ -166,6 +233,73 @@ def generate_report(run_root: Path) -> str:
     for path in attempt_paths:
         if path.is_file():
             attempts.extend(load_jsonl(path))
+
+    manifest_path = run_root / "manifest.json"
+    manifest = load_json(manifest_path) if manifest_path.is_file() else {}
+    timing = manifest.get("timing", {})
+    lines.extend(["## 运行时延", ""])
+    if not isinstance(timing, dict) or not timing:
+        lines.extend(["本次运行没有可用的结构化时延记录。", ""])
+    else:
+        lines.extend(
+            [
+                f"- 首次开始：{timing.get('first_started_at', '—')}",
+                f"- 完成时间：{timing.get('completed_at', '—')}",
+                f"- 自然时间跨度：{_format_duration(timing.get('wall_clock_duration_ms'))}",
+                f"- 累计活跃执行耗时：{_format_duration(timing.get('active_duration_ms'))}",
+                f"- 启动次数：{timing.get('invocation_count', 0)}；"
+                f"断点恢复次数：{timing.get('resume_count', 0)}",
+                "",
+                "### 主阶段耗时",
+                "",
+                "| 阶段 | 执行次数 | 累计活跃耗时 | 最近一次耗时 | 最近开始 | 最近结束 |",
+                "|---|---:|---:|---:|---|---|",
+            ]
+        )
+        phases = timing.get("phases", {})
+        stages = manifest.get("stages", {})
+        main_rows = [
+            ("初始化与 source 校验", phases.get("initialization", {})),
+            ("Cluster 输入审计及索引准备", stages.get("cluster_prepare", {}).get("timing", {})),
+            ("Quality Control", stages.get("quality_control", {}).get("timing", {})),
+            ("P1 Coverage", stages.get("p1_coverage", {}).get("timing", {})),
+            ("汇总构建", stages.get("build_screened", {}).get("timing", {})),
+            ("报告生成", stages.get("report", {}).get("timing", {})),
+            ("发布与索引清理", stages.get("publish", {}).get("timing", {})),
+        ]
+        lines.extend(_timing_entry_lines(main_rows))
+        lines.extend(
+            [
+                "",
+                "### 分支耗时",
+                "",
+                "| 分支阶段 | 执行次数 | 累计活跃耗时 | 最近一次耗时 | 最近开始 | 最近结束 |",
+                "|---|---:|---:|---:|---|---|",
+            ]
+        )
+        branch_rows: list[tuple[str, JsonObject]] = []
+        branches = manifest.get("branches", {})
+        for set_name in ("P0", "P1", "P2"):
+            branch = branches.get(set_name, {})
+            for stage_name, label in (
+                ("prescreen", "prescreen"),
+                ("population_prepare", "Population 准备"),
+                ("supplement", "supplement"),
+                ("build", "build"),
+            ):
+                value = branch.get(stage_name, {})
+                branch_rows.append(
+                    (f"{set_name} {label}", value.get("timing", {}) if isinstance(value, dict) else {})
+                )
+        lines.extend(_timing_entry_lines(branch_rows))
+        lines.extend(
+            [
+                "",
+                "> 主阶段和分支可能并行或互相包含，耗时不可相加作为整链路总耗时；请以“累计活跃执行耗时”为准。",
+                "",
+            ]
+        )
+
     outcomes = Counter(str(row.get("outcome", "unknown")) for row in attempts)
     lines.extend([
         "## 模型调用审计",
@@ -174,6 +308,39 @@ def generate_report(run_root: Path) -> str:
         f"- 合法终态响应：{outcomes.get('success', 0)}",
         f"- 解析/结构失败：{outcomes.get('parse_fail', 0)}",
         f"- 调用工程失败：{outcomes.get('call_error', 0)}",
+        "",
+    ])
+    grouped_attempts: dict[str, list[JsonObject]] = {}
+    for attempt in attempts:
+        stage = _llm_stage_group(str(attempt.get("stage") or "unknown"))
+        grouped_attempts.setdefault(stage, []).append(attempt)
+    for title, field in (
+        ("首 Token 时延", "first_token_latency_ms"),
+        ("完整响应时延", "full_latency_ms"),
+    ):
+        lines.extend(
+            [
+                f"### {title}",
+                "",
+                "| LLM 阶段 | 尝试次数 | 有效时延样本数 | 平均值 | P50 | P95 | 最大值 |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for stage in sorted(grouped_attempts):
+            rows = grouped_attempts[stage]
+            stats = _latency_stats(rows, field)
+            lines.append(
+                f"| {_llm_stage_label(stage)} | {len(rows)} | {stats['count']} | "
+                f"{_format_duration(stats['average_ms'])} | "
+                f"{_format_duration(stats['p50_ms'])} | "
+                f"{_format_duration(stats['p95_ms'])} | "
+                f"{_format_duration(stats['max_ms'])} |"
+            )
+        if not grouped_attempts:
+            lines.append("| 无 | 0 | 0 | — | — | — | — |")
+        lines.append("")
+    lines.extend([
+        "有效时延样本指该字段包含非负数值的 attempt；没有时延的异常 attempt 只计入尝试次数。",
         "",
     ])
     return "\n".join(lines)

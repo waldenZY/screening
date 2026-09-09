@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import threading
+import time
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,7 +41,7 @@ from .coverage import load_taxonomy_mappings
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = PACKAGE_DIR / "outputs"
 DEFAULT_CONFIG_PATH = PACKAGE_DIR / "artifacts" / "config" / "pipeline.default.json"
-PIPELINE_VERSION = 6
+PIPELINE_VERSION = 7
 _MANIFEST_LOCK = threading.RLock()
 
 INCOMPLETE_STATUSES = {"created", "running", "incomplete", "publish_failed"}
@@ -62,6 +64,163 @@ class RunContext:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def utc_now_ms() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _elapsed_ms(started_ns: int) -> int:
+    return max(0, round((time.monotonic_ns() - started_ns) / 1_000_000))
+
+
+def _merge_timing_entry(
+    entry: JsonObject,
+    *,
+    started_at: str,
+    finished_at: str,
+    duration_ms: int,
+) -> None:
+    duration = max(0, int(duration_ms))
+    entry.setdefault("first_started_at", started_at)
+    entry["last_started_at"] = started_at
+    entry["last_finished_at"] = finished_at
+    entry["last_duration_ms"] = duration
+    entry["active_duration_ms"] = int(entry.get("active_duration_ms", 0)) + duration
+    entry["execution_count"] = int(entry.get("execution_count", 0)) + 1
+
+
+def _timing_target(manifest: JsonObject, scope: tuple[str, ...]) -> JsonObject:
+    current = manifest
+    for key in scope:
+        value = current.setdefault(key, {})
+        if not isinstance(value, dict):
+            raise ValueError(f"manifest 计时路径非法: {'.'.join(scope)}")
+        current = value
+    return current
+
+
+def _wall_clock_duration_ms(started_at: str, finished_at: str) -> int:
+    try:
+        started = datetime.fromisoformat(started_at)
+        finished = datetime.fromisoformat(finished_at)
+    except ValueError:
+        return 0
+    return max(0, round((finished - started).total_seconds() * 1000))
+
+
+def _merge_run_timing(
+    manifest: JsonObject,
+    *,
+    phase: str,
+    started_at: str,
+    finished_at: str,
+    duration_ms: int,
+    phase_duration_ms: int | None = None,
+    invocation_disposition: str | None = None,
+    completed: bool = False,
+) -> None:
+    timing = manifest.setdefault("timing", {})
+    if not isinstance(timing, dict):
+        raise ValueError("manifest.timing 必须是对象")
+    timing.setdefault("schema_version", 1)
+    timing.setdefault("first_started_at", started_at)
+    timing["last_finished_at"] = finished_at
+    timing["active_duration_ms"] = int(timing.get("active_duration_ms", 0)) + max(
+        0, int(duration_ms)
+    )
+    timing["wall_clock_duration_ms"] = _wall_clock_duration_ms(
+        str(timing["first_started_at"]), finished_at
+    )
+    phases = timing.setdefault("phases", {})
+    if not isinstance(phases, dict):
+        raise ValueError("manifest.timing.phases 必须是对象")
+    phase_entry = phases.setdefault(phase, {})
+    if not isinstance(phase_entry, dict):
+        raise ValueError(f"manifest.timing.phases.{phase} 必须是对象")
+    _merge_timing_entry(
+        phase_entry,
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_ms=duration_ms if phase_duration_ms is None else phase_duration_ms,
+    )
+    if invocation_disposition is not None:
+        timing["invocation_count"] = int(timing.get("invocation_count", 0)) + 1
+        if invocation_disposition == "resumed":
+            timing["resume_count"] = int(timing.get("resume_count", 0)) + 1
+        else:
+            timing.setdefault("resume_count", 0)
+    if completed:
+        timing["completed_at"] = finished_at
+
+
+def record_run_execution_timing(
+    run_root: Path,
+    *,
+    started_at: str,
+    finished_at: str,
+    duration_ms: int,
+    completed: bool,
+) -> JsonObject:
+    """Accumulate one pipeline execution without counting offline resume gaps."""
+    with _MANIFEST_LOCK:
+        manifest_path = run_root / "manifest.json"
+        manifest = _read_manifest(manifest_path)
+        _merge_run_timing(
+            manifest,
+            phase="pipeline_execution",
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=duration_ms,
+            completed=completed,
+        )
+        manifest["updated_at"] = utc_now()
+        write_json(manifest_path, manifest)
+        return manifest
+
+
+def record_manifest_timing(
+    run_root: Path,
+    scopes: list[tuple[str, ...]],
+    *,
+    started_at: str,
+    finished_at: str,
+    duration_ms: int,
+) -> JsonObject:
+    """Accumulate one completed active interval into one or more timing scopes."""
+    with _MANIFEST_LOCK:
+        manifest_path = run_root / "manifest.json"
+        manifest = _read_manifest(manifest_path)
+        for scope in scopes:
+            _merge_timing_entry(
+                _timing_target(manifest, scope),
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            )
+        manifest["updated_at"] = utc_now()
+        write_json(manifest_path, manifest)
+        return manifest
+
+
+@contextmanager
+def measure_manifest_timing(
+    run_root: Path,
+    *scopes: tuple[str, ...],
+):
+    """Record elapsed active time even when the measured operation raises."""
+    started_at = utc_now_ms()
+    started_ns = time.monotonic_ns()
+    try:
+        yield
+    finally:
+        record_manifest_timing(
+            run_root,
+            list(scopes),
+            started_at=started_at,
+            finished_at=utc_now_ms(),
+            duration_ms=_elapsed_ms(started_ns),
+        )
 
 
 def _deep_merge(base: JsonObject, overlay: JsonObject) -> JsonObject:
@@ -955,6 +1114,8 @@ def prepare_run_context(
     new_run: bool = False,
     llm_metadata: JsonObject | None = None,
 ) -> RunContext:
+    preparation_started_at = utc_now_ms()
+    preparation_started_ns = time.monotonic_ns()
     if run_id and new_run:
         raise ValueError("--run-id 与 --new-run 不能同时使用")
     selected_sets = resolve_selected_sets(config)
@@ -980,6 +1141,8 @@ def prepare_run_context(
         failure_audit_path=failure_audit_path,
     )
     prompts = _prompt_metadata(config)
+    cluster_prepare_started_at = utc_now_ms()
+    cluster_prepare_started_ns = time.monotonic_ns()
     inputs = _input_metadata(
         config,
         selected_sets,
@@ -988,6 +1151,8 @@ def prepare_run_context(
         failure_audit_path=failure_audit_path,
         source_audit=source.get("field_audit", {}),
     )
+    cluster_prepare_finished_at = utc_now_ms()
+    cluster_prepare_duration_ms = _elapsed_ms(cluster_prepare_started_ns)
     config_id = compute_config_id(config, prompts, inputs, llm_metadata)
     dataset_root = resolved_output / f"{_slug(str(source['name']))}__{source['source_id']}"
     runs_root = dataset_root / "runs"
@@ -1038,7 +1203,7 @@ def prepare_run_context(
         write_json(input_audit_path, input_audit)
         now = utc_now()
         manifest: JsonObject = {
-            "schema_version": 6,
+            "schema_version": 7,
             "pipeline_version": PIPELINE_VERSION,
             "run_id": run_root.name,
             "config_id": config_id,
@@ -1101,8 +1266,30 @@ def prepare_run_context(
             {"changed_at": utc_now(), "previous": manifest.get("configuration")}
         )
         manifest["configuration"] = config
-        manifest["updated_at"] = utc_now()
-        write_json(selected_run_root / "manifest.json", manifest)
+    preparation_finished_at = utc_now_ms()
+    preparation_duration_ms = _elapsed_ms(preparation_started_ns)
+    _merge_run_timing(
+        manifest,
+        phase="initialization",
+        started_at=preparation_started_at,
+        finished_at=preparation_finished_at,
+        duration_ms=preparation_duration_ms,
+        phase_duration_ms=max(
+            0,
+            preparation_duration_ms
+            - (cluster_prepare_duration_ms if "P1" in selected_sets else 0),
+        ),
+        invocation_disposition=disposition,
+    )
+    if "P1" in selected_sets:
+        _merge_timing_entry(
+            _timing_target(manifest, ("stages", "cluster_prepare", "timing")),
+            started_at=cluster_prepare_started_at,
+            finished_at=cluster_prepare_finished_at,
+            duration_ms=cluster_prepare_duration_ms,
+        )
+    manifest["updated_at"] = utc_now()
+    write_json(selected_run_root / "manifest.json", manifest)
     return RunContext(
         source_root=resolved_source,
         output_root=resolved_output,
