@@ -12,6 +12,7 @@ from typing import Any
 from .core import (
     SET_FILES,
     JsonObject,
+    build_cluster_candidate,
     ensure_within,
     get_decision,
     is_testable_difficulty,
@@ -32,6 +33,12 @@ from .core import (
 from .cluster_index import identity_sha256, read_indexed_record, record_sha256
 from .coverage import TaxonomyMappings, load_taxonomy_mappings, stable_take
 from .logging_config import setup_logger
+from .screened_schema import (
+    UPSTREAM_REQUIRED_TARGET_FIELDS,
+    align_upstream_record,
+    inspect_labeled_schema,
+    l2_leaf_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +235,60 @@ def _select_p1(
     )
 
 
+def _align_p1_screened(
+    source_root: Path,
+    selected_refs: list[JsonObject],
+) -> tuple[list[JsonObject], list[JsonObject], JsonObject]:
+    schema = inspect_labeled_schema(
+        source_root / SET_FILES["P1"],
+        required_fields=UPSTREAM_REQUIRED_TARGET_FIELDS,
+    )
+    aligned_refs: list[JsonObject] = []
+    null_counts: Counter[str] = Counter()
+    overwrite_counts: Counter[str] = Counter()
+    normalized_count = 0
+    for item in selected_refs:
+        if item["origin"] == "initial":
+            aligned_item = dict(item)
+            aligned_item["record"] = {
+                field: item["record"][field] for field in schema.fields
+            }
+            aligned_refs.append(aligned_item)
+            continue
+        source_record = item["record"]
+        candidate = build_cluster_candidate(source_record)
+        result = align_upstream_record(
+            source_record,
+            schema,
+            mapped_values={
+                "session_id": sample_identity(source_record)[0],
+                "target_query": candidate["target_query"],
+                "cluster_id": item.get("cluster"),
+                "L1": item["L1"],
+                "L2": l2_leaf_name(str(item["L1"]), item.get("L2")),
+                "set": schema.set_value,
+            },
+        )
+        normalized_count += 1
+        null_counts.update(result.null_fields)
+        overwrite_counts.update(result.overwritten_fields)
+        aligned_item = dict(item)
+        aligned_item["record"] = result.record
+        aligned_refs.append(aligned_item)
+    return (
+        [item["record"] for item in aligned_refs],
+        aligned_refs,
+        {
+            "schema_version": 1,
+            "target_fields": list(schema.fields),
+            "target_set_value": schema.set_value,
+            "normalized_upstream_records": normalized_count,
+            "null_filled_by_field": dict(sorted(null_counts.items())),
+            "overwritten_conflicts_by_field": dict(sorted(overwrite_counts.items())),
+        },
+    )
+
+
 def _category_counts(records: list[JsonObject], field: str) -> Counter[str]:
     return Counter(str(record.get(field) or "未知") for record in records)
 
@@ -275,6 +336,7 @@ def build_screened_samples(
     p1_provenance: list[JsonObject] | None = None
 
     for set_name in selected_sets:
+        schema_alignment: JsonObject | None = None
         rows_by_line = _initial_rows(source_root, set_name)
         results = _results_for_set(run_root, set_name)
         if set_name == "P0":
@@ -308,9 +370,15 @@ def build_screened_samples(
             )
             prescreen = _deduplicate_in_order([item["record"] for item in initial_refs])
             supplement = _deduplicate_in_order([item["record"] for item in supplement_refs])
-            screened, qualified_counts, selected_counts, selected_refs = _select_p1(
+            _, qualified_counts, selected_counts, selected_refs = _select_p1(
                 qualified, quotas, int(policy["p1_coverage"]["seed"])
             )
+            if policy["p1_coverage"]["supplement"]["enabled"]:
+                screened, selected_refs, schema_alignment = _align_p1_screened(
+                    source_root, selected_refs
+                )
+            else:
+                screened = [item["record"] for item in selected_refs]
             p1_provenance = []
             for output_index, item in enumerate(selected_refs, start=1):
                 provenance: JsonObject = {
@@ -324,6 +392,7 @@ def build_screened_samples(
                         item.get("identity_sha256")
                         or identity_sha256(item["record"])
                     ),
+                    "output_identity_sha256": identity_sha256(item["record"]),
                     "output_record_sha256": record_sha256(item["record"]),
                 }
                 if item["origin"] == "initial":
@@ -362,6 +431,8 @@ def build_screened_samples(
         diagnostics[set_name] = _set_diagnostics(
             list(rows_by_line.values()), scores, results, screened
         )
+        if schema_alignment is not None:
+            diagnostics[set_name]["schema_alignment"] = schema_alignment
 
     for set_name, (prescreen, supplement, screened) in output.items():
         write_jsonl(run_prescreen_dataset_path(run_root, set_name), prescreen)

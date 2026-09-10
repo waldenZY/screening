@@ -290,7 +290,7 @@ QUALIFIED + quota
 
 SQLite 不复制完整 JSON，只保存：
 
-- 身份哈希；
+- 原始身份哈希与规范化输出身份哈希；
 - 原始行号、字节偏移、字节长度；
 - Cluster、L1、L2；
 - 稳定随机排名；
@@ -385,6 +385,14 @@ run_root/
 
 P0/P2 不生成 supplement 空文件。P1 的 supplement 数据集保存全部补样 KEEP，不等同于最终按配额入选的子集。
 
+### 7.1 Upstream screened 字段对齐
+
+凡最终入选记录来自 upstream cluster，build 都通过通用 `screened_schema` 模块将其严格投影到目标集合本周 labeled 输入的字段集合和字段顺序。当前只有 P1 使用 upstream 补样，因此实际接入点仅为 P1 build；模块本身不依赖 P1 常量。
+
+P1 固定映射 `session_id`、`target_query`、`cluster_id`、`L1`、`L2` 和 `set`；其中目标 Query 优先取 `raw_query`，内部限定形式的 L2 只输出叶子名称，`__L1_ONLY__` 输出 `null`。`text`、`cluster_prob`、`frequency` 在目标 Schema 存在时直接复制，其他无法可靠生成的字段写 `null`。同义目标字段冲突时由规范映射覆盖，只在 screening summary 记录字段级覆盖数量。P1 初版记录保持原有字段和值；supplement 保持 cluster 原始结构，便于追溯。
+
+启用 upstream 补样的目标集合必须在模型调用前通过 Schema 校验：所有 labeled 记录字段集合一致、非空值类型兼容、`set` 唯一且非空，映射目标字段齐全，ID 类型与 taxonomy/cluster 一致。字段列表、规范化数量、补 null 数量和冲突覆盖数量进入集合 screening summary，并随 build artifact 元数据登记到 manifest。
+
 ## 8. 来源账本与发布校验
 
 P1 最终构建同步生成来源账本，每条最终样本记录：
@@ -404,7 +412,8 @@ P1 最终构建同步生成来源账本，每条最终样本记录：
 3. 全部规范结果合法、唯一且任务覆盖完整；
 4. 来源账本与任务账本一致；
 5. 定点回读记录、目标字段、指纹、去重和顺序正确；
-6. 三个正式文件先写临时文件，再作为一个事务提交。
+6. 对 upstream 来源按同一目标 Schema 和冻结任务分类重建期望记录，并与 screened 一致；
+7. 三个正式文件先写临时文件，再作为一个事务提交。
 
 只有事务完整成功，源目录才看到新的 screened 文件。
 
@@ -463,7 +472,7 @@ prepare-only
 2. L1 内部由稳定候选顺序自然选择 L2，不能保证 L2 比例或最低覆盖。
 3. 更合理的下一步是“L1 硬配额 + L2 软目标”，而不是直接建立 2,595 个全局 L2 硬配额。
 4. P0/P2 已预留补样策略接口，但当前只有 P1 实现 Coverage 补样。
-5. P1 正式文件允许初版记录与上游记录两种原生结构，消费方不能假设所有字段完全一致。
+5. P1 正式文件已统一为该周 P1 labeled Schema；cluster 原生字段需从 supplement 和 provenance 回读。
 6. 首次 50GB+ 索引耗时不可消除；上线前应通过真实数据的准备模式测量吞吐、索引大小和磁盘峰值。
 
 历史方案请参见 [数据筛选链路实现技术方案 v0](screening_pipeline_technical_design_v0.md)。

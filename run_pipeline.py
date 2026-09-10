@@ -469,6 +469,9 @@ def _run_branch(
                 context.run_root,
             ),
         }
+        schema_alignment = branch_summary["sets"][set_name].get("schema_alignment")
+        if schema_alignment is not None:
+            artifacts["screened"]["schema_alignment"] = schema_alignment
         if set_name == "P1" and policy["supplement"]["enabled"]:
             artifacts["supplement"] = _metadata(
                 run_supplement_dataset_path(context.run_root, set_name),

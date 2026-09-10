@@ -14,6 +14,7 @@ from .core import (
     SCREENED_FILES,
     SET_FILES,
     JsonObject,
+    build_cluster_candidate,
     ensure_within,
     get_decision,
     iter_jsonl,
@@ -43,6 +44,12 @@ from .run_context import (
     validate_source_unchanged,
 )
 from .logging_config import setup_logger
+from .screened_schema import (
+    UPSTREAM_REQUIRED_TARGET_FIELDS,
+    align_upstream_record,
+    inspect_labeled_schema,
+    l2_leaf_name,
+)
 
 
 def _load_manifest(run_root: Path) -> JsonObject:
@@ -86,6 +93,14 @@ def _validate_p1_mixed(
     mappings = load_taxonomy_mappings(taxonomy_path)
     screened = load_jsonl(screened_path)
     provenance = load_jsonl(provenance_path)
+    schema = (
+        inspect_labeled_schema(
+            source_path,
+            required_fields=UPSTREAM_REQUIRED_TARGET_FIELDS,
+        )
+        if any(source.get("origin") == "upstream" for source in provenance)
+        else None
+    )
     tasks_path = provenance_path.with_name("supplement_tasks.jsonl")
     tasks = load_jsonl(tasks_path) if tasks_path.is_file() else []
     tasks_by_id = {str(task.get("filter_id")): task for task in tasks}
@@ -95,17 +110,19 @@ def _validate_p1_mixed(
         raise ValueError("P1 screened 与来源账本记录数不一致")
     phase = 0
     previous = {0: 0, 1: 0}
-    seen: set[tuple[str, str]] = set()
+    seen_source_identities: set[str] = set()
     seen_tasks: set[str] = set()
     for index, (row, source) in enumerate(zip(screened, provenance), start=1):
         if source.get("output_index") != index:
             raise ValueError("P1 来源账本 output_index 不连续")
-        identity = sample_identity(row)
-        if identity in seen:
+        source_identity = source.get("identity_sha256")
+        if not isinstance(source_identity, str) or not source_identity:
+            raise ValueError("P1 来源账本原始身份哈希非法")
+        if source_identity in seen_source_identities:
             raise ValueError("P1 screened 存在重复样本")
-        seen.add(identity)
-        if source.get("identity_sha256") != identity_sha256(row):
-            raise ValueError("P1 来源账本身份哈希与输出不一致")
+        seen_source_identities.add(source_identity)
+        if source.get("output_identity_sha256") != identity_sha256(row):
+            raise ValueError("P1 来源账本输出身份哈希与输出不一致")
         if source.get("output_record_sha256") != record_sha256(row):
             raise ValueError("P1 来源账本输出指纹不一致")
         line = source.get("source_line")
@@ -115,12 +132,16 @@ def _validate_p1_mixed(
             if phase != 0 or line <= previous[0] or line not in initial_rows:
                 raise ValueError("P1 初版来源无法关联或出现在上游来源之后")
             original = initial_rows[line]
+            if identity_sha256(original) != source_identity:
+                raise ValueError("P1 初版来源身份哈希不一致")
             if record_sha256(original) != source.get("source_record_sha256"):
                 raise ValueError("P1 初版来源记录指纹不一致")
             if record_fingerprint(original) != record_fingerprint(row):
                 raise ValueError("P1 初版来源与 screened 内容不一致")
             previous[0] = line
         elif source.get("origin") == "upstream":
+            if schema is None:  # Defensive; provenance determined schema loading above.
+                raise ValueError("P1 上游来源缺少 labeled Schema")
             phase = 1
             if line <= previous[1]:
                 raise ValueError("P1 上游来源未按物理行升序输出")
@@ -143,15 +164,26 @@ def _validate_p1_mixed(
             ):
                 raise ValueError("P1 来源账本与补样任务账本不一致")
             original = read_indexed_record(upstream_path, source)
+            if identity_sha256(original) != source_identity:
+                raise ValueError("P1 上游来源身份哈希不一致")
             if record_sha256(original) != source.get("source_record_sha256"):
                 raise ValueError("P1 上游来源记录指纹不一致")
             l1 = mappings.cluster_to_l1.get(original.get("cluster"))
             if l1 is None or l1 != source.get("L1"):
                 raise ValueError("P1 上游来源的 cluster/L1 映射不一致")
-            annotated = dict(original)
-            annotated["_target_level"] = "l1"
-            annotated["_target_category"] = l1
-            if record_fingerprint(annotated) != record_fingerprint(row):
+            expected = align_upstream_record(
+                original,
+                schema,
+                mapped_values={
+                    "session_id": sample_identity(original)[0],
+                    "target_query": build_cluster_candidate(original)["target_query"],
+                    "cluster_id": original.get("cluster"),
+                    "L1": task.get("L1"),
+                    "L2": l2_leaf_name(str(task.get("L1") or ""), task.get("L2")),
+                    "set": schema.set_value,
+                },
+            ).record
+            if record_fingerprint(expected) != record_fingerprint(row):
                 raise ValueError("P1 上游来源与 screened 内容不一致")
             seen_tasks.add(task_id)
             previous[1] = line

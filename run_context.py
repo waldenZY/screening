@@ -37,11 +37,16 @@ from .cluster_index import (
     validate_cluster_source,
 )
 from .coverage import load_taxonomy_mappings
+from .screened_schema import (
+    LabeledSchemaError,
+    UPSTREAM_REQUIRED_TARGET_FIELDS,
+    inspect_labeled_schema,
+)
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = PACKAGE_DIR / "outputs"
 DEFAULT_CONFIG_PATH = PACKAGE_DIR / "artifacts" / "config" / "pipeline.default.json"
-PIPELINE_VERSION = 7
+PIPELINE_VERSION = 8
 _MANIFEST_LOCK = threading.RLock()
 
 INCOMPLETE_STATUSES = {"created", "running", "incomplete", "publish_failed"}
@@ -420,6 +425,7 @@ def build_source_snapshot(
     selected_sets: list[str],
     *,
     failure_audit_path: Path | None = None,
+    schema_alignment_sets: set[str] | None = None,
 ) -> JsonObject:
     resolved_root = source_root.expanduser().resolve()
     if not resolved_root.is_dir():
@@ -449,6 +455,7 @@ def build_source_snapshot(
                     **extra,
                 }
             )
+    alignment_sets = schema_alignment_sets or set()
     snapshot_sets = list(selected_sets)
     if "P1" in selected_sets:
         snapshot_sets.extend(
@@ -526,6 +533,27 @@ def build_source_snapshot(
             "empty_identity_rows": records - nonempty_identity_rows,
             "cluster_id_type_counts": cluster_id_type_counts,
         }
+        if set_name in alignment_sets:
+            try:
+                labeled_schema = inspect_labeled_schema(
+                    path,
+                    required_fields=UPSTREAM_REQUIRED_TARGET_FIELDS,
+                )
+                field_audit["sets"][set_name]["labeled_schema"] = (
+                    labeled_schema.audit_summary()
+                )
+            except LabeledSchemaError as exc:
+                record_issue(
+                    path,
+                    set_name,
+                    exc.source_line,
+                    exc.code,
+                    **exc.details,
+                )
+                field_audit["sets"][set_name]["labeled_schema"] = {
+                    "status": "failed",
+                    "code": exc.code,
+                }
         files[set_name] = {
             "path": SET_FILES[set_name].as_posix(),
             "size": path.stat().st_size,
@@ -790,6 +818,44 @@ def _input_metadata(
             )
             audit_suffix = f"；审计文件: {resolved_audit}"
         raise ValueError(f"{exc}{audit_suffix}") from exc
+    if config["p1_coverage"]["supplement"]["enabled"]:
+        p1_schema = (
+            (source_audit or {}).get("sets", {}).get("P1", {}).get("labeled_schema", {})
+        )
+        schema_cluster_type = p1_schema.get("field_types", {}).get("cluster_id")
+        expected_cluster_type = (
+            "number" if mappings.cluster_id_type == "integer" else "string"
+        )
+        if schema_cluster_type not in {None, expected_cluster_type}:
+            audit_suffix = ""
+            if failure_audit_path is not None:
+                resolved_audit = failure_audit_path.expanduser().resolve()
+                write_json(
+                    resolved_audit,
+                    {
+                        "schema_version": 1,
+                        "status": "failed",
+                        "source_root": str(source_root),
+                        "source": source_audit or {},
+                        "p1_source_mapping": {
+                            "issue_count": 1,
+                            "issue_samples": [
+                                {
+                                    "file": str(source_root / SET_FILES["P1"]),
+                                    "source_line": 1,
+                                    "code": "labeled_cluster_id_type_mismatch",
+                                    "labeled_type": schema_cluster_type,
+                                    "taxonomy_type": mappings.cluster_id_type,
+                                }
+                            ],
+                        },
+                    },
+                )
+                audit_suffix = f"；审计文件: {resolved_audit}"
+            raise ValueError(
+                "P1 labeled cluster_id 类型与 taxonomy cluster ID 类型不一致；"
+                f"未启动任何 LLM 调用{audit_suffix}"
+            )
     p1_source_mapping = _validate_p1_source_mapping(
         source_root,
         mappings,
@@ -1009,6 +1075,8 @@ def _input_audit_summary(audit: JsonObject) -> JsonObject:
     cluster = audit.get("cluster") if isinstance(audit.get("cluster"), dict) else {}
     mapping = audit.get("mapping") if isinstance(audit.get("mapping"), dict) else {}
     source = audit.get("source") if isinstance(audit.get("source"), dict) else {}
+    source_sets = source.get("sets") if isinstance(source.get("sets"), dict) else {}
+    p1_source = source_sets.get("P1") if isinstance(source_sets.get("P1"), dict) else {}
     return {
         "actual_l1_count": computed.get("l1_count"),
         "actual_l2_count": computed.get("l2_count"),
@@ -1020,6 +1088,7 @@ def _input_audit_summary(audit: JsonObject) -> JsonObject:
         "cluster_invalid_records": cluster.get("invalid_records"),
         "source_invalid_records": source.get("issue_count", 0),
         "source_duplicate_identities": source.get("duplicate_identities", 0),
+        "p1_labeled_schema": p1_source.get("labeled_schema"),
     }
 
 
@@ -1139,6 +1208,12 @@ def prepare_run_context(
         source_root,
         selected_sets,
         failure_audit_path=failure_audit_path,
+        schema_alignment_sets=(
+            {"P1"}
+            if "P1" in selected_sets
+            and config["p1_coverage"]["supplement"]["enabled"]
+            else set()
+        ),
     )
     prompts = _prompt_metadata(config)
     cluster_prepare_started_at = utc_now_ms()
@@ -1203,7 +1278,7 @@ def prepare_run_context(
         write_json(input_audit_path, input_audit)
         now = utc_now()
         manifest: JsonObject = {
-            "schema_version": 7,
+            "schema_version": 8,
             "pipeline_version": PIPELINE_VERSION,
             "run_id": run_root.name,
             "config_id": config_id,
@@ -1370,6 +1445,14 @@ def validate_source_unchanged(
         Path(source["source_root"]),
         list(source.get("selected_sets", source["sets"])),
         failure_audit_path=run_root / "input_audit.validation_failed.json",
+        schema_alignment_sets=(
+            {"P1"}
+            if manifest.get("configuration", {})
+            .get("p1_coverage", {})
+            .get("supplement", {})
+            .get("enabled")
+            else set()
+        ),
     )
     if current_source["source_id"] != source["source_id"] or current_source["sets"] != source["sets"]:
         raise ValueError("原始 labeled 文件在运行期间发生变化，拒绝继续或发布")

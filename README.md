@@ -118,6 +118,8 @@ P0/P2 不生成 supplement 空文件。只有所有选中分支完成后，才�
 
 `*_prescreen.jsonl` 表示“初筛后按该集合策略接纳”，因此 P2 文件同时包含 KEEP 和可测困难 REVIEW。P1 的 prescreen 与 supplement 文件保存各阶段全部合格样本；最终 screened 再按配额裁剪。
 
+最终入选且来源为 upstream cluster 的记录会在对应集合 build 内对齐到该周 labeled 输入 Schema。当前只有 P1 存在这种来源：`session_id`、`target_query`、`cluster_id`、`L1`、`L2`、`set` 使用规范映射，`text`、`cluster_prob`、`frequency` 在目标 Schema 存在时直接复制，其余无法可靠生成的字段写 `null`。cluster 特有字段不会进入正式 screened，仍保留在 supplement 和 provenance 中；P1 初版记录的字段和值不变。最终 P1 screened 的每条记录具有与 P1 labeled 输入完全相同的字段集合和字段顺序。
+
 ## P1 Population 和增量补样
 
 - L1 Population 以 taxonomy 的 `total_size` 为准；L2 诊断以 `sub_intents.size` 为准。
@@ -133,6 +135,8 @@ P0/P2 不生成 supplement 空文件。只有所有选中分支完成后，才�
 - `target_n` 默认等于 P1 初版全部合法 JSONL 记录数。
 
 所有 labeled source 记录必须提供 1～5 的整数 `quality_overall_score`，按现有回退规则得到的目标 Query 以及去重身份的 session、文本部分都必须非空。Cluster ID 只能统一使用整数或统一使用非空字符串（噪音值 `-1`/`"-1"` 除外），不自动进行数字/字符串转换。非噪音 Cluster 记录同样要求 Query 和去重身份非空；`-1`/`"-1"` 会直接按噪音排除，不要求这些候选字段。相同去重身份若对应不同目标 Query 或 cluster 会在任何模型调用前失败；完全一致的重复记录仍确定性去重。错误与日志只包含文件、物理行、问题类型和有限样例，不写原始 Query 内容。
+
+启用 P1 upstream 补样时，P1 labeled 的所有记录还必须具有一致的字段集合和兼容的非空值类型，且 `set` 是唯一非空字符串；六个规范映射目标字段必须存在，`cluster_id` 的类型须与 taxonomy/cluster ID 类型一致。此类 Schema 问题会写入输入审计，并在任何 LLM 调用前失败。
 
 完整统计写入缓存和 run 根目录的 `input_audit.json`，manifest 保存审计哈希、摘要和明确采用的 Population、`target_n`、去重口径。源输入在 run 创建前失败时，精简审计写入 `<output_root>/_input_audits/`，异常会给出具体路径。
 
