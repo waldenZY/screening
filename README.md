@@ -15,9 +15,9 @@
 先安装运行依赖，并复制唯一的本地 LLM 配置模板：
 
 ```powershell
-python -m pip install -r filter_v2/requirements.txt
-Copy-Item filter_v2/artifacts/config/llm_config.example.json `
-  filter_v2/artifacts/config/llm_config.local.json
+python -m pip install -r screening/requirements.txt
+Copy-Item screening/artifacts/config/llm_config.example.json `
+  screening/artifacts/config/llm_config.local.json
 ```
 
 然后在 `llm_config.local.json` 中填写 API URL、Key、模型和固定请求参数。该文件已被 Git 忽略；所有命令只读取这一处，不读取环境变量。
@@ -37,13 +37,13 @@ Copy-Item filter_v2/artifacts/config/llm_config.example.json `
 配置完成后直接运行：
 
 ```powershell
-python -m filter_v2.run_pipeline
+python -m screening.run_pipeline
 ```
 
 只处理 P0/P2 时不需要两个 P1 外部输入：
 
 ```powershell
-python -m filter_v2.run_pipeline --sets P0,P2
+python -m screening.run_pipeline --sets P0,P2
 ```
 
 `--dry-run` 是轻量预检：只检查路径、权限、文件大小、配置、Prompt、taxonomy 和 cluster 头部样本；它不会完整扫描 cluster、不会建立索引、不会创建正式 run，并会明确提示完整数据尚未验证。
@@ -51,7 +51,7 @@ python -m filter_v2.run_pipeline --sets P0,P2
 首次处理 50GB+ cluster 时，建议先单独完成准备：
 
 ```powershell
-python -m filter_v2.run_pipeline `
+python -m screening.run_pipeline `
   --prepare-only
 ```
 
@@ -67,7 +67,7 @@ P1-基准集/P1_benchmark_set_v4_labeled.jsonl
 P2-对抗集/P2_adversarial_set_v4_labeled.jsonl
 ```
 
-默认工作区位于当前 Python 包旁，不依赖 `filter_v2` 字面量：
+默认工作区位于当前 `screening` Python 包旁：
 
 ```text
 <package>/outputs/<week>__<source_id>/runs/<timestamp>__<config_id>/

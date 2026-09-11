@@ -2,7 +2,7 @@
 
 Run with::
 
-    python -m filter_v2.retain_prescreened_samples \
+    python -m screening.retain_prescreened_samples \
         --source-root ./source/0803-0809 --run-root ./outputs/run-id
 """
 
