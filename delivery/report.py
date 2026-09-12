@@ -1,0 +1,716 @@
+"""Deterministic, sanitized run-level reporting for screening v2."""
+
+from __future__ import annotations
+
+import json
+from collections import Counter, defaultdict
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+from ..quality.two_stage import (
+    CLASSIFICATION_DIFFICULTIES,
+    TASK_DIFFICULTIES,
+    validate_stage1_result,
+    validate_stage2_result,
+    stage1_passes,
+)
+from ..shared.json_io import JsonObject, write_json
+from ..shared.taxonomy import TaxonomyMappings
+from .screened import validate_screened_canonical_record
+
+
+RUN_REPORT_SCHEMA_VERSION = 1
+RUN_REPORT_JSON = "screening_run_report.json"
+RUN_REPORT_MARKDOWN = "screening_run_report.md"
+SET_NAMES = ("P0", "P1", "P2")
+_CATEGORY_FIT_VALUES = ("exact", "partial", "mismatch")
+_SENSITIVE_KEYS = frozenset({"text", "raw_text", "target_query", "context_turns", "full_text"})
+
+
+class RunReportError(ValueError):
+    """A deterministic report contract or reconciliation failure."""
+
+
+def _ratio(numerator: int, denominator: int) -> JsonObject:
+    if numerator < 0 or denominator < 0 or numerator > denominator:
+        raise RunReportError("报告比例的分子或分母非法")
+    return {
+        "numerator": numerator,
+        "denominator": denominator,
+        "rate": None if denominator == 0 else round(numerator / denominator, 6),
+    }
+
+
+def _is_usable(stage1: Mapping[str, Any]) -> bool:
+    return (
+        stage1["semantic_completeness"] == "self_contained"
+        and stage1["intent_clarity"] == "clear"
+        and stage1["validity"] == "valid"
+    )
+
+
+def _l1_for_l2(taxonomy: TaxonomyMappings, l2_key: str) -> str:
+    matches = [l1 for l1 in taxonomy.l1_order if l2_key.startswith(f"{l1}/")]
+    if not matches:
+        raise RunReportError(f"报告无法定位 L2 所属 L1: {l2_key}")
+    return max(matches, key=len)
+
+
+def _l2_name(l1: str, l2_key: str) -> str:
+    prefix = f"{l1}/"
+    if not l2_key.startswith(prefix) or len(l2_key) == len(prefix):
+        raise RunReportError(f"报告 L2 key 非法: {l2_key}")
+    return l2_key[len(prefix):]
+
+
+def _empty_counts() -> dict[str, Any]:
+    return {
+        "stage1_evaluated": 0,
+        "usable_queries": 0,
+        "category_exact_among_usable": 0,
+        "stage1_pass": 0,
+        "final_count": 0,
+        "category_fit": Counter(),
+    }
+
+
+def _add_stage1(counts: dict[str, Any], result: Mapping[str, Any]) -> None:
+    counts["stage1_evaluated"] += 1
+    counts["category_fit"][result["category_fit"]] += 1
+    usable = _is_usable(result)
+    if usable:
+        counts["usable_queries"] += 1
+        if result["category_fit"] == "exact":
+            counts["category_exact_among_usable"] += 1
+    if stage1_passes(result):
+        counts["stage1_pass"] += 1
+
+
+def _finalize_counts(counts: Mapping[str, Any]) -> JsonObject:
+    evaluated = int(counts["stage1_evaluated"])
+    usable = int(counts["usable_queries"])
+    exact = int(counts["category_exact_among_usable"])
+    passed = int(counts["stage1_pass"])
+    return {
+        "stage1_evaluated": evaluated,
+        "usable_queries": usable,
+        "query_usability_rate": _ratio(usable, evaluated),
+        "category_fit_distribution": {
+            value: int(counts["category_fit"].get(value, 0))
+            for value in _CATEGORY_FIT_VALUES
+        },
+        "category_exact_among_usable": exact,
+        "semantic_label_fit_rate": _ratio(exact, usable),
+        "stage1_pass": passed,
+        "stage1_admission_rate": _ratio(passed, evaluated),
+        "final_count": int(counts["final_count"]),
+    }
+
+
+def _distribution(
+    values: Counter[str],
+    allowed: Sequence[str] | None = None,
+) -> JsonObject:
+    keys = list(allowed) if allowed is not None else sorted(values)
+    return {key: int(values.get(key, 0)) for key in keys}
+
+
+def build_run_report(
+    *,
+    run_id: str,
+    taxonomy: TaxonomyMappings,
+    evaluated_candidates: Mapping[str, Sequence[Mapping[str, Any]]],
+    evaluation_rounds: Mapping[str, Mapping[str, int]],
+    stage1_results: Mapping[str, Mapping[str, Any]],
+    final_records: Mapping[str, Sequence[Mapping[str, Any]]],
+    p1_target_quotas: Mapping[str, int],
+    build_summary: Mapping[str, Any],
+) -> JsonObject:
+    """Build a complete report without retaining any query text."""
+    if set(evaluated_candidates) != set(SET_NAMES) or set(final_records) != set(SET_NAMES):
+        raise RunReportError("报告必须同时包含 P0/P1/P2")
+    if set(evaluation_rounds) != set(SET_NAMES):
+        raise RunReportError("报告候选轮次必须同时包含 P0/P1/P2")
+
+    l2_to_l1 = {
+        l2_key: _l1_for_l2(taxonomy, l2_key)
+        for l2_key in taxonomy.l2_population
+    }
+    sets: JsonObject = {}
+    total_final = 0
+
+    for set_name in SET_NAMES:
+        set_counts = _empty_counts()
+        node_counts = {key: _empty_counts() for key in taxonomy.l2_population}
+        wave_counts: dict[int, dict[str, Any]] = defaultdict(_empty_counts)
+        seen_identities: set[str] = set()
+
+        for candidate in evaluated_candidates[set_name]:
+            identity = str(candidate["source_identity_sha256"])
+            if identity in seen_identities:
+                raise RunReportError(f"{set_name} 报告候选 identity 重复")
+            seen_identities.add(identity)
+            taxonomy_value = candidate["taxonomy"]
+            l2_key = str(taxonomy_value["l2_key"])
+            if l2_key not in node_counts:
+                raise RunReportError(f"{set_name} 报告候选 L2 不在 taxonomy")
+            if taxonomy_value["l1"] != l2_to_l1[l2_key]:
+                raise RunReportError(f"{set_name} 报告候选 L1/L2 不一致")
+            result = validate_stage1_result(dict(stage1_results[identity]))
+            round_id = evaluation_rounds[set_name].get(identity)
+            if isinstance(round_id, bool) or not isinstance(round_id, int) or round_id < 0:
+                raise RunReportError(f"{set_name} 报告候选缺少合法轮次")
+            if set_name != "P1" and round_id != 0:
+                raise RunReportError(f"{set_name} 不得出现补采轮次")
+            _add_stage1(set_counts, result)
+            _add_stage1(node_counts[l2_key], result)
+            _add_stage1(wave_counts[round_id], result)
+
+        final_round_counts: Counter[int] = Counter()
+        final_quality = {
+            "classification_difficulty": Counter(),
+            "task_difficulty": Counter(),
+            "issue_types": Counter(),
+            "overall_score": Counter(),
+        }
+        final_l2_counts: Counter[str] = Counter()
+        for record in final_records[set_name]:
+            validate_screened_canonical_record(record)
+            if record["set"] != set_name:
+                raise RunReportError(f"{set_name} 报告混入其他集合记录")
+            candidate = record["candidate"]
+            identity = str(candidate["source_identity_sha256"])
+            if identity not in seen_identities:
+                raise RunReportError(f"{set_name} 最终记录未出现在候选统计中")
+            l2_key = str(candidate["taxonomy"]["l2_key"])
+            node_counts[l2_key]["final_count"] += 1
+            set_counts["final_count"] += 1
+            final_l2_counts[l2_key] += 1
+            round_id = int(record["selection"]["round_id"])
+            final_round_counts[round_id] += 1
+            quality = record["quality"]
+            stage1 = validate_stage1_result(
+                {
+                    key: quality[key]
+                    for key in ("category_fit", "semantic_completeness", "intent_clarity", "validity")
+                }
+            )
+            validate_stage2_result(
+                {
+                    key: quality[key]
+                    for key in (
+                        "classification_difficulty",
+                        "task_difficulty",
+                        "issue_types",
+                        "overall_score",
+                    )
+                },
+                stage1,
+            )
+            final_quality["classification_difficulty"][quality["classification_difficulty"]] += 1
+            final_quality["task_difficulty"][quality["task_difficulty"]] += 1
+            for issue in quality["issue_types"]:
+                final_quality["issue_types"][issue] += 1
+            final_quality["overall_score"][str(quality["overall_score"])] += 1
+
+        target_scope = {
+            key for key, value in p1_target_quotas.items() if int(value) > 0
+        } if set_name == "P1" else {
+            key
+            for key, value in node_counts.items()
+            if int(value["stage1_evaluated"]) > 0
+        }
+        covered_l2 = {key for key, count in final_l2_counts.items() if count > 0}
+        covered_l1 = {l2_to_l1[key] for key in covered_l2}
+        target_covered = covered_l2 & target_scope
+
+        l2_rows: list[JsonObject] = []
+        for l2_key, population in taxonomy.l2_population.items():
+            l1 = l2_to_l1[l2_key]
+            row = {
+                "l1": l1,
+                "l2": _l2_name(l1, l2_key),
+                "l2_key": l2_key,
+                "taxonomy_population": int(population),
+                **_finalize_counts(node_counts[l2_key]),
+                "final_share": (
+                    None
+                    if set_counts["final_count"] == 0
+                    else round(node_counts[l2_key]["final_count"] / set_counts["final_count"], 6)
+                ),
+                "target_quota": (
+                    int(p1_target_quotas.get(l2_key, 0)) if set_name == "P1" else None
+                ),
+                "deficit": (
+                    max(
+                        0,
+                        int(p1_target_quotas.get(l2_key, 0))
+                        - int(node_counts[l2_key]["final_count"]),
+                    )
+                    if set_name == "P1"
+                    else None
+                ),
+                "in_coverage_scope": l2_key in target_scope,
+            }
+            l2_rows.append(row)
+
+        tree: list[JsonObject] = []
+        for l1 in taxonomy.l1_order:
+            children = [row for row in l2_rows if row["l1"] == l1]
+            l1_counts = _empty_counts()
+            for child in children:
+                l1_counts["stage1_evaluated"] += child["stage1_evaluated"]
+                l1_counts["usable_queries"] += child["usable_queries"]
+                l1_counts["category_exact_among_usable"] += child["category_exact_among_usable"]
+                l1_counts["stage1_pass"] += child["stage1_pass"]
+                l1_counts["final_count"] += child["final_count"]
+                l1_counts["category_fit"].update(child["category_fit_distribution"])
+            target_children = [row for row in children if row["in_coverage_scope"]]
+            covered_children = [row for row in target_children if row["final_count"] > 0]
+            tree.append(
+                {
+                    "l1": l1,
+                    "taxonomy_population": int(taxonomy.l1_population[l1]),
+                    "taxonomy_l2_count": len(children),
+                    "coverage_scope_l2_count": len(target_children),
+                    "covered_scope_l2_count": len(covered_children),
+                    "scope_l2_coverage_rate": _ratio(
+                        len(covered_children), len(target_children)
+                    ),
+                    "target_quota": (
+                        sum(int(row["target_quota"]) for row in children)
+                        if set_name == "P1"
+                        else None
+                    ),
+                    **_finalize_counts(l1_counts),
+                    "l2": children,
+                }
+            )
+
+        quota_fulfilled = sum(
+            min(final_l2_counts.get(key, 0), int(quota))
+            for key, quota in p1_target_quotas.items()
+        )
+        quota_total = sum(int(value) for value in p1_target_quotas.values())
+        distribution_deviation: float | None = None
+        if set_name == "P1" and quota_total and set_counts["final_count"]:
+            distribution_deviation = round(
+                0.5
+                * sum(
+                    abs(
+                        final_l2_counts.get(key, 0) / set_counts["final_count"]
+                        - int(quota) / quota_total
+                    )
+                    for key, quota in p1_target_quotas.items()
+                ),
+                6,
+            )
+
+        wave_rows = []
+        for round_id in sorted(wave_counts):
+            values = _finalize_counts(wave_counts[round_id])
+            values.update(
+                {
+                    "origin": "initial_wave" if round_id == 0 else "supplement_wave",
+                    "round_id": round_id,
+                    "final_count": int(final_round_counts.get(round_id, 0)),
+                }
+            )
+            wave_rows.append(values)
+
+        set_report = {
+            "coverage_scope": "p1_target_quota_l2" if set_name == "P1" else "stage1_evaluated_l2",
+            **_finalize_counts(set_counts),
+            "taxonomy_l1_coverage_rate": _ratio(
+                len(covered_l1), len(taxonomy.l1_order)
+            ),
+            "taxonomy_l2_coverage_rate": _ratio(
+                len(covered_l2), len(taxonomy.l2_population)
+            ),
+            "scope_l2_coverage_rate": _ratio(
+                len(target_covered), len(target_scope)
+            ),
+            "p1_quota_fulfillment_rate": (
+                _ratio(quota_fulfilled, quota_total) if set_name == "P1" else None
+            ),
+            "p1_target_distribution_deviation": distribution_deviation,
+            "waves": wave_rows,
+            "final_quality_distribution": {
+                "classification_difficulty": _distribution(
+                    final_quality["classification_difficulty"],
+                    sorted(CLASSIFICATION_DIFFICULTIES),
+                ),
+                "task_difficulty": _distribution(
+                    final_quality["task_difficulty"],
+                    sorted(TASK_DIFFICULTIES),
+                ),
+                "issue_types": _distribution(final_quality["issue_types"]),
+                "overall_score": _distribution(
+                    final_quality["overall_score"], ("1", "2", "3", "4", "5")
+                ),
+            },
+            "semantic_tree": tree,
+        }
+        sets[set_name] = set_report
+        total_final += int(set_counts["final_count"])
+
+    report: JsonObject = {
+        "report_schema_version": RUN_REPORT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "metric_notice": (
+            "semantic_label_fit_rate is an LLM-as-judge agreement estimate, "
+            "not a human-gold accuracy measurement"
+        ),
+        "metric_definitions": {
+            "query_usability_rate": (
+                "self_contained + clear + valid / all completed stage1 candidates"
+            ),
+            "semantic_label_fit_rate": (
+                "category_fit=exact among self_contained + clear + valid candidates"
+            ),
+            "stage1_admission_rate": (
+                "exact + self_contained + clear + valid / all completed stage1 candidates"
+            ),
+            "scope_l2_coverage_rate": (
+                "final covered L2 / reporting scope L2; P1 uses frozen quota L2, "
+                "P0/P2 use stage1-evaluated L2"
+            ),
+            "p1_quota_fulfillment_rate": (
+                "sum(min(final L2 count, frozen quota)) / sum(frozen L2 quota)"
+            ),
+        },
+        "taxonomy": {
+            "l1_count": len(taxonomy.l1_order),
+            "l2_count": len(taxonomy.l2_population),
+            "declared_l1_population": sum(taxonomy.l1_population.values()),
+            "declared_l2_population": sum(taxonomy.l2_population.values()),
+        },
+        "totals": {
+            "final_records_across_sets": total_final,
+            "cross_set_overlap": dict(build_summary.get("cross_set_overlap", {})),
+        },
+        "sets": sets,
+    }
+    validate_run_report(report)
+    return report
+
+
+def _validate_ratio(value: Any, label: str) -> None:
+    if not isinstance(value, Mapping) or set(value) != {"numerator", "denominator", "rate"}:
+        raise RunReportError(f"{label} 比例结构非法")
+    numerator = value["numerator"]
+    denominator = value["denominator"]
+    if (
+        isinstance(numerator, bool)
+        or not isinstance(numerator, int)
+        or isinstance(denominator, bool)
+        or not isinstance(denominator, int)
+        or numerator < 0
+        or denominator < 0
+        or numerator > denominator
+    ):
+        raise RunReportError(f"{label} 比例数值非法")
+    expected = None if denominator == 0 else round(numerator / denominator, 6)
+    if value["rate"] != expected:
+        raise RunReportError(f"{label} 比例计算不一致")
+
+
+def _reject_sensitive_keys(value: Any) -> None:
+    if isinstance(value, Mapping):
+        if _SENSITIVE_KEYS & set(value):
+            raise RunReportError("批跑报告不得包含 Query 正文相关字段")
+        for child in value.values():
+            _reject_sensitive_keys(child)
+    elif isinstance(value, list):
+        for child in value:
+            _reject_sensitive_keys(child)
+
+
+def validate_run_report(report: Mapping[str, Any]) -> None:
+    """Strictly validate report totals, ratios, hierarchy, and privacy."""
+    expected_top = {
+        "report_schema_version",
+        "run_id",
+        "metric_notice",
+        "metric_definitions",
+        "taxonomy",
+        "totals",
+        "sets",
+    }
+    if not isinstance(report, Mapping) or set(report) != expected_top:
+        raise RunReportError("批跑报告顶层字段不一致")
+    if report.get("report_schema_version") != RUN_REPORT_SCHEMA_VERSION:
+        raise RunReportError("批跑报告 schema version 非法")
+    if not isinstance(report.get("run_id"), str) or not report["run_id"]:
+        raise RunReportError("批跑报告 run_id 非法")
+    if not isinstance(report.get("sets"), Mapping) or set(report["sets"]) != set(SET_NAMES):
+        raise RunReportError("批跑报告集合不完整")
+    _reject_sensitive_keys(report)
+
+    total_final = 0
+    for set_name in SET_NAMES:
+        set_report = report["sets"][set_name]
+        if not isinstance(set_report, Mapping):
+            raise RunReportError(f"{set_name} 报告必须是对象")
+        for metric in (
+            "query_usability_rate",
+            "semantic_label_fit_rate",
+            "stage1_admission_rate",
+            "taxonomy_l1_coverage_rate",
+            "taxonomy_l2_coverage_rate",
+            "scope_l2_coverage_rate",
+        ):
+            _validate_ratio(set_report.get(metric), f"{set_name}.{metric}")
+        quota_metric = set_report.get("p1_quota_fulfillment_rate")
+        if set_name == "P1":
+            _validate_ratio(quota_metric, "P1.p1_quota_fulfillment_rate")
+        elif quota_metric is not None:
+            raise RunReportError(f"{set_name} 不得包含 P1 配额完成率")
+
+        tree = set_report.get("semantic_tree")
+        if not isinstance(tree, list) or len(tree) != report["taxonomy"]["l1_count"]:
+            raise RunReportError(f"{set_name} 语义树 L1 数量非法")
+        l2_rows = []
+        for l1_row in tree:
+            if not isinstance(l1_row, Mapping) or not isinstance(l1_row.get("l2"), list):
+                raise RunReportError(f"{set_name} 语义树节点非法")
+            _validate_ratio(
+                l1_row.get("scope_l2_coverage_rate"),
+                f"{set_name}.{l1_row.get('l1')}.scope_l2_coverage_rate",
+            )
+            l2_rows.extend(l1_row["l2"])
+        if len(l2_rows) != report["taxonomy"]["l2_count"]:
+            raise RunReportError(f"{set_name} 语义树 L2 数量非法")
+        if sum(int(row["stage1_evaluated"]) for row in l2_rows) != set_report["stage1_evaluated"]:
+            raise RunReportError(f"{set_name} L2 候选统计不守恒")
+        if sum(int(row["final_count"]) for row in l2_rows) != set_report["final_count"]:
+            raise RunReportError(f"{set_name} L2 最终统计不守恒")
+        if sum(int(row["stage1_evaluated"]) for row in tree) != set_report["stage1_evaluated"]:
+            raise RunReportError(f"{set_name} L1 候选统计不守恒")
+        if sum(int(row["final_count"]) for row in tree) != set_report["final_count"]:
+            raise RunReportError(f"{set_name} L1 最终统计不守恒")
+        if sum(int(value) for value in set_report["category_fit_distribution"].values()) != set_report["stage1_evaluated"]:
+            raise RunReportError(f"{set_name} category_fit 分布不守恒")
+        if sum(int(row["stage1_evaluated"]) for row in set_report["waves"]) != set_report["stage1_evaluated"]:
+            raise RunReportError(f"{set_name} 波次候选统计不守恒")
+        if sum(int(row["final_count"]) for row in set_report["waves"]) != set_report["final_count"]:
+            raise RunReportError(f"{set_name} 波次最终统计不守恒")
+        total_final += int(set_report["final_count"])
+
+    if report["totals"].get("final_records_across_sets") != total_final:
+        raise RunReportError("批跑报告总记录数不守恒")
+
+
+def _pct(metric: Mapping[str, Any] | None) -> str:
+    if metric is None or metric.get("rate") is None:
+        return "—"
+    return f"{float(metric['rate']) * 100:.2f}%"
+
+
+def _cell(value: Any) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def render_run_report(report: Mapping[str, Any]) -> str:
+    """Render the validated JSON report as a presentation-friendly Markdown file."""
+    validate_run_report(report)
+    lines = [
+        "# Screening v2 批跑报告",
+        "",
+        f"> Run ID：`{_cell(report['run_id'])}`  ",
+        "> 语义标签一致率由 Stage1 LLM 判断得到，是自动评估指标，不等同于人工金标准确率。",
+        "",
+        "## 核心汇报指标",
+        "",
+        "| 集合 | Stage1 候选 | Query 基础可用率 | 语义标签一致率 | Stage1 准入率 | 最终数量 | 目标范围 L2 覆盖率 | P1 配额完成率 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for set_name in SET_NAMES:
+        value = report["sets"][set_name]
+        lines.append(
+            f"| {set_name} | {value['stage1_evaluated']} | "
+            f"{_pct(value['query_usability_rate'])} | "
+            f"{_pct(value['semantic_label_fit_rate'])} | "
+            f"{_pct(value['stage1_admission_rate'])} | "
+            f"{value['final_count']} | {_pct(value['scope_l2_coverage_rate'])} | "
+            f"{_pct(value['p1_quota_fulfillment_rate'])} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 指标口径",
+            "",
+            "- Query 基础可用率：Stage1 候选中同时满足 self_contained、clear、valid 的比例。",
+            "- 语义标签一致率：基础可用 Query 中 category_fit=exact 的比例。",
+            "- Stage1 准入率：四项同时满足 exact、self_contained、clear、valid 的比例。",
+            "- P1 的目标范围为冻结配额大于 0 的 L2；P0/P2 的目标范围为实际进入 Stage1 的 L2。",
+            "- 最终集 category_fit=exact 为准入约束，不作为独立准确率结论。",
+        ]
+    )
+
+    for set_name in SET_NAMES:
+        value = report["sets"][set_name]
+        lines.extend(
+            [
+                "",
+                f"## {set_name} 语义树分布",
+                "",
+                f"- 最终数量：{value['final_count']}",
+                f"- Taxonomy L1 覆盖率：{_pct(value['taxonomy_l1_coverage_rate'])}",
+                f"- Taxonomy L2 覆盖率：{_pct(value['taxonomy_l2_coverage_rate'])}",
+                f"- 目标范围 L2 覆盖率：{_pct(value['scope_l2_coverage_rate'])}",
+            ]
+        )
+        if set_name == "P1":
+            lines.extend(
+                [
+                    f"- 冻结 L2 配额完成率：{_pct(value['p1_quota_fulfillment_rate'])}",
+                    (
+                        "- 最终分布与配额分布偏差："
+                        + (
+                            "—"
+                            if value["p1_target_distribution_deviation"] is None
+                            else f"{value['p1_target_distribution_deviation']:.6f}"
+                        )
+                    ),
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "| L1 | Taxonomy population | L2 数 | 目标 L2 | 已覆盖目标 L2 | Stage1 候选 | 基础可用率 | 标签一致率 | Stage1 通过 | 最终数量 |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for l1_row in value["semantic_tree"]:
+            lines.append(
+                f"| {_cell(l1_row['l1'])} | {l1_row['taxonomy_population']} | "
+                f"{l1_row['taxonomy_l2_count']} | {l1_row['coverage_scope_l2_count']} | "
+                f"{l1_row['covered_scope_l2_count']} | {l1_row['stage1_evaluated']} | "
+                f"{_pct(l1_row['query_usability_rate'])} | "
+                f"{_pct(l1_row['semantic_label_fit_rate'])} | "
+                f"{l1_row['stage1_pass']} | {l1_row['final_count']} |"
+            )
+
+        relevant_l2 = [
+            row
+            for l1_row in value["semantic_tree"]
+            for row in l1_row["l2"]
+            if row["stage1_evaluated"] or row["final_count"] or row["in_coverage_scope"]
+        ]
+        lines.extend(
+            [
+                "",
+                "### L2 明细",
+                "",
+                "| L1 | L2 | Population | 配额 | Stage1 候选 | 基础可用 | exact（可用中） | 标签一致率 | Stage1 通过 | 最终数量 | 缺口 |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in relevant_l2:
+            quota = "—" if row["target_quota"] is None else row["target_quota"]
+            deficit = "—" if row["deficit"] is None else row["deficit"]
+            lines.append(
+                f"| {_cell(row['l1'])} | {_cell(row['l2'])} | "
+                f"{row['taxonomy_population']} | {quota} | {row['stage1_evaluated']} | "
+                f"{row['usable_queries']} | {row['category_exact_among_usable']} | "
+                f"{_pct(row['semantic_label_fit_rate'])} | {row['stage1_pass']} | "
+                f"{row['final_count']} | {deficit} |"
+            )
+
+        lines.extend(
+            [
+                "",
+                "### 波次统计",
+                "",
+                "| 来源 | 轮次 | Stage1 候选 | 基础可用率 | 标签一致率 | Stage1 通过 | 最终入选 |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for wave in value["waves"]:
+            lines.append(
+                f"| {wave['origin']} | {wave['round_id']} | {wave['stage1_evaluated']} | "
+                f"{_pct(wave['query_usability_rate'])} | "
+                f"{_pct(wave['semantic_label_fit_rate'])} | "
+                f"{wave['stage1_pass']} | {wave['final_count']} |"
+            )
+
+        category = value["category_fit_distribution"]
+        lines.extend(
+            [
+                "",
+                "### 质量与难度摘要",
+                "",
+                f"- Stage1 category_fit：exact={category['exact']}，partial={category['partial']}，mismatch={category['mismatch']}。",
+                f"- Stage2 classification_difficulty：{json.dumps(value['final_quality_distribution']['classification_difficulty'], ensure_ascii=False, sort_keys=True)}。",
+                f"- Stage2 task_difficulty：{json.dumps(value['final_quality_distribution']['task_difficulty'], ensure_ascii=False, sort_keys=True)}。",
+                f"- Stage2 overall_score：{json.dumps(value['final_quality_distribution']['overall_score'], ensure_ascii=False, sort_keys=True)}。",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 结论使用说明",
+            "",
+            "- “全面性”主要看 P1 的目标范围 L2 覆盖率、冻结配额完成率和逐 L2 缺口。",
+            "- P0/P2 有各自的结构和困难样本门槛，不应以全 taxonomy L2 覆盖作为硬目标。",
+            "- “可用性”同时参考 Query 基础可用率、语义标签一致率和 Stage1 准入率。",
+            "- 如需对外声明真实标签准确率，应在此自动报告之外增加按 L2 分层的人工抽检。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_run_report(
+    run_root: Path,
+    *,
+    run_id: str,
+    taxonomy: TaxonomyMappings,
+    evaluated_candidates: Mapping[str, Sequence[Mapping[str, Any]]],
+    evaluation_rounds: Mapping[str, Mapping[str, int]],
+    stage1_results: Mapping[str, Mapping[str, Any]],
+    final_records: Mapping[str, Sequence[Mapping[str, Any]]],
+    p1_target_quotas: Mapping[str, int],
+    build_summary: Mapping[str, Any],
+) -> JsonObject:
+    """Write deterministic JSON and Markdown report artifacts."""
+    report = build_run_report(
+        run_id=run_id,
+        taxonomy=taxonomy,
+        evaluated_candidates=evaluated_candidates,
+        evaluation_rounds=evaluation_rounds,
+        stage1_results=stage1_results,
+        final_records=final_records,
+        p1_target_quotas=p1_target_quotas,
+        build_summary=build_summary,
+    )
+    run_root = run_root.expanduser().resolve()
+    write_json(run_root / RUN_REPORT_JSON, report)
+    (run_root / RUN_REPORT_MARKDOWN).write_text(
+        render_run_report(report), encoding="utf-8", newline="\n"
+    )
+    return report
+
+
+def load_and_validate_run_report(run_root: Path) -> JsonObject:
+    """Validate both report files and their deterministic equivalence."""
+    run_root = run_root.expanduser().resolve()
+    try:
+        report = json.loads((run_root / RUN_REPORT_JSON).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunReportError("无法读取 JSON 批跑报告") from exc
+    if not isinstance(report, dict):
+        raise RunReportError("JSON 批跑报告必须是对象")
+    validate_run_report(report)
+    expected_markdown = render_run_report(report)
+    try:
+        actual_markdown = (run_root / RUN_REPORT_MARKDOWN).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RunReportError("无法读取 Markdown 批跑报告") from exc
+    if actual_markdown != expected_markdown:
+        raise RunReportError("Markdown 批跑报告与 JSON 事实源不一致")
+    return report

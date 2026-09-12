@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-PACKAGE_DIR = Path(__file__).resolve().parent
-DEFAULT_LLM_CONFIG_PATH = PACKAGE_DIR / "artifacts" / "config" / "llm_config.local.json"
-EXAMPLE_LLM_CONFIG_PATH = PACKAGE_DIR / "artifacts" / "config" / "llm_config.example.json"
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_LLM_CONFIG_PATH = PACKAGE_ROOT / "artifacts" / "config" / "llm_config.local.json"
+EXAMPLE_LLM_CONFIG_PATH = PACKAGE_ROOT / "artifacts" / "config" / "llm_config.example.json"
+
+LlmCall = Callable[..., tuple[str, float, float]]
 
 _CONFIG_FIELDS = {
     "api_url",

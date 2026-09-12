@@ -1,0 +1,55 @@
+{
+  "common": {
+    "sets": ["P0", "P1", "P2"],
+    "log_level": "INFO"
+  },
+  "inputs": {
+    "source_root": "",
+    "taxonomy": "",
+    "upstream_cluster_population": ""
+  },
+  "quality_control": {
+    "prompt": "../prompts/validity_filter_prompt.md",
+    "workers": 2,
+    "sleep": 1.0,
+    "max_retries": 3,
+    "limit": 0
+  },
+  "p0": {
+    "scores": [2, 3, 4, 5],
+    "accept": ["KEEP"],
+    "supplement": {"enabled": false, "strategy": "none"}
+  },
+  "p1_coverage": {
+    "scores": [3, 4, 5],
+    "accept": ["KEEP"],
+    "supplement": {"enabled": true, "strategy": "coverage_quota"},
+    "alpha": 0.5,
+    "target_n": null,
+    "seed": 42,
+    "max_rounds": 3,
+    "default_pass_rate": 0.55,
+    "pass_rate_prior_strength": 10.0,
+    "min_pass_rate": 0.10,
+    "max_pass_rate": 0.95,
+    "safety_factor": 1.1
+  },
+  "p2": {
+    "scores": [3, 4, 5],
+    "accept": ["KEEP", "TESTABLE_DIFFICULTY_REVIEW"],
+    "supplement": {"enabled": false, "strategy": "none"}
+  },
+  "large_inputs": {
+    "cluster_cache_root": null,
+    "index_batch_size": 10000,
+    "progress_every": 100000,
+    "sqlite_cache_mb": 64,
+    "min_free_space_gb": 3.0,
+    "reserve_free_space_gb": 1.0,
+    "verify_full_cluster_hash": false,
+    "cleanup_index_after_publish": true
+  },
+  "publication": {
+    "enabled": true
+  }
+}

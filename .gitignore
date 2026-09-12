@@ -1,4 +1,6 @@
-outputs/
+outputs_v2/
+.pytest_cache/
+.pytest_tmp*/
 __pycache__/
 *.py[cod]
 artifacts/config/llm_config.local.json

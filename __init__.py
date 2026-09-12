@@ -1,2 +1,2 @@
-"""Policy-specific P0/P1/P2 screening and P1 Coverage pipeline."""
+"""Canonical P0/P1/P2 screening pipeline with P1-only supplementation."""
 
