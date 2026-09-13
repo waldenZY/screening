@@ -44,8 +44,12 @@ class P1SupplementConfig:
     safety_factor: float = 1.1
 
     def __post_init__(self) -> None:
-        if self.max_rounds < 0:
-            raise ValueError("max_rounds 不能为负数")
+        if (
+            isinstance(self.max_rounds, bool)
+            or not isinstance(self.max_rounds, int)
+            or self.max_rounds < 0
+        ):
+            raise ValueError("max_rounds 必须是非负整数")
         if not 0 < self.minimum_pass_rate <= self.maximum_pass_rate <= 1:
             raise ValueError("补采通过率范围非法")
         if not self.minimum_pass_rate <= self.default_pass_rate <= self.maximum_pass_rate:
@@ -77,8 +81,8 @@ def _only(mapping: Mapping[str, Any], allowed: set[str], label: str) -> None:
         raise ValueError(f"{label} 包含未知字段: {sorted(extra)}")
 
 
-def load_build_config(path: Path) -> BuildConfig:
-    value = json.loads(path.read_text(encoding="utf-8"))
+def parse_build_config(value: Mapping[str, Any]) -> BuildConfig:
+    """Parse the versioned sampling/supplement portion of a configuration."""
     if not isinstance(value, dict):
         raise ValueError("P012 构建配置必须是 JSON 对象")
     _only(value, {"config_version", "sampling", "p1_supplement"}, "配置")

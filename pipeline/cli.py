@@ -19,10 +19,9 @@ from ..shared.taxonomy import TaxonomyMappings, load_taxonomy_mappings
 from ..delivery.legacy import LEGACY_MAPPING_VERSION
 from ..delivery.report import RUN_REPORT_SCHEMA_VERSION
 from ..shared.llm import LlmConfig, load_llm_config, validate_llm_dependency
-from .orchestrator import BuildConfig, load_build_config, run_build
+from .orchestrator import BuildConfig, run_build
 from ..delivery.screened import SCREENED_CANONICAL_SCHEMA_VERSION
 from ..quality.two_stage import (
-    QualityRunConfig,
     QualityStageIncomplete,
     TwoStageQualityRunner,
 )
@@ -33,6 +32,11 @@ from ..delivery.publish import (
     validate_manifest_artifacts,
     validate_manifest_inputs,
     validate_manifest_source,
+)
+from .config import (
+    apply_pipeline_overrides,
+    configure_logging,
+    load_pipeline_config,
 )
 from .run_context import (
     RunContext,
@@ -46,10 +50,7 @@ from .run_context import (
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT_ROOT = PACKAGE_ROOT / "outputs_v2"
 DEFAULT_CONFIG_PATH = PACKAGE_ROOT / "artifacts" / "config" / "pipeline.default.json"
-DEFAULT_STAGE1_PROMPT = PACKAGE_ROOT / "artifacts" / "prompts" / "quality_stage1.md"
-DEFAULT_STAGE2_PROMPT = PACKAGE_ROOT / "artifacts" / "prompts" / "quality_stage2.md"
 
 
 def _read_manifest(run_root: Path) -> JsonObject:
@@ -247,41 +248,49 @@ def execute_pipeline(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="构建并发布 screening v2 P0/P1/P2 数据集")
-    parser.add_argument("--source", type=Path, required=True, help="cluster JSONL")
-    parser.add_argument("--taxonomy", type=Path, required=True, help="taxonomy JSON")
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--source", type=Path, default=None, help="覆盖配置中的 cluster JSONL")
+    parser.add_argument("--taxonomy", type=Path, default=None, help="覆盖配置中的 taxonomy JSON")
+    parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--publish-root", type=Path, default=None)
     parser.add_argument("--no-publish", action="store_true")
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--new-run", action="store_true")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--stage1-prompt", type=Path, default=DEFAULT_STAGE1_PROMPT)
-    parser.add_argument("--stage2-prompt", type=Path, default=DEFAULT_STAGE2_PROMPT)
-    parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--max-retries", type=int, default=3)
-    parser.add_argument("--sleep", type=float, default=1.0)
+    parser.add_argument("--stage1-prompt", type=Path, default=None)
+    parser.add_argument("--stage2-prompt", type=Path, default=None)
+    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--max-retries", type=int, default=None)
+    parser.add_argument("--sleep", type=float, default=None)
     parser.add_argument("--cache-root", type=Path, default=None)
-    parser.add_argument("--index-batch-size", type=int, default=10_000)
-    parser.add_argument("--index-progress-every", type=int, default=100_000)
-    parser.add_argument("--index-cache-mb", type=int, default=64)
-    parser.add_argument("--index-min-free-space-gb", type=float, default=3.0)
-    parser.add_argument("--index-reserve-free-space-gb", type=float, default=1.0)
-    parser.add_argument("--verify-full-source-hash", action="store_true")
+    parser.add_argument("--index-batch-size", type=int, default=None)
+    parser.add_argument("--index-progress-every", type=int, default=None)
+    parser.add_argument("--index-cache-mb", type=int, default=None)
+    parser.add_argument("--index-min-free-space-gb", type=float, default=None)
+    parser.add_argument("--index-reserve-free-space-gb", type=float, default=None)
+    verification = parser.add_mutually_exclusive_group()
+    verification.add_argument(
+        "--verify-full-source-hash",
+        dest="verify_full_source_hash",
+        action="store_true",
+        default=None,
+    )
+    verification.add_argument(
+        "--no-verify-full-source-hash",
+        dest="verify_full_source_hash",
+        action="store_false",
+    )
+    parser.add_argument("--log-level", default=None)
     return parser
 
 
 def _validate_cli(args: argparse.Namespace) -> None:
     if args.no_publish and args.publish_root is not None:
         raise ValueError("--no-publish 与 --publish-root 不能同时使用")
-    if not args.no_publish and args.publish_root is None:
-        raise ValueError("正式发布必须显式提供 --publish-root；仅构建请使用 --no-publish")
     if args.replace and args.no_publish:
         raise ValueError("--replace 只能用于发布")
     if args.run_id and args.new_run:
         raise ValueError("--run-id 与 --new-run 不能同时使用")
-    if args.index_min_free_space_gb < args.index_reserve_free_space_gb:
-        raise ValueError("index min free space 不能小于 reserve free space")
 
 
 def main(
@@ -297,38 +306,67 @@ def main(
         return 0 if exc.code == 0 else 1
     try:
         _validate_cli(args)
-        build_config = load_build_config(args.config)
-        quality_config = QualityRunConfig(
-            workers=args.workers,
-            max_retries=args.max_retries,
-            sleep_seconds=args.sleep,
+        profile = load_pipeline_config(args.config)
+        publication_enabled: bool | None = None
+        if args.no_publish:
+            publication_enabled = False
+        elif args.publish_root is not None:
+            publication_enabled = True
+        effective = apply_pipeline_overrides(
+            profile,
+            {
+                "source": args.source,
+                "taxonomy": args.taxonomy,
+                "output_root": args.output_root,
+                "stage1_prompt": args.stage1_prompt,
+                "stage2_prompt": args.stage2_prompt,
+                "workers": args.workers,
+                "max_retries": args.max_retries,
+                "sleep_seconds": args.sleep,
+                "cache_root": args.cache_root,
+                "index_batch_size": args.index_batch_size,
+                "index_progress_every": args.index_progress_every,
+                "index_cache_mb": args.index_cache_mb,
+                "index_min_free_space_gb": args.index_min_free_space_gb,
+                "index_reserve_free_space_gb": args.index_reserve_free_space_gb,
+                "verify_full_source_hash": args.verify_full_source_hash,
+                "log_level": args.log_level,
+                "publication_enabled": publication_enabled,
+                "publish_root": args.publish_root,
+            },
         )
-        stage1_prompt = args.stage1_prompt.read_text(encoding="utf-8")
-        stage2_prompt = args.stage2_prompt.read_text(encoding="utf-8")
+        if args.replace and not effective.publication.enabled:
+            raise ValueError("--replace 只能用于发布")
+        configure_logging(effective.log_level)
+        effective.validate_for_execution()
+        assert effective.source is not None and effective.taxonomy is not None
+        build_config = effective.build
+        quality_config = effective.quality
+        stage1_prompt = effective.stage1_prompt.read_text(encoding="utf-8")
+        stage2_prompt = effective.stage2_prompt.read_text(encoding="utf-8")
         llm_config = llm_config_override or load_llm_config()
         validate_llm_dependency()
-        taxonomy = load_taxonomy_mappings(args.taxonomy)
-        taxonomy_sha256 = sha256_file(args.taxonomy)
-        cache_root = (args.cache_root or args.output_root / "_canonical_cache").resolve()
+        taxonomy = load_taxonomy_mappings(effective.taxonomy)
+        taxonomy_sha256 = sha256_file(effective.taxonomy)
         logger = logging.getLogger("screening.v2")
         index = ensure_canonical_candidate_index(
-            args.source,
+            effective.source,
             taxonomy,
             taxonomy_sha256=taxonomy_sha256,
-            cache_root=cache_root,
-            batch_size=args.index_batch_size,
-            progress_every=args.index_progress_every,
-            min_free_bytes=int(args.index_min_free_space_gb * 1024**3),
-            reserve_free_bytes=int(args.index_reserve_free_space_gb * 1024**3),
-            cache_mb=args.index_cache_mb,
-            verify_full_source_hash=args.verify_full_source_hash,
+            cache_root=effective.cache_root,
+            batch_size=effective.index.batch_size,
+            progress_every=effective.index.progress_every,
+            min_free_bytes=int(effective.index.min_free_space_gb * 1024**3),
+            reserve_free_bytes=int(effective.index.reserve_free_space_gb * 1024**3),
+            cache_mb=effective.index.sqlite_cache_mb,
+            verify_full_source_hash=effective.index.verify_full_source_hash,
             logger=logger,
         )
         metadata = dict(llm_metadata_override or llm_config.public_metadata())
         context = prepare_run_context(
-            args.output_root,
-            args.source,
-            args.taxonomy,
+            effective.output_root,
+            effective.source,
+            effective.taxonomy,
             index,
             build_config,
             quality_config,
@@ -337,6 +375,14 @@ def main(
             llm_metadata=metadata,
             run_id=args.run_id,
             new_run=args.new_run,
+        )
+        update_manifest(
+            context.run_root,
+            effective_config=effective.manifest_value(
+                run_id=args.run_id,
+                new_run=args.new_run,
+                replace_files=args.replace,
+            ),
         )
         runner = TwoStageQualityRunner(
             context.run_root / "quality",
@@ -354,7 +400,7 @@ def main(
             build_config,
             taxonomy,
             runner,
-            publish_root=None if args.no_publish else args.publish_root,
+            publish_root=effective.publish_root,
             replace=args.replace,
         )
         print(f"v2 run={context.run_id} status={_read_manifest(context.run_root)['status']}")

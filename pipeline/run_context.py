@@ -258,6 +258,7 @@ def update_manifest(
     branches: Mapping[str, Mapping[str, Any]] | None = None,
     artifacts: Mapping[str, Any] | None = None,
     publication: Mapping[str, Any] | None = None,
+    effective_config: Mapping[str, Any] | None = None,
 ) -> JsonObject:
     with _LOCK:
         path = run_root / "manifest.json"
@@ -272,6 +273,8 @@ def update_manifest(
             manifest["artifacts"] = dict(artifacts)
         if publication is not None:
             manifest["publication"] = dict(publication)
+        if effective_config is not None:
+            manifest["effective_config"] = dict(effective_config)
         manifest["updated_at"] = utc_now()
         write_json(path, manifest)
         return manifest

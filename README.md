@@ -34,17 +34,18 @@ Copy-Item screening/artifacts/config/llm_config.example.json `
   screening/artifacts/config/llm_config.local.json
 ```
 
-只构建、不交付：
+然后在 `artifacts/config/pipeline.default.json` 中填写 `inputs.source` 和
+`inputs.taxonomy`。默认 `publication.enabled=false`，因此一键启动只构建、不交付：
 
 ```powershell
-python -m screening.run_pipeline `
-  --source D:/data/cluster.jsonl `
-  --taxonomy D:/data/taxonomy.json `
-  --output-root D:/data/screening-runs `
-  --no-publish
+python -m screening.run_pipeline
 ```
 
-构建并交付下游 labeled 文件：
+相同配置再次执行会自动恢复未完成 run，只重试缺少合法结果的 LLM 任务；已经完成的
+run 会直接复用。输入、Prompt、模型或业务配置变化时会建立新 run。
+
+需要自动交付时，在配置中设置 `publication.enabled=true` 并填写 `publish_root`；也可
+使用 CLI 临时覆盖配置：
 
 ```powershell
 python -m screening.run_pipeline `
@@ -57,16 +58,19 @@ python -m screening.run_pipeline `
 发布目录已有不同内容时默认拒绝。确认整组三个文件都要替换时显式增加
 `--replace`。相同内容会直接视为幂等成功。
 
-默认业务参数位于 `artifacts/config/pipeline.default.json`。两个 Prompt 位于
-`artifacts/prompts/quality_stage1.md` 和 `quality_stage2.md`。常用运行参数：
+完整运行配置位于 `artifacts/config/pipeline.default.json`，相对路径以该配置文件
+所在目录为基准。CLI 显式参数优先于配置值。两个 Prompt 默认位于
+`artifacts/prompts/quality_stage1.md` 和 `quality_stage2.md`。常用临时覆盖参数：
 
-- `--workers`，默认 2；
-- `--max-retries`，默认 3；
-- `--sleep`，默认 1 秒；
+- `--source`、`--taxonomy` 和 `--output-root`；
+- `--workers`、`--max-retries` 和 `--sleep`；
 - `--run-id`，只恢复契约完全一致的 v2 run；
 - `--new-run`，忽略可恢复或可复用 run，新建一次运行；
 - `--cache-root`，覆盖默认的 `<output-root>/_canonical_cache`；
-- `--verify-full-source-hash`，索引打开时重新验证完整 cluster SHA-256。
+- `--verify-full-source-hash`，索引打开时重新验证完整 cluster SHA-256；
+- `--no-publish`，临时关闭配置中的自动发布。
+
+`--new-run`、`--run-id` 和 `--replace` 只允许通过 CLI 指定，不写入长期配置。
 
 退出码：`0` 成功，`1` 配置、数据、契约或发布错误，`2` 存在可以续跑的 LLM
 工程失败。

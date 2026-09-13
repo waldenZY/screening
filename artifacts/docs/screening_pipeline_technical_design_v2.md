@@ -833,14 +833,13 @@ P1 或 P2 的业务数量缺口本身不阻止发布；任何 LLM 工程失败�
 v2 唯一生产入口：
 
 ```powershell
-python -m screening.run_pipeline `
-  --source D:/data/cluster.jsonl `
-  --taxonomy D:/data/taxonomy.json `
-  --output-root D:/data/screening-runs `
-  --no-publish
+python -m screening.run_pipeline
 ```
 
-构建并发布：
+入口默认加载完整 `pipeline.default.json`。配置好输入和本地 LLM 文件后，无参数执行
+即可构建；相同契约的未完成 run 自动恢复，已完成 run 直接复用。默认不发布。
+
+CLI 可临时覆盖配置，例如构建并发布：
 
 ```powershell
 python -m screening.run_pipeline `
@@ -854,23 +853,28 @@ python -m screening.run_pipeline `
 
 | 参数 | 说明 |
 | --- | --- |
-| `--source` | cluster JSONL，必需 |
-| `--taxonomy` | taxonomy JSON，必需 |
-| `--output-root` | 索引和 run 工作区 |
-| `--config` | P012 采样及补采配置 |
+| `--source` | 覆盖配置中的 cluster JSONL |
+| `--taxonomy` | 覆盖配置中的 taxonomy JSON |
+| `--output-root` | 覆盖索引和 run 工作区 |
+| `--config` | 选择完整运行配置 |
 | `--stage1-prompt` / `--stage2-prompt` | 两阶段 Prompt |
-| `--publish-root` | 下游交付根目录；正式发布时必需 |
-| `--no-publish` | 只构建不发布，不能与 `--publish-root` 同用 |
+| `--publish-root` | 临时启用发布并覆盖下游交付根目录 |
+| `--no-publish` | 临时关闭发布，不能与 `--publish-root` 同用 |
 | `--replace` | 允许事务替换不同内容的三份发布文件 |
 | `--run-id` | 指定并恢复/复用契约完全一致的 v2 run |
 | `--new-run` | 强制新建；不能与 `--run-id` 同用 |
-| `--workers` | LLM 全局并发数，默认 2 |
-| `--max-retries` | 每阶段最大尝试次数，默认 3 |
-| `--sleep` | 请求节流间隔，默认 1 秒 |
+| `--workers` | 覆盖 LLM 全局并发数 |
+| `--max-retries` | 覆盖每阶段最大尝试次数 |
+| `--sleep` | 覆盖请求节流间隔 |
 | `--cache-root` | 覆盖 canonical cache 根目录 |
 | `--verify-full-source-hash` | 复用索引时重新验证完整源 SHA-256 |
+| `--no-verify-full-source-hash` | 临时关闭配置中的完整源哈希复验 |
+| `--log-level` | 覆盖控制台日志等级 |
 
-默认业务配置位于 `artifacts/config/pipeline.default.json`，默认 Prompt 位于：
+配置文件内相对路径统一相对于配置文件目录解析。CLI 显式参数优先于配置值。
+`--new-run`、`--run-id` 和 `--replace` 是一次性或高风险控制，只保留在 CLI。
+
+默认完整配置位于 `artifacts/config/pipeline.default.json`，默认 Prompt 位于：
 
 ```text
 artifacts/prompts/quality_stage1.md
@@ -885,11 +889,43 @@ artifacts/prompts/quality_stage2.md
 | `1` | 配置、输入、契约、构建验证或发布错误 |
 | `2` | 存在可恢复的 LLM 工程失败 |
 
-## 17. 默认业务配置
+## 17. 默认完整运行配置
 
 ```json
 {
-  "config_version": 1,
+  "config_version": 2,
+  "inputs": {
+    "source": "",
+    "taxonomy": ""
+  },
+  "outputs": {
+    "output_root": "../../outputs_v2"
+  },
+  "prompts": {
+    "stage1": "../prompts/quality_stage1.md",
+    "stage2": "../prompts/quality_stage2.md"
+  },
+  "quality": {
+    "workers": 2,
+    "max_retries": 3,
+    "sleep_seconds": 1.0
+  },
+  "index": {
+    "cache_root": null,
+    "batch_size": 50000,
+    "progress_every": 100000,
+    "sqlite_cache_mb": 1024,
+    "min_free_space_gb": 10.0,
+    "reserve_free_space_gb": 8.0,
+    "verify_full_source_hash": false
+  },
+  "logging": {
+    "level": "INFO"
+  },
+  "publication": {
+    "enabled": false,
+    "publish_root": null
+  },
   "sampling": {
     "p0": {
       "l1_big_threshold": 3000,
@@ -928,8 +964,13 @@ artifacts/prompts/quality_stage2.md
 }
 ```
 
-任何配置、Prompt、模型参数或版本变化都会改变 run identity，不能继续使用旧 run
-中的冻结任务作为同一构建。
+`inputs.source` 与 `inputs.taxonomy` 允许在模板中暂时留空，但执行前必须由配置或 CLI
+提供。LLM 地址、密钥、模型及请求参数继续存放在不提交 Git 的
+`artifacts/config/llm_config.local.json`。
+
+业务采样、质量运行参数、Prompt、模型或输入变化会改变 run identity，不能继续使用
+旧 run 中的冻结任务。日志、索引性能参数和发布设置不改变数据 identity，但其解析后
+的有效值会写入 manifest 供审计。
 
 ## 18. 模块与公共接口
 
@@ -940,6 +981,7 @@ artifacts/prompts/quality_stage2.md
 | `candidate/sampling.py` | 三分支纯采样与去重 | `CandidateSampler.sample_p0()`、`sample_p1()`、`sample_p2()`、`deduplicate_branch_candidates()` |
 | `quality/two_stage.py` | 两阶段输入/输出校验、并发、缓存和账本 | `run_stage1()`、`run_stage2()`、`stage1_passes()` |
 | `pipeline/orchestrator.py` | P0/P1/P2 编排和 P1 补采 | `run_build()` |
+| `pipeline/config.py` | 完整配置 Schema、相对路径和 CLI 覆盖 | `load_pipeline_config()`、`apply_pipeline_overrides()` |
 | `delivery/screened.py` | 最终 canonical 构建与校验 | `build_screened_canonical_record()`、`validate_screened_canonical_records()` |
 | `delivery/legacy.py` | 28 字段映射、复验和 provenance | `map_screened_to_legacy()`、`validate_legacy_record()`、`export_legacy_branch()` |
 | `delivery/report.py` | 语义树、标签一致率和批跑汇报 | `build_run_report()`、`write_run_report()`、`validate_run_report()` |

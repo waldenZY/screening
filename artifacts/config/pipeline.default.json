@@ -1,5 +1,37 @@
 {
-  "config_version": 1,
+  "config_version": 2,
+  "inputs": {
+    "source": "",
+    "taxonomy": ""
+  },
+  "outputs": {
+    "output_root": "../../outputs_v2"
+  },
+  "prompts": {
+    "stage1": "../prompts/quality_stage1.md",
+    "stage2": "../prompts/quality_stage2.md"
+  },
+  "quality": {
+    "workers": 8,
+    "max_retries": 10,
+    "sleep_seconds": 1.0
+  },
+  "index": {
+    "cache_root": null,
+    "batch_size": 50000,
+    "progress_every": 100000,
+    "sqlite_cache_mb": 1024,
+    "min_free_space_gb": 10.0,
+    "reserve_free_space_gb": 8.0,
+    "verify_full_source_hash": false
+  },
+  "logging": {
+    "level": "INFO"
+  },
+  "publication": {
+    "enabled": false,
+    "publish_root": null
+  },
   "sampling": {
     "p0": {
       "l1_big_threshold": 3000,
