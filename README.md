@@ -69,6 +69,9 @@ python -m screening.run_pipeline `
 所在目录为基准。CLI 显式参数优先于配置值。两个 Prompt 默认位于
 `artifacts/prompts/quality_stage1.md` 和 `quality_stage2.md`。常用临时覆盖参数：
 
+每个配置字段的含义、范围、调大/调小影响、run identity 关系和推荐使用方式，参见
+[Screening v2 配置使用手册](artifacts/docs/screening_pipeline_configuration_v2.md)。
+
 - `--source`、`--taxonomy` 和 `--output-root`；
 - `--workers`、`--max-retries` 和 `--sleep`；
 - `--run-id`，只恢复契约完全一致的 v2 run；
@@ -145,6 +148,9 @@ P2-对抗集/P2_adversarial_set_v4_labeled.jsonl
 三份文件作为一个事务提交；任一提交失败会恢复发布前的全部文件。
 
 ## Legacy 28 字段契约
+
+面向下游或对外沟通的完整字段字典见
+[Screening 最终交付数据字段说明（labeled v4）](artifacts/docs/screening_labeled_v4_field_dictionary.md)。
 
 P0/P1 第 15 个字段为 `relevance_p0`，P2 为 `relevance_p2`；其余字段名、类型和
 顺序一致。`norm_freq` 与 relevance 在导出时保留四位小数。所有字段必须存在且
