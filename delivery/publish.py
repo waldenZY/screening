@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from ..candidate.index import (
-    CanonicalCandidateIndex,
     CanonicalIndexHandle,
+    validate_canonical_database,
     validate_canonical_source,
 )
 from ..shared.json_io import JsonObject, load_jsonl, sha256_file
@@ -37,6 +37,7 @@ from ..quality.two_stage import (
     STAGE1_FIELDS,
     STAGE2_FIELDS,
     stage1_passes,
+    stage2_consistency_conflicts,
     validate_stage1_result,
     validate_stage2_result,
 )
@@ -112,6 +113,31 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             if previous is not None and previous != validated:
                 raise PublicationError("同一源 identity 对应多个第一阶段结果")
             stage1_by_identity[str(identity)] = validated
+    consistency_rows = load_jsonl(run_root / "quality" / "stage2_consistency.jsonl")
+    consistency_by_key = {row.get("cache_key"): row for row in consistency_rows}
+    if None in consistency_by_key or len(consistency_by_key) != len(consistency_rows):
+        raise PublicationError("第二阶段一致性账本存在非法或重复 ID")
+    if set(consistency_by_key) != set(stage2_tasks):
+        raise PublicationError("第二阶段一致性账本与任务账本不一致")
+    if set(stage2_results) != set(stage2_tasks):
+        raise PublicationError("第二阶段任务缺少合法终态")
+    for task_id, task in stage2_tasks.items():
+        identities = [str(value) for value in task.get("source_identities", [])]
+        if not identities or any(identity not in stage1_by_identity for identity in identities):
+            raise PublicationError("第二阶段一致性账本无法关联第一阶段结果")
+        stage1_value = stage1_by_identity[identities[0]]
+        if any(stage1_by_identity[identity] != stage1_value for identity in identities):
+            raise PublicationError("第二阶段任务对应的第一阶段结果不一致")
+        conflicts = list(stage2_consistency_conflicts(stage2_results[task_id], stage1_value))
+        expected_consistency = {
+            "cache_key": task_id,
+            "stage": "stage2",
+            "source_identities": sorted(identities),
+            "is_consistent": not conflicts,
+            "conflict_codes": conflicts,
+        }
+        if consistency_by_key[task_id] != expected_consistency:
+            raise PublicationError("第二阶段一致性账本内容不一致")
     files: JsonObject = {}
     candidate_rows_by_set: dict[str, list[JsonObject]] = {}
     final_l2_counts_by_set: dict[str, Counter[str]] = {}
@@ -343,7 +369,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
     for filename in (
         "quality_run_contract.json", "stage1_tasks.jsonl", "stage1_attempts.jsonl",
         "stage1_results.jsonl", "stage2_tasks.jsonl", "stage2_attempts.jsonl",
-        "stage2_results.jsonl",
+        "stage2_results.jsonl", "stage2_consistency.jsonl",
     ):
         path = run_root / "quality" / filename
         metadata: JsonObject = {
@@ -376,10 +402,7 @@ def validate_manifest_source(manifest: Mapping[str, Any], *, verify_full_hash: b
         raise PublicationError("canonical index 与 manifest 源快照不一致")
     validate_canonical_source(metadata, verify_full_hash=verify_full_hash)
     handle = CanonicalIndexHandle(metadata_path.parent, database_path, metadata_path, metadata)
-    with CanonicalCandidateIndex(handle) as readonly:
-        check = readonly.connection.execute("PRAGMA integrity_check").fetchone()
-        if not check or check[0] != "ok":
-            raise PublicationError("canonical SQLite 索引完整性失败")
+    validate_canonical_database(handle)
 
 
 def validate_manifest_inputs(run_root: Path, manifest: Mapping[str, Any]) -> None:

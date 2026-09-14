@@ -14,12 +14,13 @@ from ..quality.two_stage import (
     STAGE1_FIELDS,
     STAGE2_FIELDS,
     stage1_passes,
+    stage2_consistency_conflicts,
     validate_stage1_result,
     validate_stage2_result,
 )
 
 
-SCREENED_CANONICAL_SCHEMA_VERSION = 1
+SCREENED_CANONICAL_SCHEMA_VERSION = 2
 SET_NAMES = frozenset({"P0", "P1", "P2"})
 SELECTION_ORIGINS = frozenset({"initial_wave", "supplement_wave"})
 _HASH = re.compile(r"[0-9a-f]{64}")
@@ -49,6 +50,7 @@ def build_screened_canonical_record(
     stage2_task_id: str,
 ) -> JsonObject:
     """Build and independently validate one authoritative screened record."""
+    conflicts = stage2_consistency_conflicts(stage2_result, stage1_result)
     record: JsonObject = {
         "screened_schema_version": SCREENED_CANONICAL_SCHEMA_VERSION,
         "set": set_name,
@@ -56,6 +58,10 @@ def build_screened_canonical_record(
         "quality": {
             **validate_stage1_result(dict(stage1_result)),
             **validate_stage2_result(dict(stage2_result), stage1_result),
+        },
+        "quality_consistency": {
+            "is_consistent": not conflicts,
+            "conflict_codes": list(conflicts),
         },
         "selection": {
             "origin": origin,
@@ -74,7 +80,8 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
     if not isinstance(record, Mapping):
         raise ScreenedCanonicalError("screened canonical 必须是对象")
     expected = {
-        "screened_schema_version", "set", "candidate", "quality", "selection"
+        "screened_schema_version", "set", "candidate", "quality",
+        "quality_consistency", "selection"
     }
     if set(record) != expected:
         raise ScreenedCanonicalError("screened canonical 顶层字段不一致")
@@ -95,7 +102,18 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
     stage1 = validate_stage1_result({key: quality[key] for key in STAGE1_FIELDS})
     if not stage1_passes(stage1):
         raise ScreenedCanonicalError("screened canonical 包含未通过第一阶段的样本")
-    validate_stage2_result({key: quality[key] for key in STAGE2_FIELDS}, stage1)
+    stage2 = validate_stage2_result({key: quality[key] for key in STAGE2_FIELDS}, stage1)
+    conflicts = stage2_consistency_conflicts(stage2, stage1)
+    consistency = record.get("quality_consistency")
+    if (
+        not isinstance(consistency, Mapping)
+        or set(consistency) != {"is_consistent", "conflict_codes"}
+        or type(consistency.get("is_consistent")) is not bool
+        or not isinstance(consistency.get("conflict_codes"), list)
+        or consistency["conflict_codes"] != list(conflicts)
+        or consistency["is_consistent"] != (not conflicts)
+    ):
+        raise ScreenedCanonicalError("screened canonical 跨阶段一致性标记非法")
 
     selection = record.get("selection")
     selection_fields = {

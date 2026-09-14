@@ -40,7 +40,18 @@ BUILDING_DATABASE_NAME = "canonical_candidate_index.building.sqlite"
 METADATA_NAME = "canonical_metadata.json"
 INPUT_AUDIT_NAME = "canonical_input_audit.json"
 LOCK_NAME = "canonical_build.lock"
+VALIDATION_NAME = "canonical_database_validation.json"
+DATABASE_VALIDATION_SCHEMA_VERSION = 1
 MAX_ISSUE_SAMPLES = 20
+
+_CANDIDATE_COLUMNS = (
+    "source_identity_sha256", "conversation_sha256", "source_line", "byte_offset",
+    "byte_length", "record_sha256", "cluster_json", "l1", "l2", "l2_key",
+    "sample_type", "cluster_probability", "frequency", "frequency_less_count",
+    "cluster_frequency_count", "probability_band", "frequency_band",
+    "normalized_frequency", "relevance_p0", "relevance_p2", "length_band",
+    "complexity", "formality",
+)
 
 
 @dataclass(frozen=True)
@@ -118,6 +129,65 @@ def _quick_check(path: Path) -> bool:
         return bool(row and row[0] == "ok")
     except sqlite3.DatabaseError:
         return False
+
+
+def _database_fingerprint(path: Path) -> JsonObject:
+    return {
+        "file": _source_stat(path),
+        "samples": _sample_fingerprints(path),
+    }
+
+
+def _fast_database_open(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        uri = f"file:{path.as_posix()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            schema = connection.execute("PRAGMA schema_version").fetchone()
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidates'"
+            ).fetchone()
+            columns = tuple(row[1] for row in connection.execute("PRAGMA table_info(candidates)"))
+        return bool(schema and table and columns == _CANDIDATE_COLUMNS)
+    except sqlite3.DatabaseError:
+        return False
+
+
+def _ensure_database_validation(
+    database_path: Path,
+    validation_path: Path,
+    *,
+    logger: logging.Logger,
+) -> None:
+    current = _database_fingerprint(database_path)
+    previous = _load_json(validation_path)
+    if (
+        previous
+        and previous.get("validation_schema_version") == DATABASE_VALIDATION_SCHEMA_VERSION
+        and previous.get("database") == current
+        and previous.get("integrity") == "ok"
+        and _fast_database_open(database_path)
+    ):
+        logger.info("canonical SQLite fast validation complete")
+        return
+    logger.info("canonical SQLite full validation start")
+    started = time.monotonic()
+    if not _quick_check(database_path):
+        raise ValueError("canonical SQLite 索引完整性失败")
+    write_json(
+        validation_path,
+        {
+            "validation_schema_version": DATABASE_VALIDATION_SCHEMA_VERSION,
+            "database": current,
+            "integrity": "ok",
+            "validated_at": time.time(),
+        },
+    )
+    logger.info(
+        "canonical SQLite full validation complete seconds=%.2f",
+        time.monotonic() - started,
+    )
 
 
 def _load_json(path: Path) -> JsonObject | None:
@@ -442,9 +512,12 @@ def _frequency_groups(connection: sqlite3.Connection) -> Iterable[tuple[str, lis
 def _finalize_features(
     connection: sqlite3.Connection,
     feature_config: FixedFeatureConfig,
+    logger: logging.Logger | None = None,
 ) -> JsonObject:
     frequency_stats: JsonObject = {}
+    cluster_count = 0
     for cluster_json, counts in _frequency_groups(connection):
+        cluster_count += 1
         total = sum(count for _, count in counts)
         minimum = counts[0][0]
         maximum = counts[-1][0]
@@ -495,6 +568,8 @@ def _finalize_features(
             "min_frequency": minimum,
             "max_frequency": maximum,
         }
+        if logger is not None and cluster_count % 1000 == 0:
+            logger.info("canonical feature finalization clusters=%d", cluster_count)
 
     missing = connection.execute(
         """
@@ -841,7 +916,13 @@ def _scan(
                 finish_row()
 
         persist("finalizing")
-        population = _finalize_features(connection, feature_config)
+        logger.info("canonical feature finalization start")
+        finalize_started = time.monotonic()
+        population = _finalize_features(connection, feature_config, logger)
+        logger.info(
+            "canonical feature finalization complete seconds=%.2f",
+            time.monotonic() - finalize_started,
+        )
         population["taxonomy_l1_population"] = dict(mappings.l1_population)
         population["taxonomy_l2_population"] = dict(mappings.l2_population)
         checkpoint["source_snapshot_id"] = digest.hexdigest()
@@ -853,6 +934,8 @@ def _scan(
         )
         connection.executescript("DROP TABLE seen; DROP TABLE frequency_counts;")
         connection.commit()
+        logger.info("canonical SQLite integrity check start")
+        check_started = time.monotonic()
         check = connection.execute("PRAGMA integrity_check").fetchone()
         if not check or check[0] != "ok":
             checkpoint["fatal_code"] = "sqlite_integrity_failure"
@@ -866,6 +949,10 @@ def _scan(
                 status="fatal",
             )
             raise ValueError("canonical SQLite 索引完整性检查失败")
+        logger.info(
+            "canonical SQLite integrity check complete seconds=%.2f",
+            time.monotonic() - check_started,
+        )
         connection.execute("PRAGMA journal_mode=DELETE")
 
     source_at_end = _source_stat(source_path)
@@ -934,6 +1021,7 @@ def ensure_canonical_candidate_index(
     metadata_path = cache_dir / METADATA_NAME
     audit_path = cache_dir / INPUT_AUDIT_NAME
     lock_path = cache_dir / LOCK_NAME
+    validation_path = cache_dir / VALIDATION_NAME
 
     metadata = _load_json(metadata_path)
     compatibility = {
@@ -950,8 +1038,11 @@ def ensure_canonical_candidate_index(
             and isinstance(metadata_source, dict)
             and _same_source(metadata_source, source)
         ):
-            if not _quick_check(database_path):
-                raise ValueError("canonical SQLite 索引完整性失败")
+            _ensure_database_validation(
+                database_path,
+                validation_path,
+                logger=active_logger,
+            )
             validate_canonical_source(
                 metadata,
                 verify_full_hash=verify_full_source_hash,
@@ -1014,6 +1105,15 @@ def ensure_canonical_candidate_index(
             "completed_at": time.time(),
         }
         write_json(metadata_path, metadata)
+        write_json(
+            validation_path,
+            {
+                "validation_schema_version": DATABASE_VALIDATION_SCHEMA_VERSION,
+                "database": _database_fingerprint(database_path),
+                "integrity": "ok",
+                "validated_at": time.time(),
+            },
+        )
         return CanonicalIndexHandle(cache_dir, database_path, metadata_path, metadata)
     finally:
         lock_path.unlink(missing_ok=True)
@@ -1036,6 +1136,19 @@ def validate_canonical_source(metadata: Mapping[str, Any], *, verify_full_hash: 
         if digest.hexdigest() != metadata.get("source_snapshot_id"):
             raise ValueError("cluster 文件 SHA-256 与 canonical 快照不一致")
     return _source_stat(path)
+
+
+def validate_canonical_database(
+    handle: CanonicalIndexHandle,
+    *,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Validate a completed database through its integrity-bound fast sidecar."""
+    _ensure_database_validation(
+        handle.database_path,
+        handle.cache_dir / VALIDATION_NAME,
+        logger=logger or logging.getLogger(__name__),
+    )
 
 
 def read_canonical_indexed_record(source_path: Path, locator: Mapping[str, Any]) -> JsonObject:

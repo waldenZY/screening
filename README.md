@@ -42,7 +42,14 @@ python -m screening.run_pipeline
 ```
 
 相同配置再次执行会自动恢复未完成 run，只重试缺少合法结果的 LLM 任务；已经完成的
-run 会直接复用。输入、Prompt、模型或业务配置变化时会建立新 run。
+run 会直接复用。恢复以阶段检查点为事实源：已完成的 P0/P1/P2 采样、Stage1、P1
+补采轮次、最终成员和 Stage2 都不会重新执行。输入、Prompt、模型或业务配置变化时
+会建立新 run。
+
+Stage1 是唯一准入判定。Stage2 可以给出与 Stage1 不同的独立质量判断；这种情况会
+作为“跨阶段分歧”写入 screened canonical、脱敏一致性账本和批跑报告，不会重试、
+中断或改变集合成员。只有非法 JSON、字段/枚举错误和 Stage2 内部评分矛盾才属于
+可续跑的工程失败。
 
 需要自动交付时，在配置中设置 `publication.enabled=true` 并填写 `publish_root`；也可
 使用 CLI 临时覆盖配置：
@@ -82,8 +89,13 @@ python -m screening.run_pipeline `
 ```text
 <output-root>/
 ├── _canonical_cache/<cache-id>/
+│   ├── canonical_candidate_index.sqlite
+│   ├── canonical_metadata.json
+│   ├── canonical_input_audit.json
+│   └── canonical_database_validation.json
 └── runs/<run-id>/
     ├── manifest.json
+    ├── checkpoints/
     ├── p012_build_summary.json
     ├── legacy_export_report.json
     ├── screening_run_report.json
@@ -93,6 +105,7 @@ python -m screening.run_pipeline `
     │   ├── stage1_results.jsonl
     │   ├── stage2_tasks.jsonl
     │   ├── stage2_results.jsonl
+    │   ├── stage2_consistency.jsonl
     │   └── llm_result_cache.sqlite
     ├── P0/
     ├── P1/
@@ -112,6 +125,9 @@ Run 根目录的两份批跑报告内容等价：
 - `screening_run_report.json`：机器可读指标，适合看板、版本对比和二次分析；
 - `screening_run_report.md`：可直接用于汇报，包含 P0/P1/P2 核心指标、L1/L2
   语义树分布、P1 配额完成率、波次统计和最终难度/质量分布。
+
+报告同时给出 Stage1/Stage2 跨阶段分歧数量、分歧率和分歧类型分布。该指标用于观察
+两次独立判断的稳定性，不是新的淘汰门槛。
 
 报告中的 Query 基础可用率使用 `self_contained + clear + valid`；语义标签一致率是在
 这些可判断 Query 中统计 `category_fit=exact` 的比例。该一致率是 LLM-as-judge

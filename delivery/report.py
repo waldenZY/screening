@@ -20,7 +20,7 @@ from ..shared.taxonomy import TaxonomyMappings
 from .screened import validate_screened_canonical_record
 
 
-RUN_REPORT_SCHEMA_VERSION = 1
+RUN_REPORT_SCHEMA_VERSION = 2
 RUN_REPORT_JSON = "screening_run_report.json"
 RUN_REPORT_MARKDOWN = "screening_run_report.md"
 SET_NAMES = ("P0", "P1", "P2")
@@ -139,6 +139,7 @@ def build_run_report(
     }
     sets: JsonObject = {}
     total_final = 0
+    total_disagreements = 0
 
     for set_name in SET_NAMES:
         set_counts = _empty_counts()
@@ -175,6 +176,8 @@ def build_run_report(
             "overall_score": Counter(),
         }
         final_l2_counts: Counter[str] = Counter()
+        consistency_conflicts: Counter[str] = Counter()
+        disagreement_records = 0
         for record in final_records[set_name]:
             validate_screened_canonical_record(record)
             if record["set"] != set_name:
@@ -213,6 +216,10 @@ def build_run_report(
             for issue in quality["issue_types"]:
                 final_quality["issue_types"][issue] += 1
             final_quality["overall_score"][str(quality["overall_score"])] += 1
+            consistency = record["quality_consistency"]
+            if not consistency["is_consistent"]:
+                disagreement_records += 1
+                consistency_conflicts.update(consistency["conflict_codes"])
 
         target_scope = {
             key for key, value in p1_target_quotas.items() if int(value) > 0
@@ -335,6 +342,15 @@ def build_run_report(
                 _ratio(quota_fulfilled, quota_total) if set_name == "P1" else None
             ),
             "p1_target_distribution_deviation": distribution_deviation,
+            "cross_stage_consistency": {
+                "consistent_records": int(set_counts["final_count"]) - disagreement_records,
+                "disagreement_records": disagreement_records,
+                "consistency_rate": _ratio(
+                    int(set_counts["final_count"]) - disagreement_records,
+                    int(set_counts["final_count"]),
+                ),
+                "conflict_types": dict(sorted(consistency_conflicts.items())),
+            },
             "waves": wave_rows,
             "final_quality_distribution": {
                 "classification_difficulty": _distribution(
@@ -354,6 +370,7 @@ def build_run_report(
         }
         sets[set_name] = set_report
         total_final += int(set_counts["final_count"])
+        total_disagreements += disagreement_records
 
     report: JsonObject = {
         "report_schema_version": RUN_REPORT_SCHEMA_VERSION,
@@ -388,6 +405,7 @@ def build_run_report(
         },
         "totals": {
             "final_records_across_sets": total_final,
+            "cross_stage_disagreement_records": total_disagreements,
             "cross_set_overlap": dict(build_summary.get("cross_set_overlap", {})),
         },
         "sets": sets,
@@ -467,6 +485,25 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
             _validate_ratio(quota_metric, "P1.p1_quota_fulfillment_rate")
         elif quota_metric is not None:
             raise RunReportError(f"{set_name} 不得包含 P1 配额完成率")
+        consistency = set_report.get("cross_stage_consistency")
+        if not isinstance(consistency, Mapping) or set(consistency) != {
+            "consistent_records", "disagreement_records", "consistency_rate", "conflict_types"
+        }:
+            raise RunReportError(f"{set_name} 跨阶段一致性统计非法")
+        _validate_ratio(consistency["consistency_rate"], f"{set_name}.cross_stage_consistency")
+        if (
+            type(consistency["consistent_records"]) is not int
+            or type(consistency["disagreement_records"]) is not int
+            or consistency["consistent_records"] + consistency["disagreement_records"]
+            != set_report["final_count"]
+            or consistency["consistency_rate"]["numerator"]
+            != consistency["consistent_records"]
+            or consistency["consistency_rate"]["denominator"]
+            != set_report["final_count"]
+            or not isinstance(consistency["conflict_types"], Mapping)
+            or any(type(value) is not int or value < 1 for value in consistency["conflict_types"].values())
+        ):
+            raise RunReportError(f"{set_name} 跨阶段一致性数量不守恒")
 
         tree = set_report.get("semantic_tree")
         if not isinstance(tree, list) or len(tree) != report["taxonomy"]["l1_count"]:
@@ -500,6 +537,11 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
 
     if report["totals"].get("final_records_across_sets") != total_final:
         raise RunReportError("批跑报告总记录数不守恒")
+    if report["totals"].get("cross_stage_disagreement_records") != sum(
+        int(report["sets"][name]["cross_stage_consistency"]["disagreement_records"])
+        for name in SET_NAMES
+    ):
+        raise RunReportError("批跑报告跨阶段分歧总数不守恒")
 
 
 def _pct(metric: Mapping[str, Any] | None) -> str:
@@ -523,8 +565,8 @@ def render_run_report(report: Mapping[str, Any]) -> str:
         "",
         "## 核心汇报指标",
         "",
-        "| 集合 | Stage1 候选 | Query 基础可用率 | 语义标签一致率 | Stage1 准入率 | 最终数量 | 目标范围 L2 覆盖率 | P1 配额完成率 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 集合 | Stage1 候选 | Query 基础可用率 | 语义标签一致率 | Stage1 准入率 | 最终数量 | 阶段一致率 | 目标范围 L2 覆盖率 | P1 配额完成率 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for set_name in SET_NAMES:
         value = report["sets"][set_name]
@@ -533,7 +575,8 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             f"{_pct(value['query_usability_rate'])} | "
             f"{_pct(value['semantic_label_fit_rate'])} | "
             f"{_pct(value['stage1_admission_rate'])} | "
-            f"{value['final_count']} | {_pct(value['scope_l2_coverage_rate'])} | "
+            f"{value['final_count']} | {_pct(value['cross_stage_consistency']['consistency_rate'])} | "
+            f"{_pct(value['scope_l2_coverage_rate'])} | "
             f"{_pct(value['p1_quota_fulfillment_rate'])} |"
         )
 
@@ -547,6 +590,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             "- Stage1 准入率：四项同时满足 exact、self_contained、clear、valid 的比例。",
             "- P1 的目标范围为冻结配额大于 0 的 L2；P0/P2 的目标范围为实际进入 Stage1 的 L2。",
             "- 最终集 category_fit=exact 为准入约束，不作为独立准确率结论。",
+            "- 阶段一致率表示Stage2独立复核未发现与Stage1不同判断的最终样本比例；分歧不会改变成员。",
         ]
     )
 
@@ -647,6 +691,8 @@ def render_run_report(report: Mapping[str, Any]) -> str:
                 f"- Stage2 classification_difficulty：{json.dumps(value['final_quality_distribution']['classification_difficulty'], ensure_ascii=False, sort_keys=True)}。",
                 f"- Stage2 task_difficulty：{json.dumps(value['final_quality_distribution']['task_difficulty'], ensure_ascii=False, sort_keys=True)}。",
                 f"- Stage2 overall_score：{json.dumps(value['final_quality_distribution']['overall_score'], ensure_ascii=False, sort_keys=True)}。",
+                f"- Stage1/Stage2 一致率：{_pct(value['cross_stage_consistency']['consistency_rate'])}；分歧记录={value['cross_stage_consistency']['disagreement_records']}。",
+                f"- 分歧类型：{json.dumps(value['cross_stage_consistency']['conflict_types'], ensure_ascii=False, sort_keys=True)}。",
             ]
         )
 

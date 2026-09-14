@@ -109,22 +109,11 @@ def _execute_pipeline_impl(
     replace: bool = False,
 ) -> int:
     """Execute or resume A-E, then optionally publish the three labeled files."""
-    manifest = _read_manifest(context.run_root)
-    export_status = manifest.get("stages", {}).get("screened_export", {}).get("status")
-    report_status = manifest.get("stages", {}).get("batch_report", {}).get("status")
-    if (
-        export_status == "completed"
-        and report_status == "completed"
-        and manifest.get("artifacts")
-    ):
-        return _complete_or_publish(context, publish_root=publish_root, replace=replace)
-
     validate_canonical_source(index.metadata)
     update_manifest(
         context.run_root,
         status="running",
         stages={"p012_build": {"status": "running", "error": None}},
-        branches={name: {"status": "running", "error": None} for name in ("P0", "P1", "P2")},
     )
     build_started_ns = time.monotonic_ns()
     try:
@@ -135,9 +124,16 @@ def _execute_pipeline_impl(
             taxonomy=taxonomy,
             run_root=context.run_root,
             quality_runner=quality_runner,
+            logger=logging.getLogger("screening.v2"),
         )
     except QualityStageIncomplete as exc:
-        stage_name = "quality_stage1" if exc.stage == "stage1" else "quality_stage2"
+        current_manifest = _read_manifest(context.run_root)
+        if exc.stage == "stage2":
+            stage_name = "quality_stage2"
+        elif current_manifest.get("stages", {}).get("p1_supplement", {}).get("status") == "running":
+            stage_name = "p1_supplement"
+        else:
+            stage_name = "quality_stage1_initial"
         stages: JsonObject = {
             "p012_build": {"status": "incomplete", "error": str(exc)},
             stage_name: {
@@ -146,14 +142,16 @@ def _execute_pipeline_impl(
                 "engineering_failures": list(exc.failures),
             },
         }
-        if exc.stage == "stage2":
-            stages["quality_stage1"] = {"status": "completed", "error": None}
-            stages["p1_supplement"] = {"status": "completed", "error": None}
+        if exc.stage == "stage1":
+            stages["quality_stage1"] = {
+                "status": "incomplete",
+                "engineering_failure_count": len(exc.failures),
+                "engineering_failures": list(exc.failures),
+            }
         update_manifest(
             context.run_root,
             status="incomplete",
             stages=stages,
-            branches={name: {"status": "incomplete"} for name in ("P0", "P1", "P2")},
         )
         return 2
     finally:
@@ -179,6 +177,10 @@ def _execute_pipeline_impl(
             "screened_export": {
                 "status": "completed",
                 "screened_schema_version": SCREENED_CANONICAL_SCHEMA_VERSION,
+                "error": None,
+            },
+            "legacy_export": {
+                "status": "completed",
                 "legacy_mapping_version": LEGACY_MAPPING_VERSION,
                 "error": None,
             },
@@ -231,10 +233,6 @@ def execute_pipeline(
                         "status": "failed",
                         "error_type": type(exc).__name__,
                     }
-                },
-                branches={
-                    name: {"status": "failed", "error_type": type(exc).__name__}
-                    for name in ("P0", "P1", "P2")
                 },
             )
         raise
@@ -338,6 +336,8 @@ def main(
         if args.replace and not effective.publication.enabled:
             raise ValueError("--replace 只能用于发布")
         configure_logging(effective.log_level)
+        logger = logging.getLogger("screening.v2")
+        logger.info("screening v2 startup config=%s", effective.config_path)
         effective.validate_for_execution()
         assert effective.source is not None and effective.taxonomy is not None
         build_config = effective.build
@@ -348,7 +348,7 @@ def main(
         validate_llm_dependency()
         taxonomy = load_taxonomy_mappings(effective.taxonomy)
         taxonomy_sha256 = sha256_file(effective.taxonomy)
-        logger = logging.getLogger("screening.v2")
+        logger.info("canonical index open source_bytes=%d", effective.source.stat().st_size)
         index = ensure_canonical_candidate_index(
             effective.source,
             taxonomy,
@@ -361,6 +361,11 @@ def main(
             cache_mb=effective.index.sqlite_cache_mb,
             verify_full_source_hash=effective.index.verify_full_source_hash,
             logger=logger,
+        )
+        logger.info(
+            "canonical index ready candidates=%s cache=%s",
+            index.metadata.get("counts", {}).get("candidate_rows"),
+            index.cache_dir,
         )
         metadata = dict(llm_metadata_override or llm_config.public_metadata())
         context = prepare_run_context(
@@ -375,6 +380,11 @@ def main(
             llm_metadata=metadata,
             run_id=args.run_id,
             new_run=args.new_run,
+        )
+        logger.info(
+            "run context run_id=%s disposition=%s",
+            context.run_id,
+            context.disposition,
         )
         update_manifest(
             context.run_root,

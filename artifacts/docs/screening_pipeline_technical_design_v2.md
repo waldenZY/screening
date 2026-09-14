@@ -2,7 +2,7 @@
 
 > 文档状态：当前实现基线  
 > 适用入口：`python -m screening.run_pipeline`  
-> 更新日期：2026-09-12
+> 更新日期：2026-09-14
 
 ## 1. 目标与边界
 
@@ -35,6 +35,7 @@ v2 的运行边界为：
 - 每个集合内部去重，不进行跨集合去重。
 - 第一阶段是三个集合统一的业务准入门槛。
 - 第二阶段只补充标签，不改变集合成员。
+- 第一、第二阶段的独立判断可以不一致；分歧作为质量信号记录，不作为工程失败。
 - 只有 P1 补采；P0 和 P2 始终只有初始波次。
 - canonical screened 是内部事实源；legacy labeled 是当前下游交付格式。
 - 批跑报告只聚合脱敏统计，不保存 Query 原文，也不增加 LLM 调用。
@@ -60,7 +61,8 @@ v2 的运行边界为：
 ### 2.4 确定性与可恢复性
 
 配额、排序、去重、哈希和导出均为确定性操作。LLM 结果使用 run-local 缓存和任务
-账本；同一输入、配置、Prompt 和模型契约对应同一个 v2 run identity。
+账本；采样、Stage1、P1 每轮补采、最终成员、Stage2、导出和报告均有原子检查点。
+同一输入、配置、Prompt 和模型契约对应同一个 v2 run identity。
 
 ### 2.5 发布前独立复验
 
@@ -279,7 +281,8 @@ P0/P1 偏向高置信度、高频样本；P2 偏向低置信度、低频样本�
 <output-root>/_canonical_cache/<cache-id>/
 ├── canonical_candidate_index.sqlite
 ├── canonical_metadata.json
-└── canonical_input_audit.json
+├── canonical_input_audit.json
+└── canonical_database_validation.json
 ```
 
 索引构建流程：
@@ -292,10 +295,12 @@ P0/P1 偏向高置信度、高频样本；P2 偏向低置信度、低频样本�
    重复源行同样计入统计。
 5. 扫描完成后按 cluster 计算精确排名、总数、min/max 和固定特征并批量回填。
 6. 写入完整源文件 SHA-256、源文件 stat 和头尾采样指纹。
-7. 使用 SQLite quick/integrity check 验证索引。
+7. 新建索引使用 SQLite quick/integrity check 完整验证，并生成数据库验证侧车文件。
 
 中断时通过 checkpoint 恢复扫描。恢复或复用前会确认源文件没有变化；可通过
-`--verify-full-source-hash` 强制重新计算完整源 SHA-256。
+`--verify-full-source-hash` 强制重新计算完整源 SHA-256。已完成索引再次打开时优先
+核对源文件状态和抽样指纹、数据库文件指纹、Schema、元数据及验证侧车，不再默认
+扫描整个 SQLite；只有首次升级、构建中恢复或指纹异常时才执行完整检查。
 
 `CanonicalCandidateIndex.iter_by()` 可按 L1、L2 或 cluster 读取带特征的 locator。
 候选被选中后，`materialize()` 按 locator 定点读取源字节，重新验证行哈希，再调用
@@ -421,8 +426,8 @@ sleep_seconds = 1.0
 ```
 
 Prompt 分别冻结到 run 目录的 `prompts/stage1.md` 和 `prompts/stage2.md`。LLM 响应
-只允许输出阶段白名单字段；多余字段、输入字段复写、非法枚举、缺字段或逻辑矛盾
-都会作为响应错误重试。
+只允许输出阶段白名单字段；多余字段、输入字段复写、非法枚举、缺字段或阶段内部
+逻辑矛盾都会作为响应错误重试。两个阶段之间的判断差异不属于响应错误。
 
 ### 9.1 第一阶段：有效性、基础质量及类别检测
 
@@ -487,13 +492,31 @@ too_brief
 multi_intent
 ```
 
-第二阶段保留四个输出字段之间的逻辑校验，包括：
+第二阶段保留自身四个输出字段之间的逻辑校验，包括：
 
 - `issue_types` 必须非空、不得重复，且 `none` 不能与其他问题并存；
-- 第一阶段判为 exact/self-contained/clear 时，不得输出与其直接矛盾的问题类型；
-- 第一阶段 `valid` 时，两类 difficulty 不得为 `not_applicable`；
 - `overall_score=5` 时必须且只能为 `issue_types=["none"]`；
 - 第一阶段满格通过但总分低于 5 时，必须给出具体 issue。
+
+Stage2 可以在独立复核中标出 `category_mismatch`、`context_dependent`、`truncated`、
+`ambiguous_intent` 等与 Stage1 不一致的信号，也可以把 difficulty 标为
+`not_applicable`。系统不会要求模型强行服从 Stage1，而是生成稳定的分歧代码：
+
+```text
+category_fit
+semantic_context
+semantic_truncated
+intent_ambiguous
+intent_nonsense
+intent_emotional_only
+intent_too_brief
+classification_not_applicable
+task_not_applicable
+```
+
+分歧正常写入 Stage2 缓存和 legacy 的原质量字段，并另外写入脱敏的
+`quality/stage2_consistency.jsonl`。该账本只含任务键、source identity 哈希、是否
+一致及分歧代码，不含 Query 原文。
 
 第二阶段在 P1 补采完成、三个集合成员已经确定后，只对最终成员执行。其结果仅作为
 标签，不参与 P0/P1/P2 的业务淘汰；但缺少合法第二阶段结果的记录不是完整成品，
@@ -557,11 +580,11 @@ P1 最终不足 10,000 时，记录实际数量、总缺口、未分配目标和
 
 ## 11. Screened canonical
 
-当前 `screened_schema_version=1`。每条内部权威成品结构为：
+当前 `screened_schema_version=2`。每条内部权威成品结构为：
 
 ```json
 {
-  "screened_schema_version": 1,
+  "screened_schema_version": 2,
   "set": "P0 | P1 | P2",
   "candidate": {},
   "quality": {
@@ -573,6 +596,10 @@ P1 最终不足 10,000 时，记录实际数量、总缺口、未分配目标和
     "task_difficulty": "simple",
     "issue_types": ["none"],
     "overall_score": 5
+  },
+  "quality_consistency": {
+    "is_consistent": true,
+    "conflict_codes": []
   },
   "selection": {
     "origin": "initial_wave | supplement_wave",
@@ -587,7 +614,8 @@ P1 最终不足 10,000 时，记录实际数量、总缺口、未分配目标和
 校验器要求：
 
 - candidate 重新通过 Block A 的完整 canonical 校验；
-- quality 恰好包含两个阶段的八个字段且逻辑一致；
+- quality 恰好包含两个阶段的八个字段且各阶段内部逻辑成立；
+- `quality_consistency` 必须与两阶段结果重新计算出的分歧代码完全一致；
 - 每条记录必须通过统一第一阶段准入条件；
 - `initial_wave` 必须对应 `round_id=0`；补采必须对应大于 0 的轮次；
 - 只有 P1 可以出现 `supplement_wave`；
@@ -678,8 +706,12 @@ provenance 用于发现 canonical 或 legacy 文件被修改，以及定位每�
 
 ```text
 pipeline_version = 2
-manifest_schema_version = 1
+manifest_schema_version = 2
 p012_build_config_version = 1
+quality_contract_version = 2
+checkpoint_schema_version = 1
+screened_schema_version = 2
+run_report_schema_version = 2
 ```
 
 run contract 包含：
@@ -694,6 +726,7 @@ run contract 包含：
 - screened canonical schema 版本；
 - legacy schema 和 mapping 版本。
 - run report schema 版本。
+- quality contract 与阶段检查点 schema 版本。
 
 以上 contract 的稳定哈希形成 `config_id`。run 目录为：
 
@@ -713,6 +746,41 @@ run contract 包含：
 manifest 记录各真实运行阶段、三个分支状态、错误类型、P1 补采轮次与缺口、产物
 路径/哈希/行数，以及 invocation 次数、恢复次数、活动时长、墙钟时长和阶段时长。
 
+### 13.1 阶段级检查点状态机
+
+新 run 在 `<run-root>/checkpoints/` 原子写入以下检查点：
+
+1. `initial_p0/p1/p2`：各分支完整 canonical 候选和确定性顺序；
+2. `stage1_initial`：初始候选的 Stage1 结果；
+3. `p1_quotas`：冻结的 L2 目标配额；
+4. `p1_round_N_plan/result`：每轮补采计划、Stage1 结果、采用成员和轮次汇总；
+5. `final_membership`：三个集合最终成员、来源波次、完整 Stage1 结果；
+6. `stage2`：最终成员的 Stage2 结果；
+7. `screened_export`、`legacy_export`、`batch_report`：产物路径、大小和 SHA-256；
+8. `build_outcome`：完整构建结果的最终检查点。
+
+每个检查点都包含 schema 版本、run contract 哈希、记录数、payload 哈希和 payload。
+临时文件不会被当作有效检查点。恢复规则为：
+
+- manifest 未完成但检查点合法：承认检查点并回写完成状态；
+- manifest 已完成但对应检查点缺失：停止，不能静默重算或复用错误数据；
+- 检查点契约、内容哈希或产物哈希不一致：停止；
+- 某分支没有完成：只重算该分支；
+- P1 轮次已有 plan：重启后复用该计划，只继续未完成的 Stage1 任务；
+- 已有 `final_membership`：跳过全部采样、Stage1 和补采；
+- 已有 `stage2`：跳过质量调用，直接恢复导出或报告。
+
+恢复粒度止于完整分支和完整 P1 轮次，不在单个 L2 的采样循环内部建立检查点。
+
+### 13.2 旧 run 兼容边界
+
+manifest schema 1 的历史 v2 run 不进入新状态机，自动搜索时忽略；显式指定旧 run ID
+时返回不兼容提示。历史成品保留不变，canonical 索引仍可被新 run 复用。
+
+对于升级部署时尚未完成、只被跨阶段分歧阻塞的历史 run，兼容性热修仅替换
+`quality/two_stage.py`，保持原 Prompt、manifest 和 run identity，即可复用原 LLM
+缓存完成该 run。历史 run 完成后再部署完整状态机；不能直接用完整新版恢复旧 run。
+
 ## 14. 运行产物
 
 ```text
@@ -721,10 +789,12 @@ manifest 记录各真实运行阶段、三个分支状态、错误类型、P1 �
 │   └── <cache-id>/
 │       ├── canonical_candidate_index.sqlite
 │       ├── canonical_metadata.json
-│       └── canonical_input_audit.json
+│       ├── canonical_input_audit.json
+│       └── canonical_database_validation.json
 └── runs/
     └── <run-id>/
         ├── manifest.json
+        ├── checkpoints/
         ├── p012_run_contract.json
         ├── p012_build_summary.json
         ├── legacy_export_report.json
@@ -743,7 +813,8 @@ manifest 记录各真实运行阶段、三个分支状态、错误类型、P1 �
         │   ├── stage1_results.jsonl
         │   ├── stage2_tasks.jsonl
         │   ├── stage2_attempts.jsonl
-        │   └── stage2_results.jsonl
+        │   ├── stage2_results.jsonl
+        │   └── stage2_consistency.jsonl
         ├── P0/
         ├── P1/
         └── P2/
@@ -789,6 +860,9 @@ P1 另外报告冻结配额 L2 覆盖率、配额完成率、最终分布与目�
 语义标签一致率来自 Stage1 LLM，是自动一致性估计，不作为人工金标准确率。最终集
 的 `category_fit=exact` 是准入约束，只用于契约校验，不作为独立汇报准确率。
 
+报告另按集合给出 Stage1/Stage2 分歧数量、分歧率及分歧类型分布。它用于说明两个
+独立质量视角的一致性，不改变 Stage1 准入成员，也不等同于人工准确率。
+
 ## 15. 发布
 
 下游只接收以下三个文件：
@@ -802,7 +876,8 @@ P2-对抗集/P2_adversarial_set_v4_labeled.jsonl
 发布前必须满足：
 
 - canonical index、源文件、taxonomy 和冻结 Prompt 未变化；
-- SQLite 完整性校验通过；
+- canonical 索引的快速指纹、Schema 与元数据校验通过；首次升级、索引恢复或指纹
+  异常时还必须通过完整 SQLite 检查；
 - 第一阶段不存在未完成任务；
 - 最终成员全部具有合法第二阶段结果；
 - screened canonical 及集合内 identity 校验通过；
@@ -977,10 +1052,11 @@ artifacts/prompts/quality_stage2.md
 | 模块 | 职责 | 主要接口 |
 | --- | --- | --- |
 | `candidate/contract.py` | 会话解析、identity、固定特征、candidate 契约 | `parse_conversation()`、`compute_fixed_features()`、`build_canonical_candidate()`、`validate_canonical_candidate()` |
-| `candidate/index.py` | 流式扫描、SQLite 索引、恢复、定点读取 | `ensure_canonical_candidate_index()`、`CanonicalCandidateIndex.iter_by()`、`materialize()` |
+| `candidate/index.py` | 流式扫描、SQLite 索引、快速验证、恢复、定点读取 | `ensure_canonical_candidate_index()`、`validate_canonical_database()`、`CanonicalCandidateIndex.iter_by()`、`materialize()` |
 | `candidate/sampling.py` | 三分支纯采样与去重 | `CandidateSampler.sample_p0()`、`sample_p1()`、`sample_p2()`、`deduplicate_branch_candidates()` |
-| `quality/two_stage.py` | 两阶段输入/输出校验、并发、缓存和账本 | `run_stage1()`、`run_stage2()`、`stage1_passes()` |
+| `quality/two_stage.py` | 两阶段输入/输出校验、并发、缓存和一致性账本 | `run_stage1()`、`run_stage2()`、`stage1_passes()`、`stage2_consistency_conflicts()` |
 | `pipeline/orchestrator.py` | P0/P1/P2 编排和 P1 补采 | `run_build()` |
+| `pipeline/checkpoints.py` | 原子阶段检查点、contract 与内容哈希验证 | `CheckpointStore` |
 | `pipeline/config.py` | 完整配置 Schema、相对路径和 CLI 覆盖 | `load_pipeline_config()`、`apply_pipeline_overrides()` |
 | `delivery/screened.py` | 最终 canonical 构建与校验 | `build_screened_canonical_record()`、`validate_screened_canonical_records()` |
 | `delivery/legacy.py` | 28 字段映射、复验和 provenance | `map_screened_to_legacy()`、`validate_legacy_record()`、`export_legacy_branch()` |
@@ -1005,7 +1081,8 @@ artifacts/prompts/quality_stage2.md
 - P1：10,000 配额守恒、九宫格、冷门边界保底、冻结 L2 配额、三轮补采、过采截断、
   候选耗尽和确定性；
 - P2：概率/频率/复杂度门槛、60/40 双轨、3,000 目标和不足记录；
-- LLM：严格字段白名单、枚举、第二阶段字段矛盾、重试耗尽、断点恢复和跨集合缓存复用；
+- LLM：严格字段白名单、枚举、阶段内部矛盾、跨阶段分歧记录、重试耗尽和跨集合缓存复用；
+- 恢复：三个采样分支、Stage1、每轮 P1 补采、最终成员、Stage2、导出和报告的阶段级检查点；
 - 成品：第一阶段准入、第二阶段不改成员、P0/P2 无补采、P1 波次逐条追溯；
 - Legacy：28 字段名称/顺序/类型/值、单多轮、四位小数、三个 set 值和无损枚举；
 - 报告：L1/L2 分布、P1 配额完成率、基础可用率、标签一致率、波次守恒、脱敏及

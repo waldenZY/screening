@@ -20,10 +20,12 @@ from ..delivery.report import RUN_REPORT_SCHEMA_VERSION
 from .orchestrator import BUILD_CONFIG_VERSION, BuildConfig
 from ..delivery.screened import SCREENED_CANONICAL_SCHEMA_VERSION
 from ..quality.two_stage import QualityRunConfig
+from ..quality.two_stage import QUALITY_CONTRACT_VERSION
+from .checkpoints import CHECKPOINT_SCHEMA_VERSION
 
 
 PIPELINE_VERSION = 2
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 _LOCK = threading.RLock()
 _RESUMABLE = {"created", "running", "incomplete", "publish_failed"}
 _REUSABLE = {"completed", "published"}
@@ -74,6 +76,8 @@ def build_run_contract(
         "legacy_schema": LEGACY_SCHEMA_NAME,
         "legacy_mapping_version": LEGACY_MAPPING_VERSION,
         "run_report_schema_version": RUN_REPORT_SCHEMA_VERSION,
+        "quality_contract_version": QUALITY_CONTRACT_VERSION,
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "build_config": asdict(build_config),
         "quality_run_config": asdict(quality_config),
         "prompts": {
@@ -211,11 +215,17 @@ def prepare_run_context(
             "contract": contract,
             "stages": {
                 "canonical_index": {"status": "completed"},
+                "sampling_p0": {"status": "pending"},
+                "sampling_p1": {"status": "pending"},
+                "sampling_p2": {"status": "pending"},
+                "quality_stage1_initial": {"status": "pending"},
                 "p012_build": {"status": "pending"},
                 "quality_stage1": {"status": "pending"},
                 "p1_supplement": {"status": "pending"},
+                "final_membership": {"status": "pending"},
                 "quality_stage2": {"status": "pending"},
                 "screened_export": {"status": "pending"},
+                "legacy_export": {"status": "pending"},
                 "batch_report": {"status": "pending"},
                 "publish": {"status": "pending"},
             },
