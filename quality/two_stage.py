@@ -50,6 +50,7 @@ ISSUE_TYPES = frozenset(
         "multi_intent",
     }
 )
+QUALITY_CONTRACT_VERSION = 2
 
 
 class QualityResponseError(ValueError):
@@ -63,6 +64,13 @@ class QualityStageIncomplete(RuntimeError):
         self.stage = stage
         self.failures = tuple(failures)
         super().__init__(f"{stage} 存在 {len(failures)} 条工程失败")
+
+
+def _sanitized_error(exc: Exception) -> str:
+    """Keep task ledgers useful without persisting provider/request content."""
+    if isinstance(exc, QualityResponseError):
+        return f"{type(exc).__name__}: {exc}"
+    return type(exc).__name__
 
 
 @dataclass(frozen=True)
@@ -188,19 +196,6 @@ def validate_stage2_result(value: Any, stage1_result: Mapping[str, Any]) -> Json
         raise QualityResponseError("第二阶段 overall_score 必须是 1~5 整数")
 
     issue_set = set(issues)
-    contradictions = (
-        (stage1["category_fit"] == "exact" and "category_mismatch" in issue_set),
-        (stage1["semantic_completeness"] == "self_contained" and "context_dependent" in issue_set),
-        (stage1["intent_clarity"] == "clear" and "ambiguous_intent" in issue_set),
-        (stage1["intent_clarity"] == "clear" and "nonsense" in issue_set),
-        (stage1["semantic_completeness"] == "self_contained" and "truncated" in issue_set),
-        (stage1["intent_clarity"] == "clear" and "emotional_only" in issue_set),
-        (stage1["intent_clarity"] == "clear" and "too_brief" in issue_set),
-        (stage1["validity"] == "valid" and classification == "not_applicable"),
-        (stage1["validity"] == "valid" and task == "not_applicable"),
-    )
-    if any(contradictions):
-        raise QualityResponseError("第二阶段结果与第一阶段存在逻辑矛盾")
     if score == 5 and issue_set != {"none"}:
         raise QualityResponseError("overall_score=5 时 issue_types 必须为 none")
     if stage1_passes(stage1) and score < 5 and issue_set == {"none"}:
@@ -211,6 +206,38 @@ def validate_stage2_result(value: Any, stage1_result: Mapping[str, Any]) -> Json
         "issue_types": list(issues),
         "overall_score": score,
     }
+
+
+def stage2_consistency_conflicts(
+    value: Mapping[str, Any], stage1_result: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """Return sanitized cross-stage disagreement codes without rejecting labels."""
+    stage1 = validate_stage1_result(dict(stage1_result))
+    stage2 = validate_stage2_result(dict(value), stage1)
+    issues = set(stage2["issue_types"])
+    conflicts: list[str] = []
+    if stage1["category_fit"] == "exact" and "category_mismatch" in issues:
+        conflicts.append("category_fit")
+    if stage1["semantic_completeness"] == "self_contained":
+        if "context_dependent" in issues:
+            conflicts.append("semantic_context")
+        if "truncated" in issues:
+            conflicts.append("semantic_truncated")
+    if stage1["intent_clarity"] == "clear":
+        for issue, code in (
+            ("ambiguous_intent", "intent_ambiguous"),
+            ("nonsense", "intent_nonsense"),
+            ("emotional_only", "intent_emotional_only"),
+            ("too_brief", "intent_too_brief"),
+        ):
+            if issue in issues:
+                conflicts.append(code)
+    if stage1["validity"] == "valid":
+        if stage2["classification_difficulty"] == "not_applicable":
+            conflicts.append("classification_not_applicable")
+        if stage2["task_difficulty"] == "not_applicable":
+            conflicts.append("task_not_applicable")
+    return tuple(conflicts)
 
 
 class TwoStageQualityRunner:
@@ -250,6 +277,7 @@ class TwoStageQualityRunner:
             if not snapshot.is_file():
                 snapshot.write_text(prompt, encoding="utf-8", newline="\n")
         run_contract = {
+            "quality_contract_version": QUALITY_CONTRACT_VERSION,
             "prompt_hashes": self.prompt_hashes,
             "model": self.model,
             "options_sha256": self.options_hash,
@@ -258,7 +286,9 @@ class TwoStageQualityRunner:
         contract_path = self.run_root / "quality_run_contract.json"
         if contract_path.is_file():
             existing = json.loads(contract_path.read_text(encoding="utf-8"))
-            if existing != run_contract:
+            legacy_contract = dict(run_contract)
+            legacy_contract.pop("quality_contract_version", None)
+            if existing not in (run_contract, legacy_contract):
                 raise ValueError("两阶段 LLM 运行目录与当前 Prompt、模型或配置不兼容")
         else:
             contract_path.write_text(
@@ -414,8 +444,8 @@ class TwoStageQualityRunner:
                 {
                     "cache_key": key,
                     "stage": stage,
-                    "source_lines": sorted(int(item["source"]["source_line"]) for item in grouped),
-                    "source_identities": sorted(item["source_identity_sha256"] for item in grouped),
+                    "source_lines": sorted({int(item["source"]["source_line"]) for item in grouped}),
+                    "source_identities": sorted({item["source_identity_sha256"] for item in grouped}),
                     "conversation_sha256": representative["conversation_sha256"],
                     "taxonomy_sha256": _stable_hash(representative["taxonomy"]),
                     "prompt_sha256": self.prompt_hashes[stage],
@@ -425,6 +455,13 @@ class TwoStageQualityRunner:
         _merge_task_ledger(self.run_root / f"{stage}_tasks.jsonl", tasks)
 
         pending = [key for key in by_key if key not in cached]
+        self.logger.info(
+            "%s tasks=%d cache_hits=%d pending=%d",
+            stage,
+            len(by_key),
+            len(cached),
+            len(pending),
+        )
         failures: dict[str, str] = {}
         attempt_path = self.run_root / f"{stage}_attempts.jsonl"
         attempt_lock = threading.Lock()
@@ -433,6 +470,13 @@ class TwoStageQualityRunner:
             for attempt_no in range(1, self.config.max_retries + 1):
                 if not pending:
                     break
+                self.logger.info(
+                    "%s attempt=%d pending=%d workers=%d",
+                    stage,
+                    attempt_no,
+                    len(pending),
+                    self.config.workers,
+                )
                 failures = {}
                 successes: dict[str, JsonObject] = {}
                 with ThreadPoolExecutor(max_workers=self.config.workers) as executor:
@@ -466,7 +510,7 @@ class TwoStageQualityRunner:
                                 }
                             )
                         except Exception as exc:  # transport and contract failures are both retried
-                            failures[key] = f"{type(exc).__name__}: {exc}"
+                            failures[key] = _sanitized_error(exc)
                             attempt.update(
                                 {
                                     "outcome": "failure",
@@ -483,6 +527,14 @@ class TwoStageQualityRunner:
                     self._save_cached(stage, successes)
                     cached.update(successes)
                 pending = [key for key in pending if key not in successes]
+                self.logger.info(
+                    "%s attempt=%d succeeded=%d failed=%d remaining=%d",
+                    stage,
+                    attempt_no,
+                    len(successes),
+                    len(failures),
+                    len(pending),
+                )
                 if pending and attempt_no < self.config.max_retries:
                     time.sleep(min(2**attempt_no, 10))
         if pending:
@@ -493,6 +545,37 @@ class TwoStageQualityRunner:
             for key in sorted(by_key)
         ]
         _merge_ledger(self.run_root / f"{stage}_results.jsonl", cache_results, "cache_key")
+        if stage == "stage2":
+            consistency_rows = []
+            for key in sorted(by_key):
+                conflicts = stage2_consistency_conflicts(
+                    cached[key], stage1_for_key[key] or {}
+                )
+                consistency_rows.append(
+                    {
+                        "cache_key": key,
+                        "stage": stage,
+                        "source_identities": sorted(
+                            {
+                                candidate["source_identity_sha256"]
+                                for candidate in by_key[key]
+                            }
+                        ),
+                        "is_consistent": not conflicts,
+                        "conflict_codes": list(conflicts),
+                    }
+                )
+            _merge_ledger(
+                self.run_root / "stage2_consistency.jsonl",
+                consistency_rows,
+                "cache_key",
+            )
+            conflict_tasks = sum(not row["is_consistent"] for row in consistency_rows)
+            self.logger.info(
+                "stage2 consistency tasks=%d disagreements=%d",
+                len(consistency_rows),
+                conflict_tasks,
+            )
         result_by_identity: dict[str, JsonObject] = {}
         for key, grouped in by_key.items():
             for candidate in grouped:
