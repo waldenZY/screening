@@ -20,7 +20,7 @@ from ..shared.taxonomy import TaxonomyMappings
 from .screened import validate_screened_canonical_record
 
 
-RUN_REPORT_SCHEMA_VERSION = 2
+RUN_REPORT_SCHEMA_VERSION = 3
 RUN_REPORT_JSON = "screening_run_report.json"
 RUN_REPORT_MARKDOWN = "screening_run_report.md"
 SET_NAMES = ("P0", "P1", "P2")
@@ -114,6 +114,85 @@ def _distribution(
 ) -> JsonObject:
     keys = list(allowed) if allowed is not None else sorted(values)
     return {key: int(values.get(key, 0)) for key in keys}
+
+
+def _p1_diagnostics(build_summary: Mapping[str, Any]) -> JsonObject:
+    supplement = build_summary.get("p1_supplement")
+    if not isinstance(supplement, Mapping):
+        raise RunReportError("P1 补采诊断缺少汇总")
+    l2_totals: dict[str, Counter[str]] = defaultdict(Counter)
+    cluster_totals: dict[tuple[str, Any], Counter[str]] = defaultdict(Counter)
+    round_rows: list[JsonObject] = []
+    for round_row in supplement["rounds"]:
+        batches = round_row["batches"]
+        round_usable = 0
+        round_exact = 0
+        for key, count in round_row["requested_by_l2"].items():
+            l2_totals[key]["requested"] += int(count)
+        for batch in batches:
+            for key, row in batch["l2"].items():
+                for metric in ("sampled", "evaluated", "usable", "exact", "stage1_pass", "admitted"):
+                    l2_totals[key][metric] += int(row[metric])
+                round_usable += int(row["usable"])
+                round_exact += int(row["exact"])
+            for row in batch["clusters"]:
+                key = (str(row["l2_key"]), row["cluster_id"])
+                for metric in ("sampled", "evaluated", "usable", "exact", "stage1_pass", "admitted"):
+                    cluster_totals[key][metric] += int(row[metric])
+        if sum(int(batch["sampled"]) for batch in batches) != int(round_row["sampled"]):
+            raise RunReportError("P1 补采小批与轮次抽样数不守恒")
+        round_rows.append({
+            "round": int(round_row["round"]),
+            "batch_count": len(batches),
+            "planned_request": sum(int(value) for value in round_row["requested_by_l2"].values()),
+            "sampled": int(round_row["sampled"]),
+            "evaluated": int(round_row["after_dedup"]),
+            "usable": round_usable,
+            "exact": round_exact,
+            "stage1_pass": int(round_row["stage1_pass"]),
+            "admitted": int(round_row["admitted"]),
+            "stop_reason": round_row["stop"],
+        })
+    quotas = supplement["target_quotas_by_l2"]
+    deficits = supplement["deficits_by_l2"]
+    remaining = supplement["candidate_remaining_by_l2"]
+    stops = supplement["stop_reason_by_l2"]
+    l2_rows = [
+        {
+            "l2_key": key,
+            "quota": int(quotas[key]),
+            "deficit": int(deficits[key]),
+            "candidate_remaining": int(remaining[key]),
+            "stop_reason": stops[key],
+            **{metric: int(l2_totals[key][metric]) for metric in
+               ("requested", "sampled", "evaluated", "usable", "exact", "stage1_pass", "admitted")},
+        }
+        for key in sorted(quotas)
+    ]
+    cluster_rows = [
+        {"l2_key": key[0], "cluster_id": key[1],
+         **{metric: int(counts[metric]) for metric in
+            ("sampled", "evaluated", "usable", "exact", "stage1_pass", "admitted")}}
+        for key, counts in cluster_totals.items()
+    ]
+    deficit_rows = [row for row in l2_rows if row["deficit"] > 0]
+    small_deficits = [row for row in deficit_rows if row["deficit"] <= 2]
+    return {
+        "detail_path": "P1/supplement_summary.json",
+        "rounds": round_rows,
+        "l2_with_deficit": len(deficit_rows),
+        "small_deficit_l2": len(small_deficits),
+        "small_deficit_total": sum(row["deficit"] for row in small_deficits),
+        "top_deficit_l2": sorted(deficit_rows, key=lambda row: (-row["deficit"], row["l2_key"]))[:10],
+        "top_unusable_clusters": sorted(
+            cluster_rows,
+            key=lambda row: (-(row["evaluated"] - row["usable"]), row["l2_key"], str(row["cluster_id"])),
+        )[:10],
+        "top_category_mismatch_clusters": sorted(
+            cluster_rows,
+            key=lambda row: (-(row["usable"] - row["exact"]), row["l2_key"], str(row["cluster_id"])),
+        )[:10],
+    }
 
 
 def build_run_report(
@@ -409,6 +488,7 @@ def build_run_report(
             "cross_set_overlap": dict(build_summary.get("cross_set_overlap", {})),
         },
         "sets": sets,
+        "p1_diagnostics": _p1_diagnostics(build_summary),
     }
     validate_run_report(report)
     return report
@@ -455,6 +535,7 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         "taxonomy",
         "totals",
         "sets",
+        "p1_diagnostics",
     }
     if not isinstance(report, Mapping) or set(report) != expected_top:
         raise RunReportError("批跑报告顶层字段不一致")
@@ -465,6 +546,15 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
     if not isinstance(report.get("sets"), Mapping) or set(report["sets"]) != set(SET_NAMES):
         raise RunReportError("批跑报告集合不完整")
     _reject_sensitive_keys(report)
+    diagnostics = report["p1_diagnostics"]
+    if not isinstance(diagnostics, Mapping) or not isinstance(diagnostics.get("rounds"), list):
+        raise RunReportError("P1 补采诊断结构非法")
+    if (
+        sum(int(row["evaluated"]) for row in diagnostics["rounds"])
+        != sum(int(row["stage1_evaluated"]) for row in report["sets"]["P1"]["waves"]
+           if int(row["round_id"]) > 0)
+    ):
+        raise RunReportError("P1 补采诊断与 Stage1 波次数量不守恒")
 
     total_final = 0
     for set_name in SET_NAMES:
@@ -696,6 +786,55 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             ]
         )
 
+    lines.extend(
+        [
+            "",
+            "## P1 补采诊断",
+            "",
+            f"- 尚有缺口的 L2：{report['p1_diagnostics']['l2_with_deficit']}；其中缺 1–2 条的 L2：{report['p1_diagnostics']['small_deficit_l2']}，合计缺口 {report['p1_diagnostics']['small_deficit_total']}。",
+            "- 完整的逐批 L2 和 cluster 数据见 `P1/supplement_summary.json`。",
+            "",
+            "| 轮次 | 小批数 | 计划请求 | 实际抽样 | Stage1 评估 | 基础可用 | 类别 exact | 通过 | 入集 | 停止原因 |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    for row in report["p1_diagnostics"]["rounds"]:
+        lines.append(
+            f"| {row['round']} | {row['batch_count']} | {row['planned_request']} | "
+            f"{row['sampled']} | {row['evaluated']} | {row['usable']} | {row['exact']} | "
+            f"{row['stage1_pass']} | {row['admitted']} | {row['stop_reason']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### 缺口最大的 L2",
+            "",
+            "| L2 | 配额 | 缺口 | 补采评估 | 基础可用 | exact | 候选剩余 | 停止原因 |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    for row in report["p1_diagnostics"]["top_deficit_l2"]:
+        lines.append(
+            f"| {_cell(row['l2_key'])} | {row['quota']} | {row['deficit']} | "
+            f"{row['evaluated']} | {row['usable']} | {row['exact']} | "
+            f"{row['candidate_remaining']} | {row['stop_reason']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### 损耗最多的 cluster",
+            "",
+            "| 原因 | L2 | cluster | Stage1 评估 | 基础可用 | exact |",
+            "| --- | --- | --- | ---: | ---: | ---: |",
+        ]
+    )
+    for reason, key in (("文本不可用", "top_unusable_clusters"),
+                        ("可用但类别不符", "top_category_mismatch_clusters")):
+        for row in report["p1_diagnostics"][key]:
+            lines.append(
+                f"| {reason} | {_cell(row['l2_key'])} | {_cell(row['cluster_id'])} | "
+                f"{row['evaluated']} | {row['usable']} | {row['exact']} |"
+            )
     lines.extend(
         [
             "",

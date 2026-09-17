@@ -1289,3 +1289,22 @@ class CanonicalCandidateIndex:
             key = json.loads(value) if level == "cluster" else str(value)
             result[key] = int(count)
         return result
+
+    def cluster_counts_for_identities(self, identities: Iterable[str]) -> dict[Any, int]:
+        """Count already sampled locators by cluster without scanning the source."""
+        values = sorted(set(identities))
+        result: dict[Any, int] = {}
+        for start in range(0, len(values), 500):
+            batch = values[start:start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.connection.execute(
+                f"SELECT cluster_json, COUNT(*) FROM candidates "
+                f"WHERE source_identity_sha256 IN ({placeholders}) GROUP BY cluster_json",
+                batch,
+            )
+            for cluster_json, count in rows:
+                key = json.loads(cluster_json)
+                result[key] = result.get(key, 0) + int(count)
+        if sum(result.values()) != len(values):
+            raise ValueError("已抽样 identity 无法全部在 canonical 索引中定位")
+        return result

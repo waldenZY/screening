@@ -182,6 +182,26 @@ def _l2_counts(candidates: Sequence[JsonObject]) -> Counter[str]:
     return Counter(candidate["taxonomy"]["l2_key"] for candidate in candidates)
 
 
+def _usable_stage1(result: Mapping[str, Any]) -> bool:
+    return (
+        result["semantic_completeness"] == "self_contained"
+        and result["intent_clarity"] == "clear"
+        and result["validity"] == "valid"
+    )
+
+
+def _update_cluster_feedback(
+    feedback: dict[Any, list[int]],
+    candidates: Sequence[JsonObject],
+    results: Mapping[str, JsonObject],
+) -> None:
+    for candidate in candidates:
+        cluster = candidate["taxonomy"]["cluster_id"]
+        counts = feedback.setdefault(cluster, [0, 0])
+        counts[0] += 1
+        counts[1] += int(stage1_passes(results[candidate["source_identity_sha256"]]))
+
+
 def _pass_rates(
     l2_keys: Sequence[str],
     initial_terminal: Mapping[str, int],
@@ -335,6 +355,7 @@ def run_build(
     active_logger = logger or logging.getLogger(__name__)
     run_contract: JsonObject = {
         "config_version": config.config_version,
+        "p1_supplement_algorithm": "adaptive_cluster_batches_1",
         "config": asdict(config),
         "source_snapshot_id": index.metadata.get("source_snapshot_id"),
         "taxonomy_sha256": index.metadata.get("taxonomy_sha256"),
@@ -603,6 +624,14 @@ def run_build(
         supplement_terminal: Counter[str] = Counter()
         supplement_pass: Counter[str] = Counter()
         processed = set(branch_states["P1"]["sampled_identities"])
+        cluster_feedback: dict[Any, list[int]] = {}
+        _update_cluster_feedback(cluster_feedback, candidate_sets["P1"], stage1)
+        with CanonicalCandidateIndex(index) as readonly_index:
+            cluster_remaining = readonly_index.available_counts("cluster")
+            for cluster, count in readonly_index.cluster_counts_for_identities(processed).items():
+                cluster_remaining[cluster] -= count
+                if cluster_remaining[cluster] < 0:
+                    raise ValueError("P1 初采后 cluster 剩余量为负")
         supplement_rounds: list[JsonObject] = []
         mark("p1_supplement", "running", completed_rounds=0)
         supplement_started = time.monotonic()
@@ -634,125 +663,267 @@ def run_build(
                 for key, deficit in deficits.items()
                 if deficit > 0
             }
-            plan_name = f"p1_round_{round_id}_plan"
-            plan = checkpoints.load(plan_name)
+            round_cluster_counts = {
+                key: sum(
+                    cluster_remaining.get(cluster, 0) > 0
+                    for cluster in taxonomy.l2_clusters.get(key, ())
+                )
+                for key in requested
+            }
+            round_plan_name = f"p1_round_{round_id}_request"
+            round_plan = checkpoints.load(round_plan_name)
             completed_rounds = int(
                 manifest_stage_value("p1_supplement", "completed_rounds", 0) or 0
             )
-            if plan is None and completed_rounds >= round_id:
+            if round_plan is None and completed_rounds >= round_id:
                 raise ValueError(
                     f"manifest 标记 P1 第 {round_id} 轮已完成，但计划检查点缺失"
                 )
-            if plan is None:
-                active_logger.info(
-                    "P1 supplement round=%d sampling requested=%d",
-                    round_id,
-                    sum(requested.values()),
-                )
-                with CanonicalCandidateIndex(index) as readonly_index:
-                    sampler = CandidateSampler(
-                        readonly_index, source_path, taxonomy, config.sampling
-                    )
-                    new_locators = sampler.sample_p1(
-                        sum(requested.values()), processed, requested_by_l2=requested
-                    )
-                new_materialized = _materialize(
-                    index, source_path, taxonomy, new_locators, materialized
-                )
-                new_candidates = _deduplicate(
-                    "P1",
-                    new_materialized,
-                    accepted["P1"],
-                    threshold=config.sampling.p1.dedup_threshold,
-                )
-                plan = {
+            if round_plan is None:
+                round_plan = {
                     "round": round_id,
                     "requested_by_l2": requested,
                     "estimated_pass_rate_by_l2": rates,
-                    "sampled_identities": [
-                        item["source_identity_sha256"] for item in new_locators
-                    ],
-                    "sampled": len(new_locators),
-                    "candidates": new_candidates,
+                    "available_cluster_count_by_l2": round_cluster_counts,
                 }
-                checkpoints.save(plan_name, plan)
-            else:
-                active_logger.info(
-                    "resume checkpoint=%s candidates=%d",
-                    plan_name,
-                    len(plan["candidates"]),
-                )
-            processed.update(plan["sampled_identities"])
-            new_candidates = list(plan["candidates"])
-            if new_candidates:
-                _merge_candidate_tasks(
-                    run_root / "P1" / "candidate_tasks.jsonl",
-                    [_candidate_task(candidate, "P1", round_id) for candidate in new_candidates],
-                )
-                evaluated_candidates["P1"].extend(new_candidates)
-                evaluation_rounds["P1"].update(
-                    {candidate["source_identity_sha256"]: round_id for candidate in new_candidates}
-                )
-            result_name = f"p1_round_{round_id}_result"
-            round_result = checkpoints.load(result_name)
-            if round_result is None and completed_rounds >= round_id:
-                raise ValueError(
-                    f"manifest 标记 P1 第 {round_id} 轮已完成，但结果检查点缺失"
-                )
-            if round_result is None:
-                if new_candidates:
-                    round_stage1 = quality_runner.run_stage1(new_candidates)
-                    round_pass = _passing(new_candidates, round_stage1)
-                else:
-                    round_stage1 = {}
-                    round_pass = []
-                remaining = dict(deficits)
-                added: list[JsonObject] = []
-                for candidate in round_pass:
-                    key = candidate["taxonomy"]["l2_key"]
-                    if remaining.get(key, 0) > 0:
-                        added.append(candidate)
-                        remaining[key] -= 1
-                round_summary: JsonObject = {
-                    "round": round_id,
-                    "requested_by_l2": plan["requested_by_l2"],
-                    "estimated_pass_rate_by_l2": plan["estimated_pass_rate_by_l2"],
-                    "sampled": int(plan["sampled"]),
-                    "after_dedup": len(new_candidates),
-                    "stage1_pass": len(round_pass),
-                    "admitted": len(added),
-                }
-                if not plan["sampled_identities"]:
-                    round_summary["stop"] = "candidate_exhausted"
-                round_result = {
-                    "stage1_results": round_stage1,
-                    "admitted_identities": [
-                        candidate["source_identity_sha256"] for candidate in added
-                    ],
-                    "summary": round_summary,
-                }
-                checkpoints.save(result_name, round_result)
-            round_stage1 = dict(round_result["stage1_results"])
-            stage1.update(round_stage1)
-            round_pass = _passing(new_candidates, round_stage1) if new_candidates else []
-            supplement_terminal.update(_l2_counts(new_candidates))
-            supplement_pass.update(_l2_counts(round_pass))
-            admitted_ids = set(round_result["admitted_identities"])
-            added = [
-                candidate for candidate in new_candidates
-                if candidate["source_identity_sha256"] in admitted_ids
-            ]
-            accepted["P1"].extend(added)
-            selection_rounds["P1"].update(
-                {candidate["source_identity_sha256"]: round_id for candidate in added}
+                checkpoints.save(round_plan_name, round_plan)
+            elif (
+                round_plan["requested_by_l2"] != requested
+                or round_plan["available_cluster_count_by_l2"] != round_cluster_counts
+            ):
+                raise ValueError(f"P1 第 {round_id} 轮计划与续跑状态不一致")
+            active_logger.info(
+                "P1 supplement round=%d sampling requested=%d",
+                round_id, sum(requested.values()),
             )
-            supplement_rounds.append(dict(round_result["summary"]))
+            used: Counter[str] = Counter()
+            round_draws: Counter[Any] = Counter()
+            round_cold: Counter[Any] = Counter()
+            batch_summaries: list[JsonObject] = []
+            batch_id = 0
+            while True:
+                current = _l2_counts(accepted["P1"])
+                deficits = {
+                    key: max(0, quota - current.get(key, 0))
+                    for key, quota in p1_target_quotas.items()
+                }
+                batch_request = {
+                    key: min(deficit, requested[key] - used[key])
+                    for key, deficit in deficits.items()
+                    if deficit > 0
+                    and used[key] < requested.get(key, 0)
+                    and any(cluster_remaining.get(cluster, 0) > 0
+                            for cluster in taxonomy.l2_clusters.get(key, ()))
+                }
+                if not batch_request:
+                    break
+                batch_id += 1
+                plan_name = f"p1_round_{round_id}_batch_{batch_id}_plan"
+                plan = checkpoints.load(plan_name)
+                if plan is None and completed_rounds >= round_id:
+                    raise ValueError(f"P1 第 {round_id} 轮第 {batch_id} 批计划检查点缺失")
+                if plan is None:
+                    with CanonicalCandidateIndex(index) as readonly_index:
+                        sampler = CandidateSampler(
+                            readonly_index, source_path, taxonomy, config.sampling
+                        )
+                        locators = sampler.sample_p1_supplement_batch(
+                            batch_request,
+                            processed,
+                            remaining_by_cluster=cluster_remaining,
+                            evaluated_passed_by_cluster=cluster_feedback,
+                            prior_by_l2=rates,
+                            prior_strength=config.p1_supplement.pass_rate_prior_strength,
+                            round_draws_by_cluster=round_draws,
+                            round_cold_by_cluster=round_cold,
+                            round_request_by_l2=requested,
+                            round_cluster_count_by_l2=round_cluster_counts,
+                        )
+                    if not locators:
+                        raise ValueError("P1 仍有可抽样候选，但小批采样结果为空")
+                    new_materialized = _materialize(
+                        index, source_path, taxonomy, locators, materialized
+                    )
+                    new_candidates = _deduplicate(
+                        "P1", new_materialized, accepted["P1"],
+                        threshold=config.sampling.p1.dedup_threshold,
+                    )
+                    sampled_l2 = Counter(item["l2_key"] for item in locators)
+                    sampled_cluster = Counter(
+                        (item["l2_key"], item["cluster_id"]) for item in locators
+                    )
+                    cold_cluster = Counter(
+                        item["cluster_id"] for item in locators
+                        if item["features"]["probability_band"] == "boundary"
+                        and item["features"]["frequency_band"] == "cold"
+                    )
+                    plan = {
+                        "round": round_id,
+                        "batch": batch_id,
+                        "requested_by_l2": batch_request,
+                        "sampled_identities": [item["source_identity_sha256"] for item in locators],
+                        "sampled_by_l2": dict(sampled_l2),
+                        "sampled_by_cluster": [
+                            {"l2_key": key, "cluster_id": cluster, "count": count}
+                            for (key, cluster), count in sorted(
+                                sampled_cluster.items(), key=lambda item: (item[0][0], str(item[0][1]))
+                            )
+                        ],
+                        "cold_by_cluster": [
+                            {"cluster_id": cluster, "count": count}
+                            for cluster, count in sorted(cold_cluster.items(), key=lambda item: str(item[0]))
+                        ],
+                        "candidates": new_candidates,
+                    }
+                    checkpoints.save(plan_name, plan)
+                elif plan["requested_by_l2"] != batch_request:
+                    raise ValueError(f"P1 第 {round_id} 轮第 {batch_id} 批计划与续跑状态不一致")
+                processed.update(plan["sampled_identities"])
+                used.update(plan["sampled_by_l2"])
+                for row in plan["sampled_by_cluster"]:
+                    cluster = row["cluster_id"]
+                    count = int(row["count"])
+                    round_draws[cluster] += count
+                    cluster_remaining[cluster] -= count
+                    if cluster_remaining[cluster] < 0:
+                        raise ValueError("P1 补采后 cluster 剩余量为负")
+                for row in plan["cold_by_cluster"]:
+                    round_cold[row["cluster_id"]] += int(row["count"])
+                new_candidates = list(plan["candidates"])
+                if new_candidates:
+                    _merge_candidate_tasks(
+                        run_root / "P1" / "candidate_tasks.jsonl",
+                        [_candidate_task(candidate, "P1", round_id) for candidate in new_candidates],
+                    )
+                    evaluated_candidates["P1"].extend(new_candidates)
+                    evaluation_rounds["P1"].update(
+                        {candidate["source_identity_sha256"]: round_id for candidate in new_candidates}
+                    )
+                result_name = f"p1_round_{round_id}_batch_{batch_id}_result"
+                batch_result = checkpoints.load(result_name)
+                if batch_result is None and completed_rounds >= round_id:
+                    raise ValueError(f"P1 第 {round_id} 轮第 {batch_id} 批结果检查点缺失")
+                if batch_result is None:
+                    batch_stage1 = quality_runner.run_stage1(new_candidates) if new_candidates else {}
+                    batch_pass = _passing(new_candidates, batch_stage1) if new_candidates else []
+                    pass_counts = _l2_counts(batch_pass)
+                    if any(pass_counts[key] > deficits[key] for key in pass_counts):
+                        raise ValueError("P1 小批通过量超过当前 L2 缺口")
+                    batch_result = {
+                        "stage1_results": batch_stage1,
+                        "admitted_identities": [item["source_identity_sha256"] for item in batch_pass],
+                    }
+                    checkpoints.save(result_name, batch_result)
+                batch_stage1 = dict(batch_result["stage1_results"])
+                stage1.update(batch_stage1)
+                batch_pass = _passing(new_candidates, batch_stage1) if new_candidates else []
+                admitted_ids = set(batch_result["admitted_identities"])
+                if admitted_ids != {item["source_identity_sha256"] for item in batch_pass}:
+                    raise ValueError("P1 小批通过与入集检查点不一致")
+                accepted["P1"].extend(batch_pass)
+                selection_rounds["P1"].update(
+                    {item["source_identity_sha256"]: round_id for item in batch_pass}
+                )
+                supplement_terminal.update(_l2_counts(new_candidates))
+                supplement_pass.update(_l2_counts(batch_pass))
+                _update_cluster_feedback(cluster_feedback, new_candidates, batch_stage1)
+                diagnostic_l2: dict[str, JsonObject] = {
+                    key: {"requested": count, "sampled": int(plan["sampled_by_l2"].get(key, 0)),
+                          "evaluated": 0, "usable": 0, "exact": 0, "stage1_pass": 0,
+                          "admitted": 0}
+                    for key, count in batch_request.items()
+                }
+                diagnostic_cluster: dict[tuple[str, Any], JsonObject] = {
+                    (row["l2_key"], row["cluster_id"]): {
+                        "l2_key": row["l2_key"], "cluster_id": row["cluster_id"],
+                        "sampled": int(row["count"]), "evaluated": 0, "usable": 0,
+                        "exact": 0, "stage1_pass": 0, "admitted": 0,
+                    }
+                    for row in plan["sampled_by_cluster"]
+                }
+                for candidate in new_candidates:
+                    identity = candidate["source_identity_sha256"]
+                    key = candidate["taxonomy"]["l2_key"]
+                    cluster = candidate["taxonomy"]["cluster_id"]
+                    result = batch_stage1[identity]
+                    for row in (diagnostic_l2[key], diagnostic_cluster[(key, cluster)]):
+                        row["evaluated"] += 1
+                        row["usable"] += int(_usable_stage1(result))
+                        row["exact"] += int(_usable_stage1(result) and result["category_fit"] == "exact")
+                        row["stage1_pass"] += int(stage1_passes(result))
+                        row["admitted"] += int(identity in admitted_ids)
+                current_after = _l2_counts(accepted["P1"])
+                for key, row in diagnostic_l2.items():
+                    row["remaining_deficit"] = max(0, p1_target_quotas[key] - current_after[key])
+                    row["candidate_remaining"] = sum(
+                        cluster_remaining.get(cluster, 0)
+                        for cluster in taxonomy.l2_clusters.get(key, ())
+                    )
+                    row["stop_reason"] = (
+                        "quota_filled" if row["remaining_deficit"] == 0
+                        else "candidate_exhausted" if row["candidate_remaining"] == 0
+                        else "round_requests_used" if used[key] >= requested[key]
+                        else "continue"
+                    )
+                for (_, cluster), row in diagnostic_cluster.items():
+                    row["candidate_remaining"] = cluster_remaining[cluster]
+                batch_summaries.append({
+                    "batch": batch_id,
+                    "sampled": len(plan["sampled_identities"]),
+                    "after_dedup": len(new_candidates),
+                    "stage1_pass": len(batch_pass),
+                    "admitted": len(batch_pass),
+                    "l2": diagnostic_l2,
+                    "clusters": [diagnostic_cluster[key] for key in sorted(
+                        diagnostic_cluster, key=lambda item: (item[0], str(item[1]))
+                    )],
+                })
+                active_logger.info(
+                    "P1 supplement round=%d batch=%d sampled=%d evaluated=%d admitted=%d",
+                    round_id, batch_id, len(plan["sampled_identities"]),
+                    len(new_candidates), len(batch_pass),
+                )
+            round_final_counts = _l2_counts(accepted["P1"])
+            remaining_deficits = {
+                key: max(0, quota - round_final_counts[key])
+                for key, quota in p1_target_quotas.items()
+            }
+            if not any(remaining_deficits.values()):
+                round_stop = "quota_filled"
+            elif all(
+                not any(cluster_remaining.get(cluster, 0) > 0
+                        for cluster in taxonomy.l2_clusters.get(key, ()))
+                for key, deficit in remaining_deficits.items() if deficit > 0
+            ):
+                round_stop = "candidate_exhausted"
+            else:
+                round_stop = "round_requests_used"
+            round_summary = {
+                "round": round_id,
+                "requested_by_l2": requested,
+                "estimated_pass_rate_by_l2": rates,
+                "sampled": sum(batch["sampled"] for batch in batch_summaries),
+                "after_dedup": sum(batch["after_dedup"] for batch in batch_summaries),
+                "stage1_pass": sum(batch["stage1_pass"] for batch in batch_summaries),
+                "admitted": sum(batch["admitted"] for batch in batch_summaries),
+                "batches": batch_summaries,
+                "stop": round_stop,
+            }
+            summary_name = f"p1_round_{round_id}_summary"
+            saved_summary = checkpoints.load(summary_name)
+            if saved_summary is None:
+                if completed_rounds >= round_id:
+                    raise ValueError(f"P1 第 {round_id} 轮汇总检查点缺失")
+                checkpoints.save(summary_name, round_summary)
+            elif saved_summary != round_summary:
+                raise ValueError(f"P1 第 {round_id} 轮汇总与续跑状态不一致")
+            supplement_rounds.append(round_summary)
             active_logger.info(
                 "P1 supplement round=%d complete sampled=%d stage1_pass=%d admitted=%d seconds=%.2f",
                 round_id,
-                int(round_result["summary"]["sampled"]),
-                int(round_result["summary"]["stage1_pass"]),
-                int(round_result["summary"]["admitted"]),
+                round_summary["sampled"],
+                round_summary["stage1_pass"],
+                round_summary["admitted"],
                 time.monotonic() - round_started,
             )
             mark(
@@ -761,7 +932,7 @@ def run_build(
                 completed_rounds=round_id,
                 admitted=len(accepted["P1"]),
             )
-            if round_result["summary"].get("stop") == "candidate_exhausted":
+            if round_stop == "candidate_exhausted":
                 break
 
         final_state = {
@@ -773,6 +944,11 @@ def run_build(
             "audits": audits,
             "p1_target_quotas": p1_target_quotas,
             "supplement_rounds": supplement_rounds,
+            "p1_candidate_remaining_by_l2": {
+                key: sum(cluster_remaining.get(cluster, 0)
+                         for cluster in taxonomy.l2_clusters.get(key, ()))
+                for key in p1_target_quotas
+            },
             "initial_p1_stage1_pass_count": initial_p1_stage1_pass_count,
             "initial_p1_admitted_count": initial_p1_admitted_count,
         }
@@ -826,6 +1002,10 @@ def run_build(
         str(key): int(value) for key, value in final_state["p1_target_quotas"].items()
     }
     supplement_rounds = list(final_state["supplement_rounds"])
+    p1_candidate_remaining_by_l2 = {
+        str(key): int(value)
+        for key, value in final_state["p1_candidate_remaining_by_l2"].items()
+    }
     initial_p1_stage1_pass_count = int(final_state["initial_p1_stage1_pass_count"])
     initial_p1_admitted_count = int(final_state["initial_p1_admitted_count"])
     for name in ("P0", "P1", "P2"):
@@ -1013,6 +1193,15 @@ def run_build(
         "unallocated_target": unallocated_target,
         "total_deficit": config.sampling.p1.target_n - len(accepted["P1"]),
         "deficits_by_l2": p1_deficits,
+        "candidate_remaining_by_l2": p1_candidate_remaining_by_l2,
+        "stop_reason_by_l2": {
+            key: (
+                "quota_filled" if p1_deficits[key] == 0
+                else "candidate_exhausted" if p1_candidate_remaining_by_l2[key] == 0
+                else "max_rounds"
+            )
+            for key in p1_target_quotas
+        },
     }
     write_json(run_root / "P1" / "supplement_summary.json", supplement_summary)
     identities = {

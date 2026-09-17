@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import heapq
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -155,6 +155,52 @@ def allocate_sqrt_quotas(
         )
         quotas[best] += 1
         remaining -= 1
+    return {key: value for key, value in quotas.items() if value}
+
+
+def allocate_feedback_cluster_quotas(
+    remaining: Mapping[Any, int],
+    target: int,
+    *,
+    evaluated_passed: Mapping[Any, tuple[int, int]],
+    l2_prior_rate: float,
+    prior_strength: float,
+    round_draws: Mapping[Any, int],
+    explore_all_clusters: bool,
+) -> dict[Any, int]:
+    """Split one P1 supplement batch using remaining size and Stage1 yield."""
+    sizes = {key: count for key, count in remaining.items() if count > 0}
+    target = min(target, sum(sizes.values()))
+    if target <= 0:
+        return {}
+    quotas = {key: 0 for key in sizes}
+    order = sorted(sizes, key=lambda key: (-sizes[key], str(key)))
+    # Preserve V2's one-per-cluster exploration once per outer round.
+    if explore_all_clusters:
+        for key in order:
+            if target == 0:
+                break
+            if round_draws.get(key, 0) == 0:
+                quotas[key] += 1
+                target -= 1
+    weights = {}
+    for key, count in sizes.items():
+        evaluated, passed = evaluated_passed.get(key, (0, 0))
+        posterior = (passed + prior_strength * l2_prior_rate) / (evaluated + prior_strength)
+        weights[key] = math.sqrt(count) * posterior
+    while target:
+        eligible = [key for key in sizes if quotas[key] < sizes[key]]
+        if not eligible:
+            break
+        chosen = min(
+            eligible,
+            key=lambda key: (
+                -weights[key] / (round_draws.get(key, 0) + quotas[key] + 1),
+                str(key),
+            ),
+        )
+        quotas[chosen] += 1
+        target -= 1
     return {key: value for key, value in quotas.items() if value}
 
 
@@ -384,6 +430,78 @@ class CandidateSampler:
                     remaining = [item for item in pool if item["source_identity_sha256"] not in chosen_ids]
                     remaining.sort(key=lambda item: (-self._score(item, "p0"), int(item["source_line"])))
                     chosen.extend(remaining[: min(cluster_quota, len(pool)) - len(chosen)])
+                result.extend(chosen)
+                self._canonical_cache.clear()
+        return result
+
+    def sample_p1_supplement_batch(
+        self,
+        requested_by_l2: Mapping[str, int],
+        excluded: set[str],
+        *,
+        remaining_by_cluster: Mapping[Any, int],
+        evaluated_passed_by_cluster: Mapping[Any, tuple[int, int]],
+        prior_by_l2: Mapping[str, float],
+        prior_strength: float,
+        round_draws_by_cluster: Mapping[Any, int],
+        round_cold_by_cluster: Mapping[Any, int],
+        round_request_by_l2: Mapping[str, int],
+        round_cluster_count_by_l2: Mapping[str, int],
+    ) -> list[JsonObject]:
+        """Select one adaptive P1 batch while keeping V2's within-cluster rules."""
+        config = self.config.p1
+        result: list[JsonObject] = []
+        for l2_key in sorted(requested_by_l2):
+            target = requested_by_l2[l2_key]
+            if target <= 0:
+                continue
+            clusters = self.taxonomy.l2_clusters.get(l2_key, ())
+            sizes = {
+                cluster: int(remaining_by_cluster.get(cluster, 0))
+                for cluster in clusters
+                if remaining_by_cluster.get(cluster, 0) > 0
+            }
+            quotas = allocate_feedback_cluster_quotas(
+                sizes,
+                target,
+                evaluated_passed=evaluated_passed_by_cluster,
+                l2_prior_rate=prior_by_l2[l2_key],
+                prior_strength=prior_strength,
+                round_draws=round_draws_by_cluster,
+                explore_all_clusters=(
+                    round_request_by_l2[l2_key] >= round_cluster_count_by_l2[l2_key]
+                ),
+            )
+            for cluster in sorted(quotas, key=str):
+                quota = quotas[cluster]
+                pool = self._unique_text(
+                    item for item in self.index.iter_by("cluster", cluster)
+                    if item["source_identity_sha256"] not in excluded
+                )
+                cells: dict[tuple[str, str], list[JsonObject]] = defaultdict(list)
+                for item in pool:
+                    cells[(
+                        item["features"]["probability_band"],
+                        item["features"]["frequency_band"],
+                    )].append(item)
+                remaining_floor = max(
+                    0, config.cold_boundary_floor - round_cold_by_cluster.get(cluster, 0)
+                )
+                grid = _weighted_grid_quotas(
+                    {key: len(values) for key, values in cells.items()},
+                    min(quota, len(pool)),
+                    replace(config, cold_boundary_floor=min(quota, remaining_floor)),
+                )
+                chosen: list[JsonObject] = []
+                for pb in PROBABILITY_ORDER:
+                    for fb in FREQUENCY_ORDER:
+                        key = (pb, fb)
+                        chosen.extend(self._mmr(cells.get(key, ()), grid.get(key, 0), "p0", config.mmr_lambda))
+                if len(chosen) < min(quota, len(pool)):
+                    chosen_ids = {item["source_identity_sha256"] for item in chosen}
+                    rest = [item for item in pool if item["source_identity_sha256"] not in chosen_ids]
+                    rest.sort(key=lambda item: (-self._score(item, "p0"), int(item["source_line"])))
+                    chosen.extend(rest[:min(quota, len(pool)) - len(chosen)])
                 result.extend(chosen)
                 self._canonical_cache.clear()
         return result

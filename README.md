@@ -10,7 +10,7 @@ cluster + taxonomy
 → canonical 流式索引与固定特征
 → P0/P1/P2 独立采样和集合内去重
 → 第一阶段：有效性、基础质量及类别检测
-→ 仅 P1 按冻结 L2 配额补采（最多三轮）
+→ 仅 P1 按冻结 L2 配额补采（每轮分小批，最多三轮）
 → 第二阶段：难度及综合质量
 → canonical screened
 → 28 字段 legacy labeled 导出
@@ -20,6 +20,8 @@ cluster + taxonomy
 
 - P0 沿用结构采样，无全局数量目标，不补采。
 - P1 第一阶段通过后的目标为 10,000，只有 P1 补采。
+- P1 补采保留每轮请求数公式；每批最多抽当前 L2 缺口数，批后根据 cluster
+  Stage1 通过情况重新分配下一批。配额填满或候选耗尽的 L2 立即停止。
 - P2 初始采样目标为 3,000，不补采；第一阶段淘汰后允许不足。
 - 三个集合均以 `exact + self_contained + clear + valid` 准入。
 - 第二阶段只补充标签，不改变集合成员。
@@ -43,7 +45,7 @@ python -m screening.run_pipeline
 
 相同配置再次执行会自动恢复未完成 run，只重试缺少合法结果的 LLM 任务；已经完成的
 run 会直接复用。恢复以阶段检查点为事实源：已完成的 P0/P1/P2 采样、Stage1、P1
-补采轮次、最终成员和 Stage2 都不会重新执行。输入、Prompt、模型或业务配置变化时
+补采小批、最终成员和 Stage2 都不会重新执行。输入、Prompt、模型或业务配置变化时
 会建立新 run。
 
 Stage1 是唯一准入判定。Stage2 可以给出与 Stage1 不同的独立质量判断；这种情况会
@@ -70,7 +72,8 @@ python -m screening.run_pipeline `
 `artifacts/prompts/quality_stage1.md` 和 `quality_stage2.md`。常用临时覆盖参数：
 
 每个配置字段的含义、范围、调大/调小影响、run identity 关系和推荐使用方式，参见
-[Screening v2 配置使用手册](artifacts/docs/screening_pipeline_configuration_v2.md)。
+[配置使用手册](artifacts/docs/screening_pipeline_configuration_v2.md)记录配置字段；
+[P1 补采优化说明](artifacts/docs/screening_v2_p1_adaptive_supplement.md)记录本次变化。
 
 - `--source`、`--taxonomy` 和 `--output-root`；
 - `--workers`、`--max-retries` 和 `--sleep`；
