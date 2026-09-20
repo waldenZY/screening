@@ -1,8 +1,8 @@
 # Screening v2 技术方案
 
-> 文档状态：当前实现基线  
+> 文档状态：当前实现基线（含 P1 逐批补采）
 > 适用入口：`python -m screening.run_pipeline`  
-> 更新日期：2026-09-14
+> 更新日期：2026-09-18
 
 ## 1. 目标与边界
 
@@ -18,8 +18,8 @@ cluster JSONL + taxonomy JSON
 → 流式扫描、校验和 canonical 索引
 → P0 / P1 / P2 独立采样与集合内去重
 → 第一阶段：有效性、基础质量及类别检测
-→ 第一阶段通过即准入
-→ 仅 P1 按冻结 L2 配额补采
+→ 第一阶段判断准入条件；P1 初采再受冻结 L2 配额约束
+→ 仅 P1 按冻结 L2 配额逐批补采，并依据 cluster 反馈调整份额
 → 第二阶段：难度及综合质量标签
 → screened canonical
 → legacy labeled v4 确定性映射
@@ -61,7 +61,7 @@ v2 的运行边界为：
 ### 2.4 确定性与可恢复性
 
 配额、排序、去重、哈希和导出均为确定性操作。LLM 结果使用 run-local 缓存和任务
-账本；采样、Stage1、P1 每轮补采、最终成员、Stage2、导出和报告均有原子检查点。
+账本；采样、Stage1、P1 逐批补采、最终成员、Stage2、导出和报告均有原子检查点。
 同一输入、配置、Prompt 和模型契约对应同一个 v2 run identity。
 
 ### 2.5 发布前独立复验
@@ -543,7 +543,8 @@ run-local SQLite 缓存键包含：
 ## 10. P1 补采
 
 P1 初始第一阶段结束后，按冻结 L2 配额计算当前缺口。每轮只从本次运行尚未处理的
-候选中抽取，并先与已经准入的 P1 样本去重，再调用第一阶段。
+候选中抽取，并先与已经准入的 P1 样本去重，再调用第一阶段。P0/P2 和 P1 初采规则
+不受补采算法影响。
 
 默认补采参数：
 
@@ -562,21 +563,45 @@ safety_factor = 1.1
 ceil(当前缺口 / 估计通过率 × safety_factor)
 ```
 
-通过率以默认值为先验，根据初始及已完成补采的实际结果做贝叶斯平滑，并限制在
-`[0.10, 0.95]`。新一轮仍按 L2、cluster、九宫格重新分配请求量，但最终 L2 目标
-配额不漂移。
+通过率以默认值为先验，根据初采和已完成补采的实际结果做贝叶斯平滑，并限制在
+`[0.10, 0.95]`。每轮开始时固定该轮各 L2 的计划请求量及估计通过率；只在下一轮
+重新估计。冻结 L2 目标配额和现有请求量公式不变。
 
-新候选通过第一阶段后，如果超过对应 L2 的剩余配额，则按确定性采样顺序截断。
-每一轮记录请求量、估计通过率、抽样量、去重后数量、第一阶段通过量和实际准入量。
+每轮拆成多个小批。某 L2 在一个小批内的请求量为
+`min(当前缺口, 本轮未使用请求量)`；仍需补采的 L2 合并提交 Stage1。每批返回后立即将通过样本计入对应
+L2 配额，并更新 cluster 反馈。因为单批请求量不超过当前缺口，该批通过者都能入集；
+初采时按冻结配额限制成员的规则仍保留。
+
+小批的 cluster 份额同时考虑尚未抽取的源候选数和已观测的 Stage1 通过情况。对某
+cluster `c`，令 `R_c` 为未抽过的源候选数、`E_c` 为已完成 Stage1 的候选数、`S_c`
+为其中通过数，`p_L2` 为本轮固定的 L2 估计通过率：
+
+```text
+p_c = (S_c + pass_rate_prior_strength × p_L2) / (E_c + pass_rate_prior_strength)
+w_c = sqrt(R_c) × p_c
+```
+
+把小批名额逐个给 `w_c / (本轮已分配给该 cluster 的名额 + 1)` 最大且仍有源候选的
+cluster；同分按 cluster ID 排序。初采与此前补采的 Stage1 结果都参与 `E_c/S_c`；
+仅被抽出但在送检前去重淘汰的样本不参与反馈。原有概率×频次网格、MMR 和集合内
+去重仍在 cluster 内执行。若本轮计划请求量足以探索所有可用 cluster，保留每个
+cluster 至少探索一次的规则，但在整轮内只计一次；若配额提前填满，则立即停采。
+`cold_boundary_floor` 也按整轮累计。
+
+某 L2 配额已满或没有未抽过的源候选时，停止该 L2；用完本轮计划请求量但仍有缺口，
+则留到下一轮重新估计。低通过率本身不触发停止。每轮记录计划请求量、估计通过率、
+实际抽样量、去重后数量、Stage1 通过量、入集量和逐批明细。
 
 补采在以下任一条件下停止：
 
 - `quota_filled`：全部可分配 L2 配额已满足；
-- `candidate_exhausted`：没有新的可用候选；
+- `candidate_exhausted`：有缺口的 L2 已没有未抽过的源候选；
 - `max_rounds`：完成三轮后仍有缺口。
 
 P1 最终不足 10,000 时，记录实际数量、总缺口、未分配目标和逐 L2 缺口。业务缺口
 允许发布，但不得通过跨 L2 挪用、复制样本或伪造记录补齐。
+`candidate_remaining_by_l2` 仅表示尚未抽取的源候选数，不表示其中仍有多少样本能
+通过 Stage1。
 
 ## 11. Screened canonical
 
@@ -711,8 +736,10 @@ p012_build_config_version = 1
 quality_contract_version = 2
 checkpoint_schema_version = 1
 screened_schema_version = 2
-run_report_schema_version = 2
+run_report_schema_version = 3
 ```
+
+报告 schema v3 只表示报告结构更新；链路仍为 Screening v2。
 
 run contract 包含：
 
@@ -734,6 +761,9 @@ run contract 包含：
 <output-root>/runs/<UTC timestamp>__<config-id 前 12 位>/
 ```
 
+P012 构建契约另记录补采算法标识 `adaptive_cluster_batches_1`，用于验证构建检查点
+和续跑状态与当前算法一致。
+
 选择规则：
 
 - 默认优先恢复同 contract 的 `created`、`running`、`incomplete` 或
@@ -753,11 +783,13 @@ manifest 记录各真实运行阶段、三个分支状态、错误类型、P1 �
 1. `initial_p0/p1/p2`：各分支完整 canonical 候选和确定性顺序；
 2. `stage1_initial`：初始候选的 Stage1 结果；
 3. `p1_quotas`：冻结的 L2 目标配额；
-4. `p1_round_N_plan/result`：每轮补采计划、Stage1 结果、采用成员和轮次汇总；
-5. `final_membership`：三个集合最终成员、来源波次、完整 Stage1 结果；
-6. `stage2`：最终成员的 Stage2 结果；
-7. `screened_export`、`legacy_export`、`batch_report`：产物路径、大小和 SHA-256；
-8. `build_outcome`：完整构建结果的最终检查点。
+4. `p1_round_N_request`：第 N 轮各 L2 请求量、估计通过率和可用 cluster 数；
+5. `p1_round_N_batch_B_plan/result`：第 N 轮第 B 批的候选计划、Stage1 结果和入集成员；
+6. `p1_round_N_summary`：第 N 轮逐批汇总与停止原因；
+7. `final_membership`：三个集合最终成员、来源波次、完整 Stage1 结果；
+8. `stage2`：最终成员的 Stage2 结果；
+9. `screened_export`、`legacy_export`、`batch_report`：产物路径、大小和 SHA-256；
+10. `build_outcome`：完整构建结果的最终检查点。
 
 每个检查点都包含 schema 版本、run contract 哈希、记录数、payload 哈希和 payload。
 临时文件不会被当作有效检查点。恢复规则为：
@@ -766,16 +798,21 @@ manifest 记录各真实运行阶段、三个分支状态、错误类型、P1 �
 - manifest 已完成但对应检查点缺失：停止，不能静默重算或复用错误数据；
 - 检查点契约、内容哈希或产物哈希不一致：停止；
 - 某分支没有完成：只重算该分支；
-- P1 轮次已有 plan：重启后复用该计划，只继续未完成的 Stage1 任务；
+- P1 轮次或小批已有计划：重启后复用计划和已完成的小批结果；未完成的 Stage1 任务
+  由 run-local 缓存与任务账本继续处理；
 - 已有 `final_membership`：跳过全部采样、Stage1 和补采；
 - 已有 `stage2`：跳过质量调用，直接恢复导出或报告。
 
-恢复粒度止于完整分支和完整 P1 轮次，不在单个 L2 的采样循环内部建立检查点。
+P1 补采可恢复到小批；不在单个 L2 的小批内部建立检查点。报告 schema 从 2 升至 3，
+且 P012 构建契约加入补采算法标识，因此旧算法的 run 不会作为当前算法的同契约 run
+自动复用。
 
 ### 13.2 旧 run 兼容边界
 
 manifest schema 1 的历史 v2 run 不进入新状态机，自动搜索时忽略；显式指定旧 run ID
 时返回不兼容提示。历史成品保留不变，canonical 索引仍可被新 run 复用。
+使用旧补采算法但 manifest schema 同为 2 的 run，也因报告 schema 和构建契约不同而
+不会被当前实现续跑或复用。
 
 对于升级部署时尚未完成、只被跨阶段分歧阻塞的历史 run，兼容性热修仅替换
 `quality/two_stage.py`，保持原 Prompt、manifest 和 run identity，即可复用原 LLM
@@ -823,14 +860,14 @@ manifest schema 1 的历史 v2 run 不进入新状态机，自动搜索时忽略
 每个分支目录包含：
 
 - `candidate_tasks.jsonl`：初始或补采候选任务；
-- `branch_audit.json`：采样、去重、通过、截断、准入和缺口统计；
+- `branch_audit.json`：采样、去重、通过、准入和缺口统计；P1 初采另记录配额截断；
 - `screened.canonical.jsonl`：内部权威成品；
 - 对应的 `*_labeled.jsonl`：28 字段兼容视图；
 - `export_provenance.jsonl`：逐条哈希和任务来源；
 - `legacy_export_report.json`：分支导出校验报告。
 
-P1 额外包含 `supplement_summary.json`，记录冻结配额、每轮请求和结果、最终数量、
-总缺口、未分配目标及逐 L2 缺口。
+P1 额外包含 `supplement_summary.json`，记录冻结配额、逐轮逐批的 L2/cluster 抽样与
+送检结果、最终数量、未分配目标、逐 L2 缺口、源候选剩余量和停止原因。
 
 ### 14.1 批跑报告
 
@@ -856,6 +893,12 @@ Stage1 准入率
 P1 另外报告冻结配额 L2 覆盖率、配额完成率、最终分布与目标配额分布偏差及逐 L2
 缺口。P0/P2 的目标范围仅为实际进入 Stage1 的 L2，因为它们分别受结构采样和困难
 候选门槛约束，不以覆盖全部 taxonomy L2 为目标。
+
+报告 schema v3 增加 `p1_diagnostics`：逐轮计划请求、实际抽样、Stage1 评估、基础可用、
+类别 exact、通过、入集与停止原因，以及缺口最大的 L2、文本不可用和类别不符损耗
+最多的 cluster。`P1/supplement_summary.json` 保留完整逐批 L2/cluster 明细。P0 逐
+场景损耗和 P2 按挑战类型的候选到最终难度漏斗尚未作为独立报表实现；现有报告仅提供
+对应集合的类别树统计和最终难度分布。
 
 语义标签一致率来自 Stage1 LLM，是自动一致性估计，不作为人工金标准确率。最终集
 的 `category_fit=exact` 是准入约束，只用于契约校验，不作为独立汇报准确率。
@@ -1078,15 +1121,15 @@ artifacts/prompts/quality_stage2.md
 - 索引：合法、隔离、noise、重复、identity 冲突、taxonomy 冲突、中断恢复、缓存
   失效、定点读取、行哈希和源文件变化；
 - P0：L2/cluster 选择、high 回退、MMR、每 cluster 上限和去重；
-- P1：10,000 配额守恒、九宫格、冷门边界保底、冻结 L2 配额、三轮补采、过采截断、
-  候选耗尽和确定性；
+- P1：10,000 配额守恒、九宫格、冷门边界保底、冻结 L2 配额、初采配额截断、
+  三轮逐批补采、cluster 反馈份额、补采通过即入集、候选耗尽和确定性；
 - P2：概率/频率/复杂度门槛、60/40 双轨、3,000 目标和不足记录；
 - LLM：严格字段白名单、枚举、阶段内部矛盾、跨阶段分歧记录、重试耗尽和跨集合缓存复用；
-- 恢复：三个采样分支、Stage1、每轮 P1 补采、最终成员、Stage2、导出和报告的阶段级检查点；
+- 恢复：三个采样分支、Stage1、P1 每轮及每批、最终成员、Stage2、导出和报告的检查点；
 - 成品：第一阶段准入、第二阶段不改成员、P0/P2 无补采、P1 波次逐条追溯；
 - Legacy：28 字段名称/顺序/类型/值、单多轮、四位小数、三个 set 值和无损枚举；
-- 报告：L1/L2 分布、P1 配额完成率、基础可用率、标签一致率、波次守恒、脱敏及
-  JSON/Markdown 一致性；
+- 报告：L1/L2 分布、P1 配额完成率和逐批诊断、基础可用率、标签一致率、波次守恒、
+  脱敏及 JSON/Markdown 一致性；
 - 发布：缺失标签、文件篡改、provenance 哈希、不兼容 run、幂等发布、冲突拒绝、
   `--replace` 整组替换和失败回滚；
 - 回归：`screening` 全量测试通过。
