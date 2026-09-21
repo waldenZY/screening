@@ -7,6 +7,7 @@ returns canonical locators to the orchestration layer.
 
 from __future__ import annotations
 
+import heapq
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
@@ -179,16 +180,34 @@ def allocate_sqrt_quotas(
         quotas[key] = 1
     remaining = target - len(covered)
     weights = {key: math.sqrt(max(sizes.get(key, 0), 0)) for key in usable}
-    while remaining:
-        candidates = [key for key in usable if quotas[key] < usable[key]]
-        if not candidates:
-            break
-        best = max(
-            candidates,
-            key=lambda key: (weights[key] / (quotas[key] + 1), -order.index(key)),
+    order_rank = {key: index for index, key in enumerate(order)}
+    # The previous implementation rescanned every category for every assigned
+    # item and called ``order.index`` inside that scan.  A heap preserves the
+    # exact same priority rule while reducing allocation from roughly
+    # O(target * categories^2) to O((target + categories) * log(categories)).
+    heap = [
+        (
+            -(weights[key] / (quotas[key] + 1)),
+            order_rank[key],
+            key,
         )
+        for key in usable
+        if quotas[key] < usable[key]
+    ]
+    heapq.heapify(heap)
+    while remaining and heap:
+        _, _, best = heapq.heappop(heap)
         quotas[best] += 1
         remaining -= 1
+        if quotas[best] < usable[best]:
+            heapq.heappush(
+                heap,
+                (
+                    -(weights[best] / (quotas[best] + 1)),
+                    order_rank[best],
+                    best,
+                ),
+            )
     return {key: value for key, value in quotas.items() if value}
 
 

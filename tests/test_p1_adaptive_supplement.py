@@ -147,7 +147,7 @@ class AdaptiveP1Tests(unittest.TestCase):
             self.assertGreaterEqual(len(supplement["rounds"][0]["batches"]), 2)
             self.assertEqual(first.summary["sets"]["P1"]["supplement_pass_not_admitted"], 0)
             report = load_and_validate_run_report(run_root)
-            self.assertEqual(report["report_schema_version"], 4)
+            self.assertEqual(report["report_schema_version"], 5)
             self.assertEqual(report["p1_diagnostics"]["rounds"][0]["admitted"], 2)
             calls_before_replay = runner.stage1_calls
             replay = run_build(

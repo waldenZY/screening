@@ -485,8 +485,8 @@ def _run_adaptive_p2(
         sampler = AdaptiveP2Sampler(readonly_index, p2_config)
         source_capacity = sampler.capacities()
         initial_capacity_pending = True
+        selected, selection_diag = select_final_p2(evaluated, challenge_results, p2_config)
         for wave in range(0, supplement.max_rounds + 1):
-            selected, selection_diag = select_final_p2(evaluated, challenge_results, p2_config)
             if selection_diag["target_gap"] == 0 and not any(
                 selection_diag["soft_min_deficit_by_primary"].values()
             ):
@@ -517,7 +517,6 @@ def _run_adaptive_p2(
             batch_summaries: list[JsonObject] = []
             wave_exhausted = False
             while used < budget:
-                selected, selection_diag = select_final_p2(evaluated, challenge_results, p2_config)
                 if selection_diag["target_gap"] == 0 and not any(
                     selection_diag["soft_min_deficit_by_primary"].values()
                 ):
@@ -551,6 +550,7 @@ def _run_adaptive_p2(
                 result_name = f"p2_wave_{wave}_batch_{batch_id}_result"
                 plan = checkpoints.load(plan_name)
                 if plan is None:
+                    planning_started = time.monotonic()
                     draw = sampler.draw(requested, processed)
                     raw = _materialize(index, source_path, taxonomy, draw.locators, materialized)
                     new_candidates = _deduplicate(
@@ -569,6 +569,9 @@ def _run_adaptive_p2(
                             identity: value for identity, value in draw.metadata.items()
                             if identity in new_ids
                         },
+                        "planning_duration_ms": round(
+                            (time.monotonic() - planning_started) * 1000
+                        ),
                     }
                     checkpoints.save(plan_name, plan)
                 elif plan["requested_by_source"] != requested:
@@ -594,14 +597,22 @@ def _run_adaptive_p2(
                 )
                 result = checkpoints.load(result_name)
                 if result is None:
+                    stage1_started = time.monotonic()
                     batch_stage1 = quality_runner.run_stage1(new_candidates) if new_candidates else {}
+                    stage1_duration_ms = round((time.monotonic() - stage1_started) * 1000)
                     stage1_passed = _passing(new_candidates, batch_stage1) if new_candidates else []
+                    challenge_started = time.monotonic()
                     batch_challenge = (
                         quality_runner.run_challenge(stage1_passed) if stage1_passed else {}
+                    )
+                    challenge_duration_ms = round(
+                        (time.monotonic() - challenge_started) * 1000
                     )
                     result = {
                         "stage1_results": batch_stage1,
                         "challenge_results": batch_challenge,
+                        "stage1_duration_ms": stage1_duration_ms,
+                        "challenge_duration_ms": challenge_duration_ms,
                     }
                     checkpoints.save(result_name, result)
                 batch_stage1 = {str(key): dict(value) for key, value in result["stage1_results"].items()}
@@ -644,6 +655,13 @@ def _run_adaptive_p2(
                         primary_by_source[new_metadata[identity]["sampled_from"]][
                             result_value["primary_challenge"]
                         ] += 1
+                selection_started = time.monotonic()
+                selected, selection_diag = select_final_p2(
+                    evaluated, challenge_results, p2_config
+                )
+                selection_duration_ms = round(
+                    (time.monotonic() - selection_started) * 1000
+                )
                 batch_summaries.append({
                     "batch": batch_id,
                     "requested": sum(requested.values()),
@@ -656,6 +674,12 @@ def _run_adaptive_p2(
                     "stage1_pass_by_source": dict(stage1_by_source),
                     "judge_pass": challenge_passed,
                     "judge_pass_by_source": dict(challenge_by_source),
+                    "phase_duration_ms": {
+                        "planning": int(plan.get("planning_duration_ms", 0)),
+                        "stage1": int(result.get("stage1_duration_ms", 0)),
+                        "challenge": int(result.get("challenge_duration_ms", 0)),
+                        "selection": selection_duration_ms,
+                    },
                     "total_yield": 0.0 if not sampled_ids else challenge_passed / len(sampled_ids),
                     "source_yield": {
                         source: (
@@ -682,7 +706,7 @@ def _run_adaptive_p2(
                     len(new_candidates),
                     len(stage1_passed),
                     challenge_passed,
-                    len(select_final_p2(evaluated, challenge_results, p2_config)[0]),
+                    len(selected),
                 )
                 requested_total += sum(requested.values())
                 # Overlapping source pools can make a requested slot unavailable
@@ -692,7 +716,6 @@ def _run_adaptive_p2(
                 if not sampled_ids:
                     wave_exhausted = True
                     break
-            selected, selection_diag = select_final_p2(evaluated, challenge_results, p2_config)
             target_met = selection_diag["target_gap"] == 0 and not any(
                 selection_diag["soft_min_deficit_by_primary"].values()
             )
@@ -770,6 +793,14 @@ def _run_adaptive_p2(
         "+".join(challenge_results[identity]["challenge_types"])
         for identity in final_ids
     )
+    phase_duration_ms = {
+        phase: sum(
+            int(batch.get("phase_duration_ms", {}).get(phase, 0))
+            for round_value in rounds
+            for batch in round_value["batches"]
+        )
+        for phase in ("planning", "stage1", "challenge", "selection")
+    }
     diagnostic = {
         "algorithm": P2_ALGORITHM,
         "rounds": rounds,
@@ -782,6 +813,7 @@ def _run_adaptive_p2(
             for key in CHALLENGE_TYPES
         },
         "challenge_type_combinations": dict(sorted(combinations.items(), key=lambda item: (-item[1], item[0]))),
+        "phase_duration_ms": phase_duration_ms,
         "stop_reason": stop_reason,
         "evaluated": len(evaluated),
         "stage1_pass": sum(stage1_passes(value) for value in stage1_results.values()),

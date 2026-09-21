@@ -24,7 +24,7 @@ from ..shared.taxonomy import TaxonomyMappings
 from .screened import validate_screened_canonical_record
 
 
-RUN_REPORT_SCHEMA_VERSION = 4
+RUN_REPORT_SCHEMA_VERSION = 5
 RUN_REPORT_JSON = "screening_run_report.json"
 RUN_REPORT_MARKDOWN = "screening_run_report.md"
 SET_NAMES = ("P0", "P1", "P2")
@@ -247,6 +247,7 @@ def _p2_diagnostics(
         "stage2_issue_records": stage2_issue_records,
         "judge_pass_not_selected": int(selected.get("judge_pass_not_selected", 0)),
         "not_selected_reasons": dict(selected.get("not_selected_reasons", {})),
+        "phase_duration_ms": dict(value.get("phase_duration_ms", {})),
         "target": int(value.get("target", 0)),
         "soft_min_per_type": int(value.get("soft_min_per_type", 0)),
         "max_per_primary": int(value.get("max_per_primary", 0)),
@@ -674,6 +675,13 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         ):
             raise RunReportError("P2 轮次请求数量不守恒")
         for batch in round_batches:
+            phase_duration = batch.get("phase_duration_ms")
+            if (
+                not isinstance(phase_duration, Mapping)
+                or set(phase_duration) != {"planning", "stage1", "challenge", "selection"}
+                or any(type(value) is not int or value < 0 for value in phase_duration.values())
+            ):
+                raise RunReportError("P2 批次阶段耗时结构非法")
             for scalar, by_source in (
                 ("requested", "requested_by_source"),
                 ("sampled", "sampled_by_source"),
@@ -688,6 +696,17 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
                     or int(batch.get(scalar, -1)) != sum(int(value) for value in values.values())
                 ):
                     raise RunReportError(f"P2 批次 {scalar} 来源数量不守恒")
+    phase_duration_ms = p2_diagnostics.get("phase_duration_ms")
+    if (
+        not isinstance(phase_duration_ms, Mapping)
+        or set(phase_duration_ms) != {"planning", "stage1", "challenge", "selection"}
+        or any(type(value) is not int or value < 0 for value in phase_duration_ms.values())
+        or phase_duration_ms != {
+            phase: sum(int(batch["phase_duration_ms"][phase]) for batch in batches)
+            for phase in ("planning", "stage1", "challenge", "selection")
+        }
+    ):
+        raise RunReportError("P2 阶段耗时与批次不守恒")
     funnel_fields = {
         "candidate_capacity", "requested", "actual_sampled", "after_dedup",
         "stage1_pass", "judge_pass", "final",
@@ -1015,6 +1034,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             f"- 类型软下限={p2['soft_min_per_type']}；单一 primary 上限={p2['max_per_primary']}。",
             f"- Judge 通过但未入集：{p2['judge_pass_not_selected']}。",
             f"- 未入集原因：{json.dumps(p2['not_selected_reasons'], ensure_ascii=False, sort_keys=True)}。",
+            f"- P2 批处理阶段耗时（ms）：{json.dumps(p2['phase_duration_ms'], ensure_ascii=False, sort_keys=True)}。",
             f"- Stage2 标出问题的最终记录：{p2['stage2_issue_records']}。",
             f"- 最终 frequency band：{json.dumps(p2['final_frequency_band_distribution'], ensure_ascii=False, sort_keys=True)}。",
             "",

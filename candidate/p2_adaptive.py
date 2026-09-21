@@ -100,6 +100,8 @@ class AdaptiveP2Sampler:
         self.index.connection.execute(
             "CREATE TEMP TABLE IF NOT EXISTS p2_quotas (l2_key TEXT, cluster_json TEXT, quota INTEGER, PRIMARY KEY(l2_key, cluster_json)) WITHOUT ROWID"
         )
+        self.index.connection.execute("DELETE FROM p2_excluded")
+        self.index.connection.execute("DELETE FROM p2_quotas")
 
     def _sync_excluded(self, excluded: Iterable[str]) -> None:
         additions = sorted(set(excluded) - self._excluded)
@@ -109,6 +111,52 @@ class AdaptiveP2Sampler:
                 ((value,) for value in additions),
             )
             self._excluded.update(additions)
+            # Callers may restore exclusions from a checkpoint without the
+            # corresponding locators.  In that case the cached stratum counts
+            # cannot be adjusted safely and must be rebuilt once.
+            self._cached_counts = None
+            self._cached_excluded = None
+
+    def _exclude_selected(self, locators: Sequence[JsonObject]) -> None:
+        """Exclude one draw and decrement every overlapping source pool."""
+        additions = [
+            locator for locator in locators
+            if str(locator["source_identity_sha256"]) not in self._excluded
+        ]
+        if not additions:
+            return
+        self.index.connection.executemany(
+            "INSERT OR IGNORE INTO p2_excluded(source_identity_sha256) VALUES (?)",
+            ((str(locator["source_identity_sha256"]),) for locator in additions),
+        )
+        self._excluded.update(str(locator["source_identity_sha256"]) for locator in additions)
+        if self._cached_counts is None:
+            self._cached_excluded = None
+            return
+        for locator in additions:
+            l2_key = str(locator["l2_key"])
+            cluster_json = json.dumps(
+                locator["cluster_id"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for source in source_tags(locator, self.config):
+                l2_counts, cluster_counts = self._cached_counts[source]
+                l2_remaining = l2_counts.get(l2_key, 0) - 1
+                cluster_key = (l2_key, cluster_json)
+                cluster_remaining = cluster_counts.get(cluster_key, 0) - 1
+                if l2_remaining < 0 or cluster_remaining < 0:
+                    raise ValueError("P2 来源池缓存计数出现负数")
+                if l2_remaining:
+                    l2_counts[l2_key] = l2_remaining
+                else:
+                    l2_counts.pop(l2_key, None)
+                if cluster_remaining:
+                    cluster_counts[cluster_key] = cluster_remaining
+                else:
+                    cluster_counts.pop(cluster_key, None)
+        self._cached_excluded = frozenset(self._excluded)
 
     def _predicate(self, source: str) -> tuple[str, tuple[Any, ...]]:
         minimum = COMPLEXITY_RANK[self.config.minimum_complexity]
@@ -148,8 +196,12 @@ class AdaptiveP2Sampler:
 
     def capacities(self, excluded: Iterable[str] = ()) -> dict[str, int]:
         self._sync_excluded(excluded)
-        self._cached_counts = {source: self._counts(source) for source in P2_SOURCE_NAMES}
-        self._cached_excluded = frozenset(self._excluded)
+        if (
+            self._cached_counts is None
+            or self._cached_excluded != frozenset(self._excluded)
+        ):
+            self._cached_counts = {source: self._counts(source) for source in P2_SOURCE_NAMES}
+            self._cached_excluded = frozenset(self._excluded)
         return {source: sum(self._cached_counts[source][0].values()) for source in P2_SOURCE_NAMES}
 
     def _take(
@@ -240,12 +292,11 @@ class AdaptiveP2Sampler:
         selected: list[JsonObject] = []
         metadata: dict[str, JsonObject] = {}
         available: dict[str, int] = {}
-        selected_any = False
         for source in P2_SOURCE_NAMES:
             chosen, source_available = self._take(
                 source,
                 max(0, int(requested_by_source.get(source, 0))),
-                None if prepared is None or selected_any else prepared[source],
+                None if prepared is None else prepared[source],
             )
             available[source] = source_available
             for locator in chosen:
@@ -255,10 +306,7 @@ class AdaptiveP2Sampler:
                     "sampled_from": source,
                 }
             selected.extend(chosen)
-            self._sync_excluded(item["source_identity_sha256"] for item in chosen)
-            selected_any = selected_any or bool(chosen)
-        self._cached_counts = None
-        self._cached_excluded = None
+            self._exclude_selected(chosen)
         return P2Draw(
             locators=tuple(selected),
             metadata=metadata,

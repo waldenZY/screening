@@ -795,7 +795,7 @@ p012_build_config_version = 2
 quality_contract_version = 3
 checkpoint_schema_version = 1
 screened_schema_version = 3
-run_report_schema_version = 4
+run_report_schema_version = 5
 ```
 
 P2 Adaptive、Challenge Judge 及对应契约属于 Screening v3；其余内部 schema 版本按
@@ -966,12 +966,13 @@ P1 另外报告冻结配额 L2 覆盖率、配额完成率、最终分布与目�
 缺口。P0 的目标范围仅为实际进入 Stage1 的 L2；P2 另按来源池和 Challenge 类型
 统计覆盖，不以覆盖全部 taxonomy L2 为唯一目标。
 
-报告 schema v4 保留 `p1_diagnostics`：逐轮计划请求、实际抽样、Stage1 评估、基础可用、
+报告 schema v5 保留 `p1_diagnostics`：逐轮计划请求、实际抽样、Stage1 评估、基础可用、
 类别 exact、通过、入集与停止原因，以及缺口最大的 L2、文本不可用和类别不符损耗
 最多的 cluster。`P1/supplement_summary.json` 保留完整逐批 L2/cluster 明细。
 `p2_diagnostics` 新增四来源候选到 Stage1、Challenge 和最终入集的漏斗，逐批产出率，
 八类 primary 数量、占比和软下限缺口，多标签组合，Judge 调用量、失败率、重试和
-时延，Judge 通过但未入集原因，以及 Challenge 与 Stage2 的标签交叉诊断。
+时延，候选规划/Stage1/Challenge/最终重选的批级墙钟耗时，Judge 通过但未入集原因，
+以及 Challenge 与 Stage2 的标签交叉诊断。
 
 语义标签一致率来自 Stage1 LLM，是自动一致性估计，不作为人工金标准确率。最终集
 的 `category_fit=exact` 是准入约束，只用于契约校验，不作为独立汇报准确率。

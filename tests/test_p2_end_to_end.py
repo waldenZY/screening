@@ -155,6 +155,18 @@ class P2EndToEndTests(unittest.TestCase):
                 sum(row["actual_sampled"] for row in funnel.values()),
                 sum(batch["sampled"] for wave in outcome.summary["p2_adaptive"]["rounds"] for batch in wave["batches"]),
             )
+            phases = outcome.summary["p2_adaptive"]["phase_duration_ms"]
+            self.assertEqual(
+                phases,
+                {
+                    phase: sum(
+                        batch["phase_duration_ms"][phase]
+                        for wave in outcome.summary["p2_adaptive"]["rounds"]
+                        for batch in wave["batches"]
+                    )
+                    for phase in ("planning", "stage1", "challenge", "selection")
+                },
+            )
             artifacts = collect_and_validate_artifacts(run_root)
             self.assertIn("challenge_tasks.jsonl", artifacts["quality"])
             final_ids = {

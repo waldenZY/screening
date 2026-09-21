@@ -16,6 +16,7 @@ from screening.candidate.p2_adaptive import (
     source_tags,
 )
 from screening.candidate.sampling import P2SamplingConfig
+from screening.candidate.sampling import allocate_sqrt_quotas
 from screening.delivery.publish import PublicationError, publish_labeled
 from screening.quality.two_stage import (
     CHALLENGE_TYPES,
@@ -48,6 +49,14 @@ def candidate(number: int, challenge_type: str) -> dict:
 
 
 class P2AdaptiveTests(unittest.TestCase):
+    def test_sqrt_quota_allocation_preserves_priority_and_capacity(self):
+        quotas = allocate_sqrt_quotas(
+            {"large": 100, "medium": 25, "small": 4},
+            12,
+            capacities={"large": 5, "medium": 5, "small": 2},
+        )
+        self.assertEqual(quotas, {"large": 5, "medium": 5, "small": 2})
+
     def test_challenge_contract(self):
         self.assertEqual(
             validate_challenge_result({
@@ -188,6 +197,10 @@ class P2AdaptiveTests(unittest.TestCase):
                         ) for source in request},
                         request,
                     )
+                    cached_remaining = sampler.capacities(identities)
+                    rebuilt_sampler = AdaptiveP2Sampler(candidate_index, P2SamplingConfig())
+                    rebuilt_remaining = rebuilt_sampler.capacities(identities)
+                    self.assertEqual(cached_remaining, rebuilt_remaining)
                     draws.append(identities)
             self.assertEqual(draws[0], draws[1])
 
