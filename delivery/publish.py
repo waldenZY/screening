@@ -16,6 +16,7 @@ from ..candidate.index import (
     validate_canonical_database,
     validate_canonical_source,
 )
+from ..candidate.p2_adaptive import P2_ALGORITHM, P2_SOURCE_NAMES
 from ..shared.json_io import JsonObject, load_jsonl, sha256_file
 from .legacy import (
     LEGACY_FILENAMES,
@@ -34,17 +35,20 @@ from .screened import (
     validate_screened_canonical_records,
 )
 from ..quality.two_stage import (
+    CHALLENGE_FIELDS,
+    CHALLENGE_TYPES,
     STAGE1_FIELDS,
     STAGE2_FIELDS,
     stage1_passes,
     stage2_consistency_conflicts,
+    validate_challenge_result,
     validate_stage1_result,
     validate_stage2_result,
 )
 
 
 class PublicationError(ValueError):
-    """A v2 artifact or safe-publication contract violation."""
+    """A v3 artifact or safe-publication contract violation."""
 
 
 def _load_object(path: Path) -> JsonObject:
@@ -67,31 +71,65 @@ def _jsonl_metadata(path: Path, run_root: Path, records: list[JsonObject]) -> Js
 
 def _task_maps(
     run_root: Path,
-) -> tuple[dict[str, JsonObject], dict[str, JsonObject], dict[str, JsonObject], dict[str, JsonObject]]:
+) -> tuple[dict[str, JsonObject], dict[str, JsonObject], dict[str, JsonObject], dict[str, JsonObject], dict[str, JsonObject], dict[str, JsonObject]]:
     quality_root = run_root / "quality"
     stage1_task_rows = load_jsonl(quality_root / "stage1_tasks.jsonl")
     stage2_task_rows = load_jsonl(quality_root / "stage2_tasks.jsonl")
+    challenge_task_rows = load_jsonl(quality_root / "challenge_tasks.jsonl")
     stage1_result_rows = load_jsonl(quality_root / "stage1_results.jsonl")
     stage2_result_rows = load_jsonl(quality_root / "stage2_results.jsonl")
+    challenge_result_rows = load_jsonl(quality_root / "challenge_results.jsonl")
     stage1_tasks = {row.get("cache_key"): row for row in stage1_task_rows}
     stage2_tasks = {row.get("cache_key"): row for row in stage2_task_rows}
+    challenge_tasks = {row.get("cache_key"): row for row in challenge_task_rows}
     stage1_results = {row.get("cache_key"): row.get("result") for row in stage1_result_rows}
     stage2_results = {row.get("cache_key"): row.get("result") for row in stage2_result_rows}
+    challenge_results = {row.get("cache_key"): row.get("result") for row in challenge_result_rows}
     if None in stage1_tasks or len(stage1_tasks) != len(stage1_task_rows):
         raise PublicationError("第一阶段任务账本存在重复 ID")
     if None in stage2_tasks or len(stage2_tasks) != len(stage2_task_rows):
         raise PublicationError("第二阶段任务账本存在重复 ID")
+    if None in challenge_tasks or len(challenge_tasks) != len(challenge_task_rows):
+        raise PublicationError("Challenge 任务账本存在重复 ID")
     if None in stage1_results or len(stage1_results) != len(stage1_result_rows):
         raise PublicationError("第一阶段结果账本存在非法或重复 ID")
     if None in stage2_results or len(stage2_results) != len(stage2_result_rows):
         raise PublicationError("第二阶段结果账本存在非法或重复 ID")
+    if None in challenge_results or len(challenge_results) != len(challenge_result_rows):
+        raise PublicationError("Challenge 结果账本存在非法或重复 ID")
     if any(row.get("stage") != "stage1" for row in [*stage1_task_rows, *stage1_result_rows]):
         raise PublicationError("第一阶段账本 stage 标记非法")
     if any(row.get("stage") != "stage2" for row in [*stage2_task_rows, *stage2_result_rows]):
         raise PublicationError("第二阶段账本 stage 标记非法")
+    if any(row.get("stage") != "challenge" for row in [*challenge_task_rows, *challenge_result_rows]):
+        raise PublicationError("Challenge 账本 stage 标记非法")
+    for stage, task_map in (
+        ("stage1", stage1_tasks),
+        ("challenge", challenge_tasks),
+        ("stage2", stage2_tasks),
+    ):
+        cache_hit_rows = load_jsonl(quality_root / f"{stage}_cache_hits.jsonl")
+        cache_hit_ids = {row.get("event_id") for row in cache_hit_rows}
+        if None in cache_hit_ids or len(cache_hit_ids) != len(cache_hit_rows):
+            raise PublicationError(f"{stage} 缓存命中账本存在非法或重复 ID")
+        for row in cache_hit_rows:
+            task = task_map.get(row.get("cache_key"))
+            identities = row.get("source_identities")
+            if (
+                set(row) != {"event_id", "cache_key", "stage", "source_identities"}
+                or row.get("stage") != stage
+                or task is None
+                or not isinstance(identities, list)
+                or not identities
+                or identities != sorted(set(identities))
+                or not set(identities).issubset(set(task.get("source_identities", [])))
+            ):
+                raise PublicationError(f"{stage} 缓存命中账本内容非法")
     for result in stage1_results.values():
         validate_stage1_result(result)
-    return stage1_tasks, stage2_tasks, stage1_results, stage2_results
+    for result in challenge_results.values():
+        validate_challenge_result(result)
+    return stage1_tasks, challenge_tasks, stage2_tasks, stage1_results, challenge_results, stage2_results
 
 
 def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
@@ -101,7 +139,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
     aggregate_export = _load_object(run_root / "legacy_export_report.json")
     if aggregate_export.get("legacy_mapping_version") != LEGACY_MAPPING_VERSION:
         raise PublicationError("legacy mapping version 不一致")
-    stage1_tasks, stage2_tasks, stage1_results, stage2_results = _task_maps(run_root)
+    stage1_tasks, challenge_tasks, stage2_tasks, stage1_results, challenge_results, stage2_results = _task_maps(run_root)
     stage1_by_identity: dict[str, JsonObject] = {}
     for task_id, task in stage1_tasks.items():
         result = stage1_results.get(task_id)
@@ -113,6 +151,22 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             if previous is not None and previous != validated:
                 raise PublicationError("同一源 identity 对应多个第一阶段结果")
             stage1_by_identity[str(identity)] = validated
+    if set(challenge_results) != set(challenge_tasks):
+        raise PublicationError("Challenge 任务与结果账本不一致")
+    challenge_by_identity: dict[str, JsonObject] = {}
+    for task_id, task in challenge_tasks.items():
+        validated = validate_challenge_result(challenge_results[task_id])
+        identities = [str(value) for value in task.get("source_identities", [])]
+        if not identities or any(
+            identity not in stage1_by_identity or not stage1_passes(stage1_by_identity[identity])
+            for identity in identities
+        ):
+            raise PublicationError("Challenge 任务包含未通过 Stage1 的样本")
+        for identity in identities:
+            previous = challenge_by_identity.get(identity)
+            if previous is not None and previous != validated:
+                raise PublicationError("同一源 identity 对应多个 Challenge 结果")
+            challenge_by_identity[identity] = validated
     consistency_rows = load_jsonl(run_root / "quality" / "stage2_consistency.jsonl")
     consistency_by_key = {row.get("cache_key"): row for row in consistency_rows}
     if None in consistency_by_key or len(consistency_by_key) != len(consistency_rows):
@@ -212,10 +266,20 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             )
             if stage1_value != expected_stage1 or stage2_value != expected_stage2:
                 raise PublicationError(f"{set_name} 第 {index} 条质量标签与结果账本不一致")
+            if set_name == "P2":
+                challenge = canonical_row["challenge"]
+                challenge_task_id = challenge["challenge_task_id"]
+                task = challenge_tasks.get(challenge_task_id)
+                result = challenge_results.get(challenge_task_id)
+                if task is None or result is None or identity not in task.get("source_identities", []):
+                    raise PublicationError(f"P2 第 {index} 条无法关联 Challenge 合法终态")
+                expected_challenge = {key: challenge[key] for key in CHALLENGE_FIELDS}
+                if validate_challenge_result(result) != expected_challenge:
+                    raise PublicationError(f"P2 第 {index} 条 Challenge 标签与结果账本不一致")
             l2_counts[candidate["taxonomy"]["l2_key"]] += 1
         final_l2_counts_by_set[set_name] = l2_counts
 
-        if set_name != "P1" and any(
+        if set_name == "P0" and any(
             row["selection"]["origin"] != "initial_wave" for row in canonical
         ):
             raise PublicationError(f"{set_name} 不得存在补采记录")
@@ -241,6 +305,75 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
                 or int(supplement.get("total_deficit", -1)) != target - len(canonical)
             ):
                 raise PublicationError("P1 目标、冻结配额与总缺口不守恒")
+        if set_name == "P2":
+            adaptive = summary.get("p2_adaptive")
+            if not isinstance(adaptive, dict):
+                raise PublicationError("P2 自适应汇总缺失")
+            target = adaptive.get("target")
+            candidate_source: dict[str, str] = {}
+            for row in candidate_rows:
+                identity = str(row.get("source_identity_sha256", ""))
+                sampled_from = row.get("sampled_from")
+                source_tags = row.get("source_tags")
+                if (
+                    sampled_from not in P2_SOURCE_NAMES
+                    or not isinstance(source_tags, list)
+                    or not source_tags
+                    or any(tag not in P2_SOURCE_NAMES for tag in source_tags)
+                    or sampled_from not in source_tags
+                ):
+                    raise PublicationError("P2 candidate 来源归因非法")
+                candidate_source[identity] = str(sampled_from)
+            stage1_pass_ids = {
+                identity for identity in candidate_source
+                if stage1_passes(stage1_by_identity[identity])
+            }
+            if set(challenge_by_identity) != stage1_pass_ids:
+                raise PublicationError("P2 Stage1 通过样本与 Challenge 账本不一致")
+            judge_pass_ids = {
+                identity for identity in stage1_pass_ids
+                if challenge_by_identity[identity]["is_challenge"] is True
+            }
+            final_ids = {
+                str(row["candidate"]["source_identity_sha256"])
+                for row in canonical
+            }
+            primary = Counter(
+                str(row["challenge"]["primary_challenge"]) for row in canonical
+            )
+            source_funnel = adaptive.get("source_funnel")
+            if not isinstance(source_funnel, Mapping) or set(source_funnel) != set(P2_SOURCE_NAMES):
+                raise PublicationError("P2 来源漏斗缺失")
+            for source in P2_SOURCE_NAMES:
+                if not isinstance(source_funnel[source], Mapping):
+                    raise PublicationError(f"P2 来源池 {source} 漏斗结构非法")
+                source_ids = {
+                    identity for identity, value in candidate_source.items() if value == source
+                }
+                expected = {
+                    "after_dedup": len(source_ids),
+                    "stage1_pass": len(source_ids & stage1_pass_ids),
+                    "judge_pass": len(source_ids & judge_pass_ids),
+                    "final": len(source_ids & final_ids),
+                }
+                if any(source_funnel[source].get(key) != value for key, value in expected.items()):
+                    raise PublicationError(f"P2 来源池 {source} 漏斗与任务账本不一致")
+            if (
+                type(target) is not int
+                or adaptive.get("algorithm") != P2_ALGORITHM
+                or adaptive.get("soft_min_per_type")
+                != int(summary["config"]["sampling"]["p2"]["soft_min_per_type"])
+                or adaptive.get("max_per_primary")
+                != int(summary["config"]["sampling"]["p2"]["max_per_primary"])
+                or adaptive.get("final") != len(canonical)
+                or adaptive.get("target_gap") != max(0, target - len(canonical))
+                or adaptive.get("final_by_primary") != {
+                    key: primary[key] for key in CHALLENGE_TYPES
+                }
+                or any(count > int(summary["config"]["sampling"]["p2"]["max_per_primary"])
+                       for count in primary.values())
+            ):
+                raise PublicationError("P2 目标、类型上限或总缺口不守恒")
 
         report = _load_object(branch_report_path)
         if (
@@ -271,6 +404,11 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             files[set_name]["supplement_summary"] = {
                 "path": "P1/supplement_summary.json",
                 "sha256": sha256_file(branch_root / "supplement_summary.json"),
+            }
+        if set_name == "P2":
+            files[set_name]["adaptive_summary"] = {
+                "path": "P2/adaptive_summary.json",
+                "sha256": sha256_file(branch_root / "adaptive_summary.json"),
             }
 
     root_files = {
@@ -368,7 +506,9 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
     quality_files: JsonObject = {}
     for filename in (
         "quality_run_contract.json", "stage1_tasks.jsonl", "stage1_attempts.jsonl",
-        "stage1_results.jsonl", "stage2_tasks.jsonl", "stage2_attempts.jsonl",
+        "stage1_cache_hits.jsonl", "stage1_results.jsonl", "challenge_tasks.jsonl",
+        "challenge_attempts.jsonl", "challenge_cache_hits.jsonl", "challenge_results.jsonl",
+        "stage2_tasks.jsonl", "stage2_attempts.jsonl", "stage2_cache_hits.jsonl",
         "stage2_results.jsonl", "stage2_consistency.jsonl",
     ):
         path = run_root / "quality" / filename
@@ -417,7 +557,7 @@ def validate_manifest_inputs(run_root: Path, manifest: Mapping[str, Any]) -> Non
     prompts = contract.get("prompts")
     if not isinstance(prompts, Mapping):
         raise PublicationError("manifest 缺少 Prompt 哈希")
-    for stage in ("stage1", "stage2"):
+    for stage in ("stage1", "challenge", "stage2"):
         path = run_root / "prompts" / f"{stage}.md"
         if not path.is_file() or sha256_file(path) != prompts.get(f"{stage}_sha256"):
             raise PublicationError(f"冻结的 {stage} Prompt 缺失或已变化")
@@ -481,14 +621,15 @@ def publish_labeled(
     *,
     replace: bool = False,
 ) -> JsonObject:
-    """Publish only the three labeled files after full v2 validation."""
+    """Publish only the three labeled files after full v3 validation."""
     run_root = run_root.expanduser().resolve()
     publish_root = publish_root.expanduser().resolve()
-    if manifest.get("pipeline_version") != 2:
-        raise PublicationError("仅允许发布 screening v2 run")
+    if manifest.get("pipeline_version") != 3:
+        raise PublicationError("仅允许发布 screening v3 run")
     required_stages = (
         "canonical_index", "p012_build", "quality_stage1", "p1_supplement",
-        "quality_stage2", "screened_export", "batch_report",
+        "p2_supplement", "quality_p2_challenge", "quality_stage2",
+        "screened_export", "legacy_export", "batch_report",
     )
     incomplete = [
         name

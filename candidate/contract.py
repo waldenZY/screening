@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import bisect
 import json
 import math
 import re
@@ -718,15 +717,3 @@ def validate_canonical_candidate(record: Mapping[str, Any]) -> None:
         for key in ("p0", "p2")
     ):
         raise CanonicalContractError("canonical_invalid_feature", "features.relevance 数值非法")
-
-def frequency_stats_from_values(values: list[int], frequency: int) -> JsonObject:
-    """Small-data helper used by tests and fixture construction."""
-    if not values:
-        raise CanonicalContractError("invalid_cluster_frequency_stats", "频率列表不能为空")
-    ordered = sorted(values)
-    return {
-        "total_count": len(ordered),
-        "less_count": bisect.bisect_left(ordered, frequency),
-        "min_frequency": ordered[0],
-        "max_frequency": ordered[-1],
-    }

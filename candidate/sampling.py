@@ -8,7 +8,6 @@ returns canonical locators to the orchestration layer.
 from __future__ import annotations
 
 import math
-import heapq
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -80,20 +79,55 @@ class P1SamplingConfig:
 
 @dataclass(frozen=True)
 class P2SamplingConfig:
-    target_n: int = 3000
-    multi_turn_ratio: float = 0.4
-    probability_cap: float = 0.7
-    frequency_quantile: float = 0.5
+    target_n: int = 2000
+    candidate_source_shares: Mapping[str, float] = field(default_factory=lambda: {
+        "complex": 0.30,
+        "multi_turn": 0.30,
+        "boundary": 0.20,
+        "exploration": 0.20,
+    })
     minimum_complexity: str = "moderate"
+    boundary_probability_cap: float = 0.5
+    soft_min_per_type: int = 100
+    max_per_primary: int = 700
+    batch_size: int = 2000
     dedup_threshold: float = 0.75
 
     def __post_init__(self) -> None:
         if isinstance(self.target_n, bool) or not isinstance(self.target_n, int) or self.target_n < 1:
             raise ValueError("P2 target_n 必须是正整数")
-        for name in ("multi_turn_ratio", "probability_cap", "frequency_quantile", "dedup_threshold"):
+        expected_sources = {"complex", "multi_turn", "boundary", "exploration"}
+        if set(self.candidate_source_shares) != expected_sources:
+            raise ValueError("P2 candidate_source_shares 字段不完整")
+        shares = list(self.candidate_source_shares.values())
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 for value in shares):
+            raise ValueError("P2 candidate_source_shares 必须是非负数")
+        if not math.isclose(sum(shares), 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("P2 candidate_source_shares 之和必须为 1")
+        if (
+            isinstance(self.boundary_probability_cap, bool)
+            or not isinstance(self.boundary_probability_cap, (int, float))
+            or not 0 < self.boundary_probability_cap <= 1
+        ):
+            raise ValueError("P2 boundary_probability_cap 必须位于 (0, 1]")
+        for name in ("max_per_primary", "batch_size"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
-                raise ValueError(f"P2 {name} 必须位于 [0, 1]")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"P2 {name} 必须是正整数")
+        if isinstance(self.soft_min_per_type, bool) or not isinstance(self.soft_min_per_type, int) or self.soft_min_per_type < 0:
+            raise ValueError("P2 soft_min_per_type 必须是非负整数")
+        if self.soft_min_per_type * 8 > self.target_n:
+            raise ValueError("P2 八类软下限之和不能超过 target_n")
+        if self.max_per_primary < self.soft_min_per_type:
+            raise ValueError("P2 max_per_primary 不能小于软下限")
+        if self.max_per_primary * 8 < self.target_n:
+            raise ValueError("P2 八类 primary 上限之和不能小于 target_n")
+        if (
+            isinstance(self.dedup_threshold, bool)
+            or not isinstance(self.dedup_threshold, (int, float))
+            or not 0 <= self.dedup_threshold <= 1
+        ):
+            raise ValueError("P2 dedup_threshold 必须位于 [0, 1]")
         if self.minimum_complexity not in COMPLEXITY_RANK:
             raise ValueError("P2 minimum_complexity 枚举非法")
 
@@ -505,88 +539,6 @@ class CandidateSampler:
                 result.extend(chosen)
                 self._canonical_cache.clear()
         return result
-
-    def sample_p2(self, target_n: int | None = None) -> list[JsonObject]:
-        config = self.config.p2
-        target = config.target_n if target_n is None else target_n
-        minimum_rank = COMPLEXITY_RANK[config.minimum_complexity]
-        def eligible(item: Mapping[str, Any]) -> bool:
-            frequency_stats = item["cluster_frequency_stats"]
-            quantile_index = round(
-                (int(frequency_stats["total_count"]) - 1) * config.frequency_quantile
-            )
-            return (
-                float(item["cluster_probability"]) < config.probability_cap
-                and int(frequency_stats["less_count"]) <= quantile_index
-                and COMPLEXITY_RANK[item["features"]["complexity"]] >= minimum_rank
-            )
-
-        counts: dict[str, Counter[str]] = {
-            "single_turn": Counter(),
-            "multi_turn": Counter(),
-        }
-        for l2_key in self.taxonomy.l2_population:
-            for item in self.index.iter_by("l2", l2_key):
-                if eligible(item):
-                    counts[item["sample_type"]][l2_key] += 1
-        track_targets = {
-            "multi_turn": round(target * config.multi_turn_ratio),
-        }
-        track_targets["single_turn"] = target - track_targets["multi_turn"]
-        result: list[JsonObject] = []
-        for track in ("single_turn", "multi_turn"):
-            quotas = allocate_sqrt_quotas(
-                counts[track],
-                track_targets[track],
-            )
-            seen_text: set[str] = set()
-            for l2_key, quota in quotas.items():
-                heap: list[tuple[float, int, str, str, JsonObject]] = []
-                selected_by_text: dict[str, tuple[float, int, str, str, JsonObject]] = {}
-
-                def discard_stale() -> None:
-                    while heap and selected_by_text.get(heap[0][3]) != heap[0]:
-                        heapq.heappop(heap)
-
-                for item in self.index.iter_by("l2", l2_key):
-                    if item["sample_type"] != track or not eligible(item):
-                        continue
-                    text = self._text_uncached(item)
-                    if text in seen_text:
-                        continue
-                    entry = (
-                        self._score(item, "p2"),
-                        -int(item["source_line"]),
-                        str(item["source_identity_sha256"]),
-                        text,
-                        item,
-                    )
-                    current = selected_by_text.get(text)
-                    if current is not None:
-                        if entry[:3] > current[:3]:
-                            selected_by_text[text] = entry
-                            heapq.heappush(heap, entry)
-                        continue
-                    if len(selected_by_text) < quota:
-                        selected_by_text[text] = entry
-                        heapq.heappush(heap, entry)
-                        continue
-                    discard_stale()
-                    if heap and entry[:3] > heap[0][:3]:
-                        removed = heapq.heappop(heap)
-                        if selected_by_text.get(removed[3]) == removed:
-                            del selected_by_text[removed[3]]
-                        selected_by_text[text] = entry
-                        heapq.heappush(heap, entry)
-                selected = sorted(
-                    selected_by_text.values(), key=lambda entry: entry[:3], reverse=True
-                )
-                for entry in selected:
-                    seen_text.add(entry[3])
-                    result.append(entry[4])
-                self._canonical_cache.clear()
-        return result
-
 
 def deduplicate_branch_candidates(
     set_name: str,

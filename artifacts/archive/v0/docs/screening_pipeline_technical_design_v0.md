@@ -216,4 +216,4 @@ KEEP 自动入选            → QUALIFIED 后按配额 SELECTED
 尽量填平缺口             → 缺口可作为明确业务结果暴露
 ```
 
-当前实现请参见 [数据筛选链路实现技术方案 v1](screening_pipeline_technical_design_v1.md)。
+后续版本请参见 [数据筛选链路实现技术方案 v1](../../v1/docs/screening_pipeline_technical_design_v1.md)。

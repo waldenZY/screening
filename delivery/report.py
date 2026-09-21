@@ -1,14 +1,18 @@
-"""Deterministic, sanitized run-level reporting for screening v2."""
+"""Deterministic, sanitized run-level reporting for screening v3."""
 
 from __future__ import annotations
 
 import json
+import math
+import statistics
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from ..candidate.p2_adaptive import P2_ALGORITHM, P2_SOURCE_NAMES
 from ..quality.two_stage import (
+    CHALLENGE_TYPES,
     CLASSIFICATION_DIFFICULTIES,
     TASK_DIFFICULTIES,
     validate_stage1_result,
@@ -20,7 +24,7 @@ from ..shared.taxonomy import TaxonomyMappings
 from .screened import validate_screened_canonical_record
 
 
-RUN_REPORT_SCHEMA_VERSION = 3
+RUN_REPORT_SCHEMA_VERSION = 4
 RUN_REPORT_JSON = "screening_run_report.json"
 RUN_REPORT_MARKDOWN = "screening_run_report.md"
 SET_NAMES = ("P0", "P1", "P2")
@@ -195,6 +199,65 @@ def _p1_diagnostics(build_summary: Mapping[str, Any]) -> JsonObject:
     }
 
 
+def _p2_diagnostics(
+    build_summary: Mapping[str, Any],
+    final_records: Sequence[Mapping[str, Any]],
+    challenge_runtime: Mapping[str, Any] | None,
+) -> JsonObject:
+    value = build_summary.get("p2_adaptive")
+    if not isinstance(value, Mapping):
+        raise RunReportError("P2 自适应诊断缺少汇总")
+    primary = Counter()
+    labels = Counter()
+    combinations = Counter()
+    stage2_pairs = Counter()
+    stage2_issue_records = 0
+    frequency_bands = Counter()
+    for record in final_records:
+        challenge = record.get("challenge")
+        if not isinstance(challenge, Mapping) or challenge.get("is_challenge") is not True:
+            raise RunReportError("P2 最终记录缺少 Challenge 结果")
+        primary[str(challenge["primary_challenge"])] += 1
+        frequency_bands[str(record["candidate"]["features"]["frequency_band"])] += 1
+        types = [str(item) for item in challenge["challenge_types"]]
+        labels.update(types)
+        combinations["+".join(types)] += 1
+        issues = [str(item) for item in record["quality"]["issue_types"] if item != "none"]
+        if issues:
+            stage2_issue_records += 1
+        for challenge_type in types:
+            for issue in issues:
+                stage2_pairs[f"{challenge_type}|{issue}"] += 1
+    selected = value.get("selection", {})
+    return {
+        "algorithm": value.get("algorithm"),
+        "rounds": list(value.get("rounds", [])),
+        "source_funnel": dict(value.get("source_funnel", {})),
+        "candidate_remaining_by_source": dict(value.get("candidate_remaining_by_source", {})),
+        "final_by_primary": {key: int(primary[key]) for key in CHALLENGE_TYPES},
+        "final_share_by_primary": {
+            key: (0.0 if not final_records else round(primary[key] / len(final_records), 6))
+            for key in CHALLENGE_TYPES
+        },
+        "soft_min_deficit_by_primary": dict(selected.get("soft_min_deficit_by_primary", {})),
+        "challenge_type_distribution": {key: int(labels[key]) for key in CHALLENGE_TYPES},
+        "challenge_type_combinations": dict(sorted(combinations.items(), key=lambda item: (-item[1], item[0]))),
+        "final_frequency_band_distribution": dict(sorted(frequency_bands.items())),
+        "challenge_stage2_pairs": dict(sorted(stage2_pairs.items(), key=lambda item: (-item[1], item[0]))),
+        "stage2_issue_records": stage2_issue_records,
+        "judge_pass_not_selected": int(selected.get("judge_pass_not_selected", 0)),
+        "not_selected_reasons": dict(selected.get("not_selected_reasons", {})),
+        "target": int(value.get("target", 0)),
+        "soft_min_per_type": int(value.get("soft_min_per_type", 0)),
+        "max_per_primary": int(value.get("max_per_primary", 0)),
+        "final": int(value.get("final", 0)),
+        "target_gap": int(value.get("target_gap", 0)),
+        "stop_reason": value.get("stop_reason"),
+        "candidate_exhausted": bool(value.get("candidate_exhausted", False)),
+        "challenge_runtime": dict(challenge_runtime or {}),
+    }
+
+
 def build_run_report(
     *,
     run_id: str,
@@ -205,6 +268,7 @@ def build_run_report(
     final_records: Mapping[str, Sequence[Mapping[str, Any]]],
     p1_target_quotas: Mapping[str, int],
     build_summary: Mapping[str, Any],
+    challenge_runtime: Mapping[str, Any] | None = None,
 ) -> JsonObject:
     """Build a complete report without retaining any query text."""
     if set(evaluated_candidates) != set(SET_NAMES) or set(final_records) != set(SET_NAMES):
@@ -241,7 +305,7 @@ def build_run_report(
             round_id = evaluation_rounds[set_name].get(identity)
             if isinstance(round_id, bool) or not isinstance(round_id, int) or round_id < 0:
                 raise RunReportError(f"{set_name} 报告候选缺少合法轮次")
-            if set_name != "P1" and round_id != 0:
+            if set_name == "P0" and round_id != 0:
                 raise RunReportError(f"{set_name} 不得出现补采轮次")
             _add_stage1(set_counts, result)
             _add_stage1(node_counts[l2_key], result)
@@ -489,6 +553,9 @@ def build_run_report(
         },
         "sets": sets,
         "p1_diagnostics": _p1_diagnostics(build_summary),
+        "p2_diagnostics": _p2_diagnostics(
+            build_summary, final_records["P2"], challenge_runtime
+        ),
     }
     validate_run_report(report)
     return report
@@ -536,6 +603,7 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         "totals",
         "sets",
         "p1_diagnostics",
+        "p2_diagnostics",
     }
     if not isinstance(report, Mapping) or set(report) != expected_top:
         raise RunReportError("批跑报告顶层字段不一致")
@@ -555,6 +623,108 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
            if int(row["round_id"]) > 0)
     ):
         raise RunReportError("P1 补采诊断与 Stage1 波次数量不守恒")
+    p2_diagnostics = report["p2_diagnostics"]
+    if not isinstance(p2_diagnostics, Mapping) or not isinstance(p2_diagnostics.get("rounds"), list):
+        raise RunReportError("P2 自适应诊断结构非法")
+    if p2_diagnostics.get("algorithm") != P2_ALGORITHM:
+        raise RunReportError("P2 自适应算法标识非法")
+    if int(p2_diagnostics.get("final", -1)) != int(report["sets"]["P2"]["final_count"]):
+        raise RunReportError("P2 自适应诊断与最终数量不守恒")
+    target = p2_diagnostics.get("target")
+    final = p2_diagnostics.get("final")
+    soft_min = p2_diagnostics.get("soft_min_per_type")
+    type_cap = p2_diagnostics.get("max_per_primary")
+    final_by_primary = p2_diagnostics.get("final_by_primary")
+    deficits = p2_diagnostics.get("soft_min_deficit_by_primary")
+    if (
+        any(type(value) is not int or value < 0 for value in (target, final, soft_min, type_cap))
+        or final > target
+        or p2_diagnostics.get("target_gap") != target - final
+        or not isinstance(final_by_primary, Mapping)
+        or set(final_by_primary) != set(CHALLENGE_TYPES)
+        or any(type(value) is not int or value < 0 or value > type_cap for value in final_by_primary.values())
+        or sum(final_by_primary.values()) != final
+        or not isinstance(deficits, Mapping)
+        or set(deficits) != set(CHALLENGE_TYPES)
+        or deficits != {
+            key: max(0, soft_min - int(final_by_primary[key])) for key in CHALLENGE_TYPES
+        }
+    ):
+        raise RunReportError("P2 目标、类型配额或缺口不守恒")
+    source_funnel = p2_diagnostics.get("source_funnel")
+    if not isinstance(source_funnel, Mapping) or set(source_funnel) != set(P2_SOURCE_NAMES):
+        raise RunReportError("P2 来源池漏斗结构非法")
+    batches = []
+    for round_value in p2_diagnostics["rounds"]:
+        if not isinstance(round_value, Mapping):
+            raise RunReportError("P2 轮次结构非法")
+        round_batches = round_value.get("batches")
+        if not isinstance(round_batches, list) or any(
+            not isinstance(batch, Mapping) for batch in round_batches
+        ):
+            raise RunReportError("P2 轮次批次结构非法")
+        batches.extend(round_batches)
+        if (
+            int(round_value.get("actual_sampled", -1))
+            != sum(int(batch.get("sampled", -1)) for batch in round_batches)
+            or int(round_value.get("used_requests", -1))
+            != sum(int(batch.get("requested", -1)) for batch in round_batches)
+            or int(round_value.get("planned_requests", -1))
+            < int(round_value.get("actual_sampled", -1))
+        ):
+            raise RunReportError("P2 轮次请求数量不守恒")
+        for batch in round_batches:
+            for scalar, by_source in (
+                ("requested", "requested_by_source"),
+                ("sampled", "sampled_by_source"),
+                ("after_dedup", "after_dedup_by_source"),
+                ("stage1_pass", "stage1_pass_by_source"),
+                ("judge_pass", "judge_pass_by_source"),
+            ):
+                values = batch.get(by_source)
+                if (
+                    not isinstance(values, Mapping)
+                    or any(key not in P2_SOURCE_NAMES for key in values)
+                    or int(batch.get(scalar, -1)) != sum(int(value) for value in values.values())
+                ):
+                    raise RunReportError(f"P2 批次 {scalar} 来源数量不守恒")
+    funnel_fields = {
+        "candidate_capacity", "requested", "actual_sampled", "after_dedup",
+        "stage1_pass", "judge_pass", "final",
+    }
+    for source in P2_SOURCE_NAMES:
+        row = source_funnel[source]
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != funnel_fields
+            or any(type(row[field]) is not int or row[field] < 0 for field in funnel_fields)
+            or not (
+                row["candidate_capacity"] >= row["actual_sampled"]
+                and row["requested"] >= row["actual_sampled"]
+                and row["actual_sampled"] >= row["after_dedup"]
+                >= row["stage1_pass"] >= row["judge_pass"] >= row["final"]
+            )
+        ):
+            raise RunReportError(f"P2 来源池 {source} 漏斗数量非法")
+        expected = {
+            "requested": sum(int(batch.get("requested_by_source", {}).get(source, 0)) for batch in batches),
+            "actual_sampled": sum(int(batch.get("sampled_by_source", {}).get(source, 0)) for batch in batches),
+            "after_dedup": sum(int(batch.get("after_dedup_by_source", {}).get(source, 0)) for batch in batches),
+            "stage1_pass": sum(int(batch.get("stage1_pass_by_source", {}).get(source, 0)) for batch in batches),
+            "judge_pass": sum(int(batch.get("judge_pass_by_source", {}).get(source, 0)) for batch in batches),
+        }
+        if any(int(row[key]) != value for key, value in expected.items()):
+            raise RunReportError(f"P2 来源池 {source} 漏斗与批次不守恒")
+    if sum(int(source_funnel[source]["final"]) for source in P2_SOURCE_NAMES) != int(p2_diagnostics["final"]):
+        raise RunReportError("P2 来源池最终入集数不守恒")
+    reasons = p2_diagnostics.get("not_selected_reasons")
+    if (
+        not isinstance(reasons, Mapping)
+        or set(reasons) != {"type_cap", "total_limit", "diversity"}
+        or any(type(value) is not int or value < 0 for value in reasons.values())
+        or sum(reasons.values()) != int(p2_diagnostics.get("judge_pass_not_selected", -1))
+    ):
+        raise RunReportError("P2 Judge 通过未入集原因不守恒")
 
     total_final = 0
     for set_name in SET_NAMES:
@@ -648,7 +818,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
     """Render the validated JSON report as a presentation-friendly Markdown file."""
     validate_run_report(report)
     lines = [
-        "# Screening v2 批跑报告",
+        "# Screening v3 批跑报告",
         "",
         f"> Run ID：`{_cell(report['run_id'])}`  ",
         "> 语义标签一致率由 Stage1 LLM 判断得到，是自动评估指标，不等同于人工金标准确率。",
@@ -835,6 +1005,58 @@ def render_run_report(report: Mapping[str, Any]) -> str:
                 f"| {reason} | {_cell(row['l2_key'])} | {_cell(row['cluster_id'])} | "
                 f"{row['evaluated']} | {row['usable']} | {row['exact']} |"
             )
+    p2 = report["p2_diagnostics"]
+    lines.extend(
+        [
+            "",
+            "## P2 Challenge 诊断",
+            "",
+            f"- 最终数量：{p2['final']} / {p2['target']}；target_gap={p2['target_gap']}；停止原因={p2['stop_reason']}。",
+            f"- 类型软下限={p2['soft_min_per_type']}；单一 primary 上限={p2['max_per_primary']}。",
+            f"- Judge 通过但未入集：{p2['judge_pass_not_selected']}。",
+            f"- 未入集原因：{json.dumps(p2['not_selected_reasons'], ensure_ascii=False, sort_keys=True)}。",
+            f"- Stage2 标出问题的最终记录：{p2['stage2_issue_records']}。",
+            f"- 最终 frequency band：{json.dumps(p2['final_frequency_band_distribution'], ensure_ascii=False, sort_keys=True)}。",
+            "",
+            "### Primary Challenge 分布",
+            "",
+            "| 类型 | 最终数量 | 占比 | 软下限缺口 |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+    for challenge_type in sorted(p2["soft_min_deficit_by_primary"]):
+        lines.append(
+            f"| {challenge_type} | {p2['final_by_primary'].get(challenge_type, 0)} | "
+            f"{p2['final_share_by_primary'].get(challenge_type, 0) * 100:.2f}% | "
+            f"{p2['soft_min_deficit_by_primary'][challenge_type]} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### 来源池漏斗",
+            "",
+            "| 来源 | 候选容量 | 请求 | 实际抽取 | 去重后 | Stage1 通过 | Judge 通过 | 最终入集 |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for source in sorted(p2["source_funnel"]):
+        row = p2["source_funnel"][source]
+        lines.append(
+            f"| {source} | {row['candidate_capacity']} | {row['requested']} | "
+            f"{row['actual_sampled']} | {row['after_dedup']} | {row['stage1_pass']} | "
+            f"{row['judge_pass']} | {row['final']} |"
+        )
+    runtime = p2.get("challenge_runtime", {})
+    if runtime:
+        lines.extend(
+            [
+                "",
+                "### Challenge Judge 运行",
+                "",
+                f"- 任务数={runtime.get('task_count', 0)}，调用尝试={runtime.get('attempt_count', 0)}，缓存命中={runtime.get('cache_hits', 0)}。",
+                f"- 失败={runtime.get('failure_count', 0)}，重试={runtime.get('retry_count', 0)}，平均时延={runtime.get('mean_latency_ms')} ms，P90={runtime.get('p90_latency_ms')} ms。",
+            ]
+        )
     lines.extend(
         [
             "",
@@ -863,6 +1085,36 @@ def write_run_report(
     build_summary: Mapping[str, Any],
 ) -> JsonObject:
     """Write deterministic JSON and Markdown report artifacts."""
+    quality_root = run_root.expanduser().resolve() / "quality"
+    tasks_path = quality_root / "challenge_tasks.jsonl"
+    attempts_path = quality_root / "challenge_attempts.jsonl"
+    cache_hits_path = quality_root / "challenge_cache_hits.jsonl"
+    tasks = []
+    attempts = []
+    cache_hits = []
+    if tasks_path.is_file():
+        tasks = [json.loads(line) for line in tasks_path.read_text(encoding="utf-8").splitlines() if line]
+    if attempts_path.is_file():
+        attempts = [json.loads(line) for line in attempts_path.read_text(encoding="utf-8").splitlines() if line]
+    if cache_hits_path.is_file():
+        cache_hits = [json.loads(line) for line in cache_hits_path.read_text(encoding="utf-8").splitlines() if line]
+    successes = [row for row in attempts if row.get("outcome") == "success"]
+    latencies = sorted(float(row["full_latency_ms"]) for row in successes if row.get("full_latency_ms") is not None)
+    challenge_runtime: JsonObject = {
+        "task_count": len(tasks),
+        "attempt_count": len(attempts),
+        "cache_hits": len(cache_hits),
+        "failure_count": sum(row.get("outcome") == "failure" for row in attempts),
+        "failure_rate": (
+            None if not attempts
+            else round(sum(row.get("outcome") == "failure" for row in attempts) / len(attempts), 6)
+        ),
+        "retry_count": max(0, len(attempts) - len({row.get("cache_key") for row in attempts})),
+        "mean_latency_ms": None if not latencies else round(statistics.fmean(latencies), 3),
+        "median_latency_ms": None if not latencies else round(statistics.median(latencies), 3),
+        "p90_latency_ms": None if not latencies else round(latencies[min(len(latencies) - 1, math.ceil(len(latencies) * 0.9) - 1)], 3),
+        "max_latency_ms": None if not latencies else round(max(latencies), 3),
+    }
     report = build_run_report(
         run_id=run_id,
         taxonomy=taxonomy,
@@ -872,6 +1124,7 @@ def write_run_report(
         final_records=final_records,
         p1_target_quotas=p1_target_quotas,
         build_summary=build_summary,
+        challenge_runtime=challenge_runtime,
     )
     run_root = run_root.expanduser().resolve()
     write_json(run_root / RUN_REPORT_JSON, report)

@@ -1,4 +1,4 @@
-"""Strict, path-stable configuration profile for the screening v2 entrypoint."""
+"""Strict, path-stable configuration profile for the screening v3 entrypoint."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from ..shared.json_io import JsonObject
 from .orchestrator import BUILD_CONFIG_VERSION, BuildConfig, parse_build_config
 
 
-PIPELINE_CONFIG_VERSION = 2
+PIPELINE_CONFIG_VERSION = 3
 LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 _TOP_LEVEL_FIELDS = {
@@ -28,6 +28,7 @@ _TOP_LEVEL_FIELDS = {
     "publication",
     "sampling",
     "p1_supplement",
+    "p2_supplement",
 }
 _P0_FIELDS = {
     "l1_big_threshold",
@@ -48,10 +49,12 @@ _P1_FIELDS = {
 }
 _P2_FIELDS = {
     "target_n",
-    "multi_turn_ratio",
-    "probability_cap",
-    "frequency_quantile",
+    "candidate_source_shares",
     "minimum_complexity",
+    "boundary_probability_cap",
+    "soft_min_per_type",
+    "max_per_primary",
+    "batch_size",
     "dedup_threshold",
 }
 _SUPPLEMENT_FIELDS = {
@@ -62,11 +65,21 @@ _SUPPLEMENT_FIELDS = {
     "maximum_pass_rate",
     "safety_factor",
 }
+_P2_SUPPLEMENT_FIELDS = {
+    "max_rounds",
+    "default_yield",
+    "type_default_yield",
+    "prior_strength",
+    "minimum_yield",
+    "safety_factor",
+    "exploration_share",
+}
 _OVERRIDE_FIELDS = {
     "source",
     "taxonomy",
     "output_root",
     "stage1_prompt",
+    "challenge_prompt",
     "stage2_prompt",
     "workers",
     "max_retries",
@@ -176,6 +189,7 @@ class PipelineConfig:
     taxonomy: Path | None
     output_root: Path
     stage1_prompt: Path
+    challenge_prompt: Path
     stage2_prompt: Path
     quality: QualityRunConfig
     index: IndexRuntimeConfig
@@ -200,6 +214,7 @@ class PipelineConfig:
             ("inputs.source", self.source),
             ("inputs.taxonomy", self.taxonomy),
             ("prompts.stage1", self.stage1_prompt),
+            ("prompts.challenge", self.challenge_prompt),
             ("prompts.stage2", self.stage2_prompt),
         ):
             if path is None:
@@ -221,6 +236,7 @@ class PipelineConfig:
             "outputs": {"output_root": str(self.output_root)},
             "prompts": {
                 "stage1": str(self.stage1_prompt),
+                "challenge": str(self.challenge_prompt),
                 "stage2": str(self.stage2_prompt),
             },
             "quality": asdict(self.quality),
@@ -264,19 +280,24 @@ def _parse_build(value: Mapping[str, Any]) -> BuildConfig:
         raise ValueError("sampling.p1.probability_weights 必须是对象")
     if not isinstance(p1["frequency_weights"], dict):
         raise ValueError("sampling.p1.frequency_weights 必须是对象")
+    if not isinstance(p2["candidate_source_shares"], dict):
+        raise ValueError("sampling.p2.candidate_source_shares 必须是对象")
     supplement = _object(value["p1_supplement"], "p1_supplement")
     _exact_fields(supplement, _SUPPLEMENT_FIELDS, "p1_supplement")
+    p2_supplement = _object(value["p2_supplement"], "p2_supplement")
+    _exact_fields(p2_supplement, _P2_SUPPLEMENT_FIELDS, "p2_supplement")
     return parse_build_config(
         {
             "config_version": BUILD_CONFIG_VERSION,
             "sampling": sampling,
             "p1_supplement": supplement,
+            "p2_supplement": p2_supplement,
         }
     )
 
 
 def load_pipeline_config(path: Path) -> PipelineConfig:
-    """Load and strictly validate one complete v2 execution profile."""
+    """Load and strictly validate one complete v3 execution profile."""
     config_path = path.expanduser().resolve()
     try:
         value = json.loads(config_path.read_text(encoding="utf-8"))
@@ -299,7 +320,7 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
     publication = _object(value["publication"], "publication")
     _exact_fields(inputs, {"source", "taxonomy"}, "inputs")
     _exact_fields(outputs, {"output_root"}, "outputs")
-    _exact_fields(prompts, {"stage1", "stage2"}, "prompts")
+    _exact_fields(prompts, {"stage1", "challenge", "stage2"}, "prompts")
     _exact_fields(quality, {"workers", "max_retries", "sleep_seconds"}, "quality")
     _exact_fields(
         index,
@@ -336,6 +357,7 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
         taxonomy=_path(inputs["taxonomy"], "inputs.taxonomy", base_dir, optional=True),
         output_root=_path(outputs["output_root"], "outputs.output_root", base_dir),  # type: ignore[arg-type]
         stage1_prompt=_path(prompts["stage1"], "prompts.stage1", base_dir),  # type: ignore[arg-type]
+        challenge_prompt=_path(prompts["challenge"], "prompts.challenge", base_dir),  # type: ignore[arg-type]
         stage2_prompt=_path(prompts["stage2"], "prompts.stage2", base_dir),  # type: ignore[arg-type]
         quality=QualityRunConfig(
             workers=workers,
@@ -437,6 +459,11 @@ def apply_pipeline_overrides(
             _path(values["stage1_prompt"], "--stage1-prompt", base_dir)  # type: ignore[arg-type]
             if "stage1_prompt" in values
             else config.stage1_prompt
+        ),
+        challenge_prompt=(
+            _path(values["challenge_prompt"], "--challenge-prompt", base_dir)  # type: ignore[arg-type]
+            if "challenge_prompt" in values
+            else config.challenge_prompt
         ),
         stage2_prompt=(
             _path(values["stage2_prompt"], "--stage2-prompt", base_dir)  # type: ignore[arg-type]

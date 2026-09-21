@@ -1,8 +1,8 @@
 # Screening 最终交付数据字段说明（labeled v4）
 
-> 文档状态：当前实现口径  
-> 适用版本：Screening v2 / `labeled_v4`  
-> 更新日期：2026-09-14
+> 文档状态：当前实现口径
+> 适用版本：Screening v3 / `labeled_v4`
+> 更新日期：2026-09-21
 
 ## 1. 数据是什么
 
@@ -13,7 +13,7 @@ JSON 对象”，文件最外层没有数组。
 | --- | --- | --- | --- |
 | P0 冒烟集 | `P0_smoke` | `P0_smoke_set_v4_labeled.jsonl` | 小规模、结构化覆盖，用于快速冒烟验证 |
 | P1 基准集 | `P1_benchmark` | `P1_benchmark_set_v4_labeled.jsonl` | 主要基准集，强调 L2 覆盖与分布 |
-| P2 对抗集 | `P2_adversarial` | `P2_adversarial_set_v4_labeled.jsonl` | 偏边界、低频和较复杂样本，用于困难场景验证 |
+| P2 挑战集 | `P2_adversarial` | `P2_adversarial_set_v4_labeled.jsonl` | 通过独立 Challenge Judge 的困难样本，用于挑战场景验证 |
 
 每条记录固定 28 个字段。P0/P1 的第 15 个字段叫 `relevance_p0`，P2 的第 15 个字段
 叫 `relevance_p2`；其余字段名称和顺序完全一致。
@@ -26,6 +26,11 @@ category_fit=exact
 + intent_clarity=clear
 + validity=valid
 ```
+
+P2 还必须满足 `is_challenge=true`。Challenge 的主类型和多标签保存在内部
+`screened.canonical.jsonl` 与报告中；为了保持下游 labeled v4 兼容，28 字段文件不新增
+Challenge 字段。需要分析 P2 类型构成时，应读取同一 run 的
+`screening_run_report.json`，不能从 28 字段反推 Challenge 类型。
 
 ## 2. 28 个字段
 

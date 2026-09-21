@@ -51,6 +51,16 @@ class FakeQualityRunner:
     def run_stage2(self, candidates, _stage1):
         return {item["source_identity_sha256"]: dict(STAGE2) for item in candidates}
 
+    def run_challenge(self, candidates):
+        return {
+            item["source_identity_sha256"]: {
+                "is_challenge": True,
+                "primary_challenge": "long_tail_expr",
+                "challenge_types": ["long_tail_expr"],
+            }
+            for item in candidates
+        }
+
 
 class AdaptiveP1Tests(unittest.TestCase):
     def test_cluster_feedback_and_once_per_round_exploration(self):
@@ -111,7 +121,12 @@ class AdaptiveP1Tests(unittest.TestCase):
             config = BuildConfig(
                 sampling=SamplingConfig(
                     p1=P1SamplingConfig(target_n=2),
-                    p2=P2SamplingConfig(target_n=1),
+                    p2=P2SamplingConfig(
+                        target_n=1,
+                        soft_min_per_type=0,
+                        max_per_primary=1,
+                        batch_size=2,
+                    ),
                 ),
                 p1_supplement=P1SupplementConfig(max_rounds=2),
             )
@@ -132,14 +147,15 @@ class AdaptiveP1Tests(unittest.TestCase):
             self.assertGreaterEqual(len(supplement["rounds"][0]["batches"]), 2)
             self.assertEqual(first.summary["sets"]["P1"]["supplement_pass_not_admitted"], 0)
             report = load_and_validate_run_report(run_root)
-            self.assertEqual(report["report_schema_version"], 3)
+            self.assertEqual(report["report_schema_version"], 4)
             self.assertEqual(report["p1_diagnostics"]["rounds"][0]["admitted"], 2)
+            calls_before_replay = runner.stage1_calls
             replay = run_build(
                 index, config, source_path=source, taxonomy=taxonomy,
                 run_root=run_root, quality_runner=runner,
             )
             self.assertEqual(replay.summary, first.summary)
-            self.assertEqual(runner.stage1_calls, 4)
+            self.assertEqual(runner.stage1_calls, calls_before_replay)
 
 
 if __name__ == "__main__":

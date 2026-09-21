@@ -11,16 +11,18 @@ from typing import Any
 from ..candidate.contract import validate_canonical_candidate
 from ..shared.json_io import JsonObject
 from ..quality.two_stage import (
+    CHALLENGE_FIELDS,
     STAGE1_FIELDS,
     STAGE2_FIELDS,
     stage1_passes,
     stage2_consistency_conflicts,
+    validate_challenge_result,
     validate_stage1_result,
     validate_stage2_result,
 )
 
 
-SCREENED_CANONICAL_SCHEMA_VERSION = 2
+SCREENED_CANONICAL_SCHEMA_VERSION = 3
 SET_NAMES = frozenset({"P0", "P1", "P2"})
 SELECTION_ORIGINS = frozenset({"initial_wave", "supplement_wave"})
 _HASH = re.compile(r"[0-9a-f]{64}")
@@ -43,6 +45,8 @@ def build_screened_canonical_record(
     stage1_result: Mapping[str, Any],
     stage2_result: Mapping[str, Any],
     *,
+    challenge_result: Mapping[str, Any] | None = None,
+    challenge_task_id: str | None = None,
     origin: str,
     round_id: int,
     candidate_task_id: str,
@@ -63,6 +67,14 @@ def build_screened_canonical_record(
             "is_consistent": not conflicts,
             "conflict_codes": list(conflicts),
         },
+        "challenge": (
+            None
+            if set_name != "P2"
+            else {
+                **validate_challenge_result(dict(challenge_result or {})),
+                "challenge_task_id": challenge_task_id,
+            }
+        ),
         "selection": {
             "origin": origin,
             "round_id": round_id,
@@ -81,7 +93,7 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
         raise ScreenedCanonicalError("screened canonical 必须是对象")
     expected = {
         "screened_schema_version", "set", "candidate", "quality",
-        "quality_consistency", "selection"
+        "quality_consistency", "challenge", "selection"
     }
     if set(record) != expected:
         raise ScreenedCanonicalError("screened canonical 顶层字段不一致")
@@ -95,6 +107,21 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
     if not isinstance(candidate, Mapping):
         raise ScreenedCanonicalError("screened canonical candidate 必须是对象")
     validate_canonical_candidate(candidate)
+
+    challenge = record.get("challenge")
+    if set_name == "P2":
+        expected_challenge_fields = CHALLENGE_FIELDS | {"challenge_task_id"}
+        if not isinstance(challenge, Mapping) or set(challenge) != expected_challenge_fields:
+            raise ScreenedCanonicalError("P2 challenge 字段不一致")
+        validated_challenge = validate_challenge_result(
+            {key: challenge[key] for key in CHALLENGE_FIELDS}
+        )
+        if not validated_challenge["is_challenge"]:
+            raise ScreenedCanonicalError("P2 包含非 Challenge 样本")
+        if not isinstance(challenge.get("challenge_task_id"), str) or not challenge["challenge_task_id"]:
+            raise ScreenedCanonicalError("P2 challenge_task_id 不能为空")
+    elif challenge is not None:
+        raise ScreenedCanonicalError("P0/P1 challenge 必须为 null")
 
     quality = record.get("quality")
     if not isinstance(quality, Mapping) or set(quality) != STAGE1_FIELDS | STAGE2_FIELDS:
@@ -129,8 +156,8 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
         raise ScreenedCanonicalError("selection.round_id 非法")
     if (origin == "initial_wave") != (round_id == 0):
         raise ScreenedCanonicalError("selection origin 与 round_id 不一致")
-    if set_name != "P1" and origin != "initial_wave":
-        raise ScreenedCanonicalError("只有 P1 可以包含补采样本")
+    if set_name == "P0" and origin != "initial_wave":
+        raise ScreenedCanonicalError("P0 不能包含补采样本")
     for key in ("candidate_task_id", "stage1_task_id", "stage2_task_id"):
         value = selection.get(key)
         if not isinstance(value, str) or not value:

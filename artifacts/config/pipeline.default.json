@@ -1,14 +1,15 @@
 {
-  "config_version": 2,
+  "config_version": 3,
   "inputs": {
     "source": "",
     "taxonomy": ""
   },
   "outputs": {
-    "output_root": "../../outputs_v2"
+    "output_root": "../../outputs_v3"
   },
   "prompts": {
     "stage1": "../prompts/quality_stage1.md",
+    "challenge": "../prompts/quality_challenge.md",
     "stage2": "../prompts/quality_stage2.md"
   },
   "quality": {
@@ -51,11 +52,18 @@
       "dedup_threshold": 0.75
     },
     "p2": {
-      "target_n": 3000,
-      "multi_turn_ratio": 0.4,
-      "probability_cap": 0.7,
-      "frequency_quantile": 0.5,
+      "target_n": 2000,
+      "candidate_source_shares": {
+        "complex": 0.3,
+        "multi_turn": 0.3,
+        "boundary": 0.2,
+        "exploration": 0.2
+      },
       "minimum_complexity": "moderate",
+      "boundary_probability_cap": 0.5,
+      "soft_min_per_type": 100,
+      "max_per_primary": 700,
+      "batch_size": 2000,
       "dedup_threshold": 0.75
     }
   },
@@ -66,5 +74,14 @@
     "minimum_pass_rate": 0.1,
     "maximum_pass_rate": 0.95,
     "safety_factor": 1.1
+  },
+  "p2_supplement": {
+    "max_rounds": 3,
+    "default_yield": 0.1,
+    "type_default_yield": 0.0125,
+    "prior_strength": 10.0,
+    "minimum_yield": 0.005,
+    "safety_factor": 1.1,
+    "exploration_share": 0.2
   }
 }

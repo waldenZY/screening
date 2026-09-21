@@ -1,0 +1,70 @@
+{
+  "config_version": 2,
+  "inputs": {
+    "source": "",
+    "taxonomy": ""
+  },
+  "outputs": {
+    "output_root": "../../outputs_v2"
+  },
+  "prompts": {
+    "stage1": "../prompts/quality_stage1.md",
+    "stage2": "../prompts/quality_stage2.md"
+  },
+  "quality": {
+    "workers": 8,
+    "max_retries": 10,
+    "sleep_seconds": 1.0
+  },
+  "index": {
+    "cache_root": null,
+    "batch_size": 50000,
+    "progress_every": 100000,
+    "sqlite_cache_mb": 1024,
+    "min_free_space_gb": 10.0,
+    "reserve_free_space_gb": 8.0,
+    "verify_full_source_hash": false
+  },
+  "logging": {
+    "level": "INFO"
+  },
+  "publication": {
+    "enabled": false,
+    "publish_root": null
+  },
+  "sampling": {
+    "p0": {
+      "l1_big_threshold": 3000,
+      "l2_per_l1_big": 3,
+      "l2_per_l1_small": 2,
+      "max_per_cluster": 5,
+      "fallback_pool_size": 10,
+      "mmr_lambda": 0.7,
+      "dedup_threshold": 0.7
+    },
+    "p1": {
+      "target_n": 10000,
+      "probability_weights": {"high": 3, "mid": 2, "boundary": 1},
+      "frequency_weights": {"hot": 2, "warm": 2, "cold": 1},
+      "cold_boundary_floor": 1,
+      "mmr_lambda": 0.7,
+      "dedup_threshold": 0.75
+    },
+    "p2": {
+      "target_n": 3000,
+      "multi_turn_ratio": 0.4,
+      "probability_cap": 0.7,
+      "frequency_quantile": 0.5,
+      "minimum_complexity": "moderate",
+      "dedup_threshold": 0.75
+    }
+  },
+  "p1_supplement": {
+    "max_rounds": 3,
+    "default_pass_rate": 0.55,
+    "pass_rate_prior_strength": 10.0,
+    "minimum_pass_rate": 0.1,
+    "maximum_pass_rate": 0.95,
+    "safety_factor": 1.1
+  }
+}

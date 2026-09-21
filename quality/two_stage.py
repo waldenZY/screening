@@ -25,6 +25,20 @@ STAGE1_FIELDS = frozenset(
 STAGE2_FIELDS = frozenset(
     {"classification_difficulty", "task_difficulty", "issue_types", "overall_score"}
 )
+CHALLENGE_FIELDS = frozenset(
+    {"is_challenge", "primary_challenge", "challenge_types"}
+)
+CHALLENGE_TYPES = (
+    "implicit_goal",
+    "multi_constraint",
+    "multi_turn_context",
+    "long_tail_expr",
+    "ambiguity",
+    "multi_intent",
+    "boundary",
+    "cross_app",
+)
+CHALLENGE_TYPE_SET = frozenset(CHALLENGE_TYPES)
 STAGE1_ENUMS = {
     "category_fit": frozenset({"exact", "partial", "mismatch"}),
     "semantic_completeness": frozenset({"self_contained", "context_dependent", "fragments"}),
@@ -50,7 +64,7 @@ ISSUE_TYPES = frozenset(
         "multi_intent",
     }
 )
-QUALITY_CONTRACT_VERSION = 2
+QUALITY_CONTRACT_VERSION = 3
 
 
 class QualityResponseError(ValueError):
@@ -172,6 +186,46 @@ def stage1_passes(value: Mapping[str, Any]) -> bool:
     }
 
 
+def validate_challenge_result(value: Any) -> JsonObject:
+    if not isinstance(value, dict) or set(value) != CHALLENGE_FIELDS:
+        raise QualityResponseError("Challenge 响应字段必须与白名单完全一致")
+    is_challenge = value.get("is_challenge")
+    primary = value.get("primary_challenge")
+    types = value.get("challenge_types")
+    if type(is_challenge) is not bool:
+        raise QualityResponseError("Challenge is_challenge 必须是布尔值")
+    if not isinstance(types, list):
+        raise QualityResponseError("Challenge challenge_types 必须是数组")
+    if (
+        any(not isinstance(item, str) or item not in CHALLENGE_TYPE_SET for item in types)
+        or len(set(types)) != len(types)
+        or len(types) > 3
+    ):
+        raise QualityResponseError("Challenge challenge_types 非法")
+    if not is_challenge:
+        if primary is not None or types:
+            raise QualityResponseError("非 Challenge 必须使用 primary=null 且 types=[]")
+        return {
+            "is_challenge": False,
+            "primary_challenge": None,
+            "challenge_types": [],
+        }
+    if not types or primary not in CHALLENGE_TYPE_SET or primary not in types:
+        raise QualityResponseError("Challenge primary 必须属于非空 challenge_types")
+    ordered = [primary, *[item for item in CHALLENGE_TYPES if item in types and item != primary]]
+    if types != ordered:
+        raise QualityResponseError("Challenge types 必须以 primary 开头并按固定枚举顺序排列")
+    return {
+        "is_challenge": True,
+        "primary_challenge": primary,
+        "challenge_types": list(types),
+    }
+
+
+def challenge_passes(value: Mapping[str, Any]) -> bool:
+    return bool(validate_challenge_result(dict(value))["is_challenge"])
+
+
 def validate_stage2_result(value: Any, stage1_result: Mapping[str, Any]) -> JsonObject:
     stage1 = validate_stage1_result(dict(stage1_result))
     if not isinstance(value, dict) or set(value) != STAGE2_FIELDS:
@@ -241,13 +295,14 @@ def stage2_consistency_conflicts(
 
 
 class TwoStageQualityRunner:
-    """Concurrent runner with a run-local SQLite cache and sanitized ledgers."""
+    """Concurrent three-stage runner with a run-local cache and sanitized ledgers."""
 
     def __init__(
         self,
         run_root: Path,
         *,
         stage1_prompt: str,
+        challenge_prompt: str,
         stage2_prompt: str,
         model: str,
         llm_options: Mapping[str, Any],
@@ -259,9 +314,15 @@ class TwoStageQualityRunner:
             raise ValueError("第一阶段 Prompt 必须恰好包含一个 {CANDIDATE_JSON}")
         if stage2_prompt.count("{CANDIDATE_JSON}") != 1:
             raise ValueError("第二阶段 Prompt 必须恰好包含一个 {CANDIDATE_JSON}")
+        if challenge_prompt.count("{CANDIDATE_JSON}") != 1:
+            raise ValueError("Challenge Prompt 必须恰好包含一个 {CANDIDATE_JSON}")
         self.run_root = run_root
         self.run_root.mkdir(parents=True, exist_ok=True)
-        self.prompts = {"stage1": stage1_prompt, "stage2": stage2_prompt}
+        self.prompts = {
+            "stage1": stage1_prompt,
+            "challenge": challenge_prompt,
+            "stage2": stage2_prompt,
+        }
         self.prompt_hashes = {key: _stable_hash(value) for key, value in self.prompts.items()}
         self.model = model
         self.llm_options = dict(llm_options)
@@ -289,7 +350,7 @@ class TwoStageQualityRunner:
             legacy_contract = dict(run_contract)
             legacy_contract.pop("quality_contract_version", None)
             if existing not in (run_contract, legacy_contract):
-                raise ValueError("两阶段 LLM 运行目录与当前 Prompt、模型或配置不兼容")
+                raise ValueError("质量 LLM 运行目录与当前 Prompt、模型或配置不兼容")
         else:
             contract_path.write_text(
                 json.dumps(run_contract, ensure_ascii=False, indent=2) + "\n",
@@ -297,6 +358,10 @@ class TwoStageQualityRunner:
                 newline="\n",
             )
         self._initialize_cache()
+        for stage in ("stage1", "challenge", "stage2"):
+            cache_hit_path = self.run_root / f"{stage}_cache_hits.jsonl"
+            if not cache_hit_path.exists():
+                cache_hit_path.write_text("", encoding="utf-8", newline="\n")
 
     def _initialize_cache(self) -> None:
         with sqlite3.connect(self.cache_path) as connection:
@@ -313,7 +378,7 @@ class TwoStageQualityRunner:
             )
             check = connection.execute("PRAGMA integrity_check").fetchone()
             if not check or check[0] != "ok":
-                raise ValueError("两阶段 LLM 运行缓存完整性检查失败")
+                raise ValueError("质量 LLM 运行缓存完整性检查失败")
 
     def _cache_key(
         self,
@@ -341,12 +406,14 @@ class TwoStageQualityRunner:
         stage1_result: Mapping[str, Any] | None = None,
     ) -> str:
         """Return the frozen task/cache identity recorded in the quality ledgers."""
-        if stage not in {"stage1", "stage2"}:
+        if stage not in {"stage1", "challenge", "stage2"}:
             raise ValueError(f"未知质量阶段: {stage}")
         if stage == "stage1" and stage1_result is not None:
             raise ValueError("第一阶段 task identity 不接受第一阶段结果")
         if stage == "stage2" and stage1_result is None:
             raise ValueError("第二阶段 task identity 必须包含第一阶段结果")
+        if stage == "challenge" and stage1_result is not None:
+            raise ValueError("Challenge task identity 不接受第一阶段结果")
         return self._cache_key(stage, candidate, stage1_result)
 
     def _load_cached(self, keys: Sequence[str], stage: str) -> dict[str, JsonObject]:
@@ -409,11 +476,12 @@ class TwoStageQualityRunner:
         success, parsed = try_parse_json(raw)
         if not success:
             raise QualityResponseError("响应不是合法 JSON 对象")
-        result = (
-            validate_stage1_result(parsed)
-            if stage == "stage1"
-            else validate_stage2_result(parsed, stage1_result or {})
-        )
+        if stage == "stage1":
+            result = validate_stage1_result(parsed)
+        elif stage == "challenge":
+            result = validate_challenge_result(parsed)
+        else:
+            result = validate_stage2_result(parsed, stage1_result or {})
         return result, first_latency, full_latency, hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _run(
@@ -434,8 +502,32 @@ class TwoStageQualityRunner:
         for matching_key, value in cached.items():
             if stage == "stage1":
                 validate_stage1_result(value)
+            elif stage == "challenge":
+                validate_challenge_result(value)
             else:
                 validate_stage2_result(value, stage1_for_key[matching_key] or {})
+        if cached:
+            cache_hit_rows = []
+            for key in sorted(cached):
+                identities = sorted({
+                    str(candidate["source_identity_sha256"])
+                    for candidate in by_key[key]
+                })
+                cache_hit_rows.append({
+                    "event_id": _stable_hash({
+                        "stage": stage,
+                        "cache_key": key,
+                        "source_identities": identities,
+                    }),
+                    "cache_key": key,
+                    "stage": stage,
+                    "source_identities": identities,
+                })
+            _merge_ledger(
+                self.run_root / f"{stage}_cache_hits.jsonl",
+                cache_hit_rows,
+                "event_id",
+            )
 
         tasks = []
         for key, grouped in sorted(by_key.items()):
@@ -585,6 +677,9 @@ class TwoStageQualityRunner:
     def run_stage1(self, candidates: Sequence[JsonObject]) -> dict[str, JsonObject]:
         return self._run("stage1", candidates)
 
+    def run_challenge(self, candidates: Sequence[JsonObject]) -> dict[str, JsonObject]:
+        return self._run("challenge", candidates)
+
     def run_stage2(
         self,
         candidates: Sequence[JsonObject],
@@ -600,6 +695,15 @@ def run_stage1(
 ) -> JsonObject:
     """Annotate one candidate with the first-stage contract."""
     return runner.run_stage1([candidate])[candidate["source_identity_sha256"]]
+
+
+def run_challenge(
+    candidate: JsonObject,
+    *,
+    runner: TwoStageQualityRunner,
+) -> JsonObject:
+    """Annotate one Stage1-admitted candidate with the Challenge contract."""
+    return runner.run_challenge([candidate])[candidate["source_identity_sha256"]]
 
 
 def run_stage2(

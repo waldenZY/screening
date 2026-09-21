@@ -25,17 +25,30 @@ from ..candidate.sampling import (
     allocate_sqrt_quotas,
     deduplicate_branch_candidates,
 )
+from ..candidate.p2_adaptive import (
+    P2_ALGORITHM,
+    P2_SOURCE_NAMES,
+    AdaptiveP2Sampler,
+    allocate_by_weights,
+    select_final_p2,
+    source_yield_rates,
+)
 from ..delivery.legacy import export_legacy_branch
 from ..delivery.report import write_run_report
 from ..delivery.screened import (
     build_screened_canonical_record,
     validate_screened_canonical_records,
 )
-from ..quality.two_stage import TwoStageQualityRunner, stage1_passes
+from ..quality.two_stage import (
+    CHALLENGE_TYPES,
+    TwoStageQualityRunner,
+    challenge_passes,
+    stage1_passes,
+)
 from .checkpoints import CheckpointStore
 
 
-BUILD_CONFIG_VERSION = 1
+BUILD_CONFIG_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -63,10 +76,47 @@ class P1SupplementConfig:
 
 
 @dataclass(frozen=True)
+class P2SupplementConfig:
+    max_rounds: int = 3
+    default_yield: float = 0.10
+    type_default_yield: float = 0.0125
+    prior_strength: float = 10.0
+    minimum_yield: float = 0.005
+    safety_factor: float = 1.1
+    exploration_share: float = 0.20
+
+    def __post_init__(self) -> None:
+        if isinstance(self.max_rounds, bool) or not isinstance(self.max_rounds, int) or self.max_rounds < 0:
+            raise ValueError("P2 max_rounds 必须是非负整数")
+        numeric = {
+            "default_yield": self.default_yield,
+            "type_default_yield": self.type_default_yield,
+            "prior_strength": self.prior_strength,
+            "minimum_yield": self.minimum_yield,
+            "safety_factor": self.safety_factor,
+            "exploration_share": self.exploration_share,
+        }
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in numeric.values()
+        ):
+            raise ValueError("P2 补采数值参数必须是数字")
+        if not 0 < self.minimum_yield <= self.default_yield <= 1:
+            raise ValueError("P2 总产出率参数非法")
+        if not self.minimum_yield <= self.type_default_yield <= self.default_yield:
+            raise ValueError("P2 类型产出率参数非法")
+        if self.prior_strength <= 0 or self.safety_factor <= 0:
+            raise ValueError("P2 先验强度和安全系数必须为正数")
+        if not 0 <= self.exploration_share <= 1:
+            raise ValueError("P2 exploration_share 必须位于 [0, 1]")
+
+
+@dataclass(frozen=True)
 class BuildConfig:
     config_version: int = BUILD_CONFIG_VERSION
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     p1_supplement: P1SupplementConfig = field(default_factory=P1SupplementConfig)
+    p2_supplement: P2SupplementConfig = field(default_factory=P2SupplementConfig)
 
     def __post_init__(self) -> None:
         if self.config_version != BUILD_CONFIG_VERSION:
@@ -89,11 +139,12 @@ def parse_build_config(value: Mapping[str, Any]) -> BuildConfig:
     """Parse the versioned sampling/supplement portion of a configuration."""
     if not isinstance(value, dict):
         raise ValueError("P012 构建配置必须是 JSON 对象")
-    _only(value, {"config_version", "sampling", "p1_supplement"}, "配置")
+    _only(value, {"config_version", "sampling", "p1_supplement", "p2_supplement"}, "配置")
     sampling = value.get("sampling", {})
     supplement = value.get("p1_supplement", {})
-    if not isinstance(sampling, dict) or not isinstance(supplement, dict):
-        raise ValueError("sampling 和 p1_supplement 必须是对象")
+    p2_supplement = value.get("p2_supplement", {})
+    if not isinstance(sampling, dict) or not isinstance(supplement, dict) or not isinstance(p2_supplement, dict):
+        raise ValueError("sampling、p1_supplement 和 p2_supplement 必须是对象")
     _only(sampling, {"p0", "p1", "p2"}, "sampling")
     sections: dict[str, Any] = {}
     for key, cls in (("p0", P0SamplingConfig), ("p1", P1SamplingConfig), ("p2", P2SamplingConfig)):
@@ -108,10 +159,15 @@ def parse_build_config(value: Mapping[str, Any]) -> BuildConfig:
         supplement_config = P1SupplementConfig(**supplement)
     except TypeError as exc:
         raise ValueError(f"p1_supplement 字段非法: {exc}") from exc
+    try:
+        p2_supplement_config = P2SupplementConfig(**p2_supplement)
+    except TypeError as exc:
+        raise ValueError(f"p2_supplement 字段非法: {exc}") from exc
     return BuildConfig(
         config_version=value.get("config_version", BUILD_CONFIG_VERSION),
         sampling=SamplingConfig(**sections),
         p1_supplement=supplement_config,
+        p2_supplement=p2_supplement_config,
     )
 
 
@@ -145,7 +201,7 @@ def _sample_branch(
             return sampler.sample_p0()
         if set_name == "P1":
             return sampler.sample_p1()
-        return sampler.sample_p2()
+        raise ValueError(f"初始静态采样只支持 P0/P1，收到: {set_name}")
 
 
 def _deduplicate(
@@ -340,6 +396,428 @@ def _validate_artifact_snapshot(run_root: Path, snapshot: Mapping[str, Any]) -> 
             raise ValueError(f"阶段产物缺失或哈希不一致: {relative}")
 
 
+def _p2_routing_weights(
+    diagnostics: Mapping[str, Any],
+    total_rates: Mapping[str, float],
+    type_rates: Mapping[str, Mapping[str, float]],
+    exploration_share: float,
+) -> dict[str, float]:
+    total_gap = int(diagnostics["target_gap"])
+    deficits = diagnostics["soft_min_deficit_by_primary"]
+    scores = {
+        source: total_gap * total_rates[source] + sum(
+            int(deficits[challenge_type]) * type_rates[source][challenge_type]
+            for challenge_type in CHALLENGE_TYPES
+        )
+        for source in P2_SOURCE_NAMES
+    }
+    non_exploration = [source for source in P2_SOURCE_NAMES if source != "exploration"]
+    score_sum = sum(scores[source] for source in non_exploration)
+    if score_sum <= 0:
+        base = (1.0 - exploration_share) / len(non_exploration)
+        return {**{source: base for source in non_exploration}, "exploration": exploration_share}
+    return {
+        **{
+            source: (1.0 - exploration_share) * scores[source] / score_sum
+            for source in non_exploration
+        },
+        "exploration": exploration_share,
+    }
+
+
+def _p2_wave_budget(
+    diagnostics: Mapping[str, Any],
+    total_rates: Mapping[str, float],
+    type_rates: Mapping[str, Mapping[str, float]],
+    safety_factor: float,
+) -> int:
+    total_gap = int(diagnostics["target_gap"])
+    total_need = 0 if total_gap == 0 else math.ceil(total_gap / max(total_rates.values()))
+    deficits = diagnostics["soft_min_deficit_by_primary"]
+    type_need = sum(
+        math.ceil(int(deficits[challenge_type]) / max(
+            type_rates[source][challenge_type] for source in P2_SOURCE_NAMES
+        ))
+        for challenge_type in CHALLENGE_TYPES
+        if int(deficits[challenge_type]) > 0
+    )
+    return math.ceil(max(total_need, type_need) * safety_factor)
+
+
+def _run_adaptive_p2(
+    index: CanonicalIndexHandle,
+    config: BuildConfig,
+    *,
+    source_path: Path,
+    taxonomy: TaxonomyMappings,
+    run_root: Path,
+    quality_runner: TwoStageQualityRunner,
+    checkpoints: CheckpointStore,
+    materialized: dict[str, JsonObject],
+    logger: logging.Logger,
+) -> JsonObject:
+    """Run resumable Stage1 -> Challenge batches and select official P2 members."""
+    complete = checkpoints.load("p2_adaptive_complete")
+    if complete is not None:
+        p2_root = run_root / "P2"
+        p2_root.mkdir(parents=True, exist_ok=True)
+        write_json(p2_root / "adaptive_summary.json", complete["diagnostics"])
+        return complete
+
+    p2_config = config.sampling.p2
+    supplement = config.p2_supplement
+    evaluated: list[JsonObject] = []
+    stage1_results: dict[str, JsonObject] = {}
+    challenge_results: dict[str, JsonObject] = {}
+    metadata: dict[str, JsonObject] = {}
+    sampled_metadata: dict[str, JsonObject] = {}
+    evaluation_rounds: dict[str, int] = {}
+    processed: set[str] = set()
+    rounds: list[JsonObject] = []
+    source_capacity: dict[str, int] = {source: 0 for source in P2_SOURCE_NAMES}
+    source_remaining: dict[str, int] = {source: 0 for source in P2_SOURCE_NAMES}
+    exhausted = False
+
+    branch_root = run_root / "P2"
+    branch_root.mkdir(parents=True, exist_ok=True)
+    logger.info("P2 adaptive start target=%d", p2_config.target_n)
+    with CanonicalCandidateIndex(index) as readonly_index:
+        sampler = AdaptiveP2Sampler(readonly_index, p2_config)
+        source_capacity = sampler.capacities()
+        initial_capacity_pending = True
+        for wave in range(0, supplement.max_rounds + 1):
+            selected, selection_diag = select_final_p2(evaluated, challenge_results, p2_config)
+            if selection_diag["target_gap"] == 0 and not any(
+                selection_diag["soft_min_deficit_by_primary"].values()
+            ):
+                break
+            total_rates, type_rates = source_yield_rates(
+                sampled_metadata,
+                challenge_results,
+                default_yield=supplement.default_yield,
+                type_default_yield=supplement.type_default_yield,
+                prior_strength=supplement.prior_strength,
+                minimum_yield=supplement.minimum_yield,
+            )
+            if wave == 0:
+                budget = math.ceil(
+                    p2_config.target_n / supplement.default_yield * supplement.safety_factor
+                )
+                weights = dict(p2_config.candidate_source_shares)
+            else:
+                budget = _p2_wave_budget(
+                    selection_diag, total_rates, type_rates, supplement.safety_factor
+                )
+                weights = _p2_routing_weights(
+                    selection_diag, total_rates, type_rates, supplement.exploration_share
+                )
+            used = 0
+            requested_total = 0
+            batch_id = 0
+            batch_summaries: list[JsonObject] = []
+            wave_exhausted = False
+            while used < budget:
+                selected, selection_diag = select_final_p2(evaluated, challenge_results, p2_config)
+                if selection_diag["target_gap"] == 0 and not any(
+                    selection_diag["soft_min_deficit_by_primary"].values()
+                ):
+                    break
+                if wave > 0:
+                    total_rates, type_rates = source_yield_rates(
+                        sampled_metadata,
+                        challenge_results,
+                        default_yield=supplement.default_yield,
+                        type_default_yield=supplement.type_default_yield,
+                        prior_strength=supplement.prior_strength,
+                        minimum_yield=supplement.minimum_yield,
+                    )
+                    weights = _p2_routing_weights(
+                        selection_diag, total_rates, type_rates, supplement.exploration_share
+                    )
+                request_n = min(p2_config.batch_size, budget - used)
+                if initial_capacity_pending and not processed:
+                    current_capacities = dict(source_capacity)
+                    initial_capacity_pending = False
+                else:
+                    current_capacities = sampler.capacities(processed)
+                requested = allocate_by_weights(
+                    request_n, weights, capacities=current_capacities
+                )
+                if not any(requested.values()):
+                    wave_exhausted = True
+                    break
+                batch_id += 1
+                plan_name = f"p2_wave_{wave}_batch_{batch_id}_plan"
+                result_name = f"p2_wave_{wave}_batch_{batch_id}_result"
+                plan = checkpoints.load(plan_name)
+                if plan is None:
+                    draw = sampler.draw(requested, processed)
+                    raw = _materialize(index, source_path, taxonomy, draw.locators, materialized)
+                    new_candidates = _deduplicate(
+                        "P2", raw, evaluated, threshold=p2_config.dedup_threshold
+                    )
+                    new_ids = {str(item["source_identity_sha256"]) for item in new_candidates}
+                    plan = {
+                        "wave": wave,
+                        "batch": batch_id,
+                        "requested_by_source": requested,
+                        "available_by_source": dict(draw.available_by_source),
+                        "sampled_identities": [item["source_identity_sha256"] for item in draw.locators],
+                        "sampled_metadata": dict(draw.metadata),
+                        "candidates": new_candidates,
+                        "metadata": {
+                            identity: value for identity, value in draw.metadata.items()
+                            if identity in new_ids
+                        },
+                    }
+                    checkpoints.save(plan_name, plan)
+                elif plan["requested_by_source"] != requested:
+                    raise ValueError(f"P2 第 {wave} 轮第 {batch_id} 批计划与续跑状态不一致")
+
+                sampled_ids = {str(value) for value in plan["sampled_identities"]}
+                processed.update(sampled_ids)
+                new_candidates = list(plan["candidates"])
+                new_sampled_metadata = {
+                    str(key): dict(value)
+                    for key, value in plan["sampled_metadata"].items()
+                }
+                new_metadata = {str(key): dict(value) for key, value in plan["metadata"].items()}
+                _merge_candidate_tasks(
+                    branch_root / "candidate_tasks.jsonl",
+                    [
+                        {
+                            **_candidate_task(candidate, "P2", wave),
+                            **new_metadata[candidate["source_identity_sha256"]],
+                        }
+                        for candidate in new_candidates
+                    ],
+                )
+                result = checkpoints.load(result_name)
+                if result is None:
+                    batch_stage1 = quality_runner.run_stage1(new_candidates) if new_candidates else {}
+                    stage1_passed = _passing(new_candidates, batch_stage1) if new_candidates else []
+                    batch_challenge = (
+                        quality_runner.run_challenge(stage1_passed) if stage1_passed else {}
+                    )
+                    result = {
+                        "stage1_results": batch_stage1,
+                        "challenge_results": batch_challenge,
+                    }
+                    checkpoints.save(result_name, result)
+                batch_stage1 = {str(key): dict(value) for key, value in result["stage1_results"].items()}
+                batch_challenge = {str(key): dict(value) for key, value in result["challenge_results"].items()}
+                stage1_results.update(batch_stage1)
+                challenge_results.update(batch_challenge)
+                sampled_metadata.update(new_sampled_metadata)
+                metadata.update(new_metadata)
+                evaluated.extend(new_candidates)
+                evaluation_rounds.update({
+                    str(candidate["source_identity_sha256"]): wave for candidate in new_candidates
+                })
+                stage1_passed = _passing(new_candidates, batch_stage1) if new_candidates else []
+                challenge_passed = sum(
+                    challenge_passes(batch_challenge[item["source_identity_sha256"]])
+                    for item in stage1_passed
+                )
+                sampled_by_source = Counter(
+                    str(value["sampled_from"]) for value in new_sampled_metadata.values()
+                )
+                after_dedup_by_source = Counter(
+                    str(value["sampled_from"]) for value in new_metadata.values()
+                )
+                stage1_by_source = Counter(
+                    new_metadata[item["source_identity_sha256"]]["sampled_from"]
+                    for item in stage1_passed
+                )
+                challenge_by_source = Counter(
+                    new_metadata[item["source_identity_sha256"]]["sampled_from"]
+                    for item in stage1_passed
+                    if challenge_passes(batch_challenge[item["source_identity_sha256"]])
+                )
+                primary_by_source: dict[str, Counter[str]] = {
+                    source: Counter() for source in P2_SOURCE_NAMES
+                }
+                for item in stage1_passed:
+                    identity = item["source_identity_sha256"]
+                    result_value = batch_challenge[identity]
+                    if challenge_passes(result_value):
+                        primary_by_source[new_metadata[identity]["sampled_from"]][
+                            result_value["primary_challenge"]
+                        ] += 1
+                batch_summaries.append({
+                    "batch": batch_id,
+                    "requested": sum(requested.values()),
+                    "requested_by_source": requested,
+                    "sampled": len(sampled_ids),
+                    "sampled_by_source": dict(sampled_by_source),
+                    "after_dedup": len(new_candidates),
+                    "after_dedup_by_source": dict(after_dedup_by_source),
+                    "stage1_pass": len(stage1_passed),
+                    "stage1_pass_by_source": dict(stage1_by_source),
+                    "judge_pass": challenge_passed,
+                    "judge_pass_by_source": dict(challenge_by_source),
+                    "total_yield": 0.0 if not sampled_ids else challenge_passed / len(sampled_ids),
+                    "source_yield": {
+                        source: (
+                            0.0 if sampled_by_source[source] == 0
+                            else challenge_by_source[source] / sampled_by_source[source]
+                        ) for source in P2_SOURCE_NAMES
+                    },
+                    "source_primary_yield": {
+                        source: {
+                            challenge_type: (
+                                0.0 if sampled_by_source[source] == 0
+                                else primary_by_source[source][challenge_type] / sampled_by_source[source]
+                            )
+                            for challenge_type in CHALLENGE_TYPES
+                        }
+                        for source in P2_SOURCE_NAMES
+                    },
+                })
+                logger.info(
+                    "P2 wave=%d batch=%d requested=%d evaluated=%d stage1_pass=%d judge_pass=%d final=%d",
+                    wave,
+                    batch_id,
+                    sum(requested.values()),
+                    len(new_candidates),
+                    len(stage1_passed),
+                    challenge_passed,
+                    len(select_final_p2(evaluated, challenge_results, p2_config)[0]),
+                )
+                requested_total += sum(requested.values())
+                # Overlapping source pools can make a requested slot unavailable
+                # after an earlier source claims the same identity.  Count actual
+                # draws against the wave budget so the next batch can refill it.
+                used += len(sampled_ids)
+                if not sampled_ids:
+                    wave_exhausted = True
+                    break
+            selected, selection_diag = select_final_p2(evaluated, challenge_results, p2_config)
+            target_met = selection_diag["target_gap"] == 0 and not any(
+                selection_diag["soft_min_deficit_by_primary"].values()
+            )
+            rounds.append({
+                "round": wave,
+                "planned_requests": budget,
+                "used_requests": requested_total,
+                "actual_sampled": used,
+                "batches": batch_summaries,
+                "final_count_after_round": len(selected),
+                "target_gap_after_round": selection_diag["target_gap"],
+                "type_deficits_after_round": selection_diag["soft_min_deficit_by_primary"],
+                "stop": (
+                    "target_and_soft_mins_met" if target_met else
+                    "candidate_exhausted" if wave_exhausted else
+                    "round_requests_used"
+                ),
+            })
+            logger.info(
+                "P2 wave=%d complete batches=%d final=%d target_gap=%d",
+                wave,
+                len(batch_summaries),
+                len(selected),
+                selection_diag["target_gap"],
+            )
+            if wave_exhausted:
+                exhausted = True
+                break
+        source_remaining = sampler.capacities(processed)
+        exhausted = exhausted or not any(source_remaining.values())
+
+    selected, selection_diag = select_final_p2(evaluated, challenge_results, p2_config)
+    selection_rounds = {
+        str(candidate["source_identity_sha256"]): evaluation_rounds[str(candidate["source_identity_sha256"])]
+        for candidate in selected
+    }
+    if selection_diag["target_gap"] == 0 and not any(selection_diag["soft_min_deficit_by_primary"].values()):
+        stop_reason = "target_and_soft_mins_met"
+    elif exhausted:
+        stop_reason = "candidate_exhausted"
+    else:
+        stop_reason = "max_rounds"
+
+    source_funnel: dict[str, JsonObject] = {}
+    final_ids = {str(item["source_identity_sha256"]) for item in selected}
+    for source in P2_SOURCE_NAMES:
+        sampled_source_ids = {
+            identity
+            for identity, value in sampled_metadata.items()
+            if value["sampled_from"] == source
+        }
+        source_ids = {identity for identity, value in metadata.items() if value["sampled_from"] == source}
+        stage1_ids = {identity for identity in source_ids if stage1_passes(stage1_results[identity])}
+        judge_ids = {
+            identity for identity in stage1_ids
+            if identity in challenge_results and challenge_passes(challenge_results[identity])
+        }
+        source_funnel[source] = {
+            "candidate_capacity": source_capacity[source],
+            "requested": sum(
+                int(batch["requested_by_source"].get(source, 0))
+                for value in rounds for batch in value["batches"]
+            ),
+            "actual_sampled": len(sampled_source_ids),
+            "after_dedup": len(source_ids),
+            "stage1_pass": len(stage1_ids),
+            "judge_pass": len(judge_ids),
+            "final": len(source_ids & final_ids),
+        }
+    primary_counts = Counter(
+        str(challenge_results[identity]["primary_challenge"])
+        for identity in final_ids
+    )
+    combinations = Counter(
+        "+".join(challenge_results[identity]["challenge_types"])
+        for identity in final_ids
+    )
+    diagnostic = {
+        "algorithm": P2_ALGORITHM,
+        "rounds": rounds,
+        "source_funnel": source_funnel,
+        "candidate_remaining_by_source": source_remaining,
+        "selection": selection_diag,
+        "final_by_primary": {key: primary_counts[key] for key in CHALLENGE_TYPES},
+        "final_share_by_primary": {
+            key: (0.0 if not selected else round(primary_counts[key] / len(selected), 6))
+            for key in CHALLENGE_TYPES
+        },
+        "challenge_type_combinations": dict(sorted(combinations.items(), key=lambda item: (-item[1], item[0]))),
+        "stop_reason": stop_reason,
+        "evaluated": len(evaluated),
+        "stage1_pass": sum(stage1_passes(value) for value in stage1_results.values()),
+        "judge_pass": sum(challenge_passes(value) for value in challenge_results.values()),
+        "final": len(selected),
+        "target": p2_config.target_n,
+        "soft_min_per_type": p2_config.soft_min_per_type,
+        "max_per_primary": p2_config.max_per_primary,
+        "target_gap": selection_diag["target_gap"],
+        "candidate_exhausted": exhausted,
+    }
+    result: JsonObject = {
+        "selected": selected,
+        "evaluated_candidates": evaluated,
+        "stage1_results": stage1_results,
+        "challenge_results": challenge_results,
+        "metadata": metadata,
+        "evaluation_rounds": evaluation_rounds,
+        "selection_rounds": selection_rounds,
+        "diagnostics": diagnostic,
+    }
+    quality_root = getattr(quality_runner, "run_root", None)
+    if isinstance(quality_root, Path):
+        for filename in ("challenge_tasks.jsonl", "challenge_results.jsonl", "challenge_attempts.jsonl"):
+            path = quality_root / filename
+            if not path.exists():
+                path.write_text("", encoding="utf-8", newline="\n")
+    write_json(branch_root / "adaptive_summary.json", diagnostic)
+    checkpoints.save("p2_adaptive_complete", result)
+    logger.info(
+        "P2 adaptive complete final=%d target_gap=%d stop=%s",
+        len(selected), selection_diag["target_gap"], stop_reason,
+    )
+    return result
+
+
 def run_build(
     index: CanonicalIndexHandle,
     config: BuildConfig,
@@ -356,6 +834,7 @@ def run_build(
     run_contract: JsonObject = {
         "config_version": config.config_version,
         "p1_supplement_algorithm": "adaptive_cluster_batches_1",
+        "p2_supplement_algorithm": P2_ALGORITHM,
         "config": asdict(config),
         "source_snapshot_id": index.metadata.get("source_snapshot_id"),
         "taxonomy_sha256": index.metadata.get("taxonomy_sha256"),
@@ -434,6 +913,7 @@ def run_build(
             mark_branch(name, "completed", restored=True)
         for stage in (
             "quality_stage1_initial", "quality_stage1", "p1_supplement",
+            "p2_supplement", "quality_p2_challenge",
             "final_membership", "quality_stage2", "screened_export", "legacy_export",
             "batch_report",
         ):
@@ -450,7 +930,7 @@ def run_build(
         }
         branch_states: dict[str, JsonObject] = {}
         missing: list[str] = []
-        for set_name in ("P0", "P1", "P2"):
+        for set_name in ("P0", "P1"):
             state = load_stage_checkpoint(
                 f"initial_{set_name.lower()}", f"sampling_{set_name.lower()}"
             )
@@ -525,8 +1005,9 @@ def run_build(
                     )
 
         candidate_sets = {
-            name: list(branch_states[name]["candidates"])
-            for name in ("P0", "P1", "P2")
+            "P0": list(branch_states["P0"]["candidates"]),
+            "P1": list(branch_states["P1"]["candidates"]),
+            "P2": [],
         }
         for set_name, candidates in candidate_sets.items():
             branch_root = run_root / set_name
@@ -571,14 +1052,15 @@ def run_build(
             active_logger.info("resume checkpoint=stage1_initial results=%d", len(stage1))
 
         accepted = {
-            name: _passing(candidate_sets[name], stage1)
-            for name in ("P0", "P1", "P2")
+            "P0": _passing(candidate_sets["P0"], stage1),
+            "P1": _passing(candidate_sets["P1"], stage1),
+            "P2": [],
         }
         selection_rounds: dict[str, dict[str, int]] = {
             name: {candidate["source_identity_sha256"]: 0 for candidate in values}
             for name, values in accepted.items()
         }
-        audits = {
+        audits: dict[str, JsonObject] = {
             name: _branch_audit(
                 name,
                 int(branch_states[name]["sampled_count"]),
@@ -586,7 +1068,7 @@ def run_build(
                 candidate_sets[name],
                 stage1,
             )
-            for name in ("P0", "P1", "P2")
+            for name in ("P0", "P1")
         }
 
         quota_checkpoint = checkpoints.load("p1_quotas")
@@ -935,6 +1417,45 @@ def run_build(
             if round_stop == "candidate_exhausted":
                 break
 
+        mark("p2_supplement", "running")
+        mark("quality_p2_challenge", "running")
+        p2_started = time.monotonic()
+        p2_state = _run_adaptive_p2(
+            index,
+            config,
+            source_path=source_path,
+            taxonomy=taxonomy,
+            run_root=run_root,
+            quality_runner=quality_runner,
+            checkpoints=checkpoints,
+            materialized=materialized,
+            logger=active_logger,
+        )
+        accepted["P2"] = list(p2_state["selected"])
+        evaluated_candidates["P2"] = list(p2_state["evaluated_candidates"])
+        evaluation_rounds["P2"] = dict(p2_state["evaluation_rounds"])
+        selection_rounds["P2"] = dict(p2_state["selection_rounds"])
+        stage1.update(p2_state["stage1_results"])
+        audits["P2"] = _branch_audit(
+            "P2",
+            sum(batch["sampled"] for value in p2_state["diagnostics"]["rounds"] for batch in value["batches"]),
+            len(evaluated_candidates["P2"]),
+            evaluated_candidates["P2"],
+            stage1,
+        )
+        p2_elapsed = time.monotonic() - p2_started
+        mark(
+            "p2_supplement", "completed",
+            rounds=max(0, len(p2_state["diagnostics"]["rounds"]) - 1),
+            duration_ms=round(p2_elapsed * 1000),
+        )
+        mark(
+            "quality_p2_challenge", "completed",
+            results=len(p2_state["challenge_results"]),
+        )
+        mark("sampling_p2", "completed", sampled=p2_state["diagnostics"]["evaluated"])
+        mark_branch("P2", "sampled", after_dedup=p2_state["diagnostics"]["evaluated"])
+
         final_state = {
             "sets": {name: accepted[name] for name in ("P0", "P1", "P2")},
             "stage1_results": stage1,
@@ -951,6 +1472,9 @@ def run_build(
             },
             "initial_p1_stage1_pass_count": initial_p1_stage1_pass_count,
             "initial_p1_admitted_count": initial_p1_admitted_count,
+            "challenge_results": p2_state["challenge_results"],
+            "p2_metadata": p2_state["metadata"],
+            "p2_diagnostics": p2_state["diagnostics"],
         }
         checkpoints.save("final_membership", final_state)
         mark("quality_stage1", "completed", results=len(stage1))
@@ -979,6 +1503,8 @@ def run_build(
                 validate_canonical_candidate(candidate)
         mark("quality_stage1", "completed", restored=True)
         mark("p1_supplement", "completed", restored=True)
+        mark("p2_supplement", "completed", restored=True)
+        mark("quality_p2_challenge", "completed", restored=True)
         mark("final_membership", "completed", restored=True)
         for name in ("P0", "P1", "P2"):
             mark(f"sampling_{name.lower()}", "completed", restored=True)
@@ -1008,17 +1534,30 @@ def run_build(
     }
     initial_p1_stage1_pass_count = int(final_state["initial_p1_stage1_pass_count"])
     initial_p1_admitted_count = int(final_state["initial_p1_admitted_count"])
+    challenge_results = {
+        str(key): dict(value) for key, value in final_state["challenge_results"].items()
+    }
+    p2_metadata = {
+        str(key): dict(value) for key, value in final_state["p2_metadata"].items()
+    }
+    p2_diagnostics = dict(final_state["p2_diagnostics"])
     for name in ("P0", "P1", "P2"):
         branch_root = run_root / name
         branch_root.mkdir(parents=True, exist_ok=True)
         _merge_candidate_tasks(
             branch_root / "candidate_tasks.jsonl",
             [
-                _candidate_task(
-                    candidate,
-                    name,
-                    evaluation_rounds[name][candidate["source_identity_sha256"]],
-                )
+                {
+                    **_candidate_task(
+                        candidate,
+                        name,
+                        evaluation_rounds[name][candidate["source_identity_sha256"]],
+                    ),
+                    **(
+                        p2_metadata[candidate["source_identity_sha256"]]
+                        if name == "P2" else {}
+                    ),
+                }
                 for candidate in evaluated_candidates[name]
             ],
         )
@@ -1060,6 +1599,14 @@ def run_build(
                 candidate,
                 stage1[candidate["source_identity_sha256"]],
                 stage2[candidate["source_identity_sha256"]],
+                challenge_result=(
+                    challenge_results[candidate["source_identity_sha256"]]
+                    if set_name == "P2" else None
+                ),
+                challenge_task_id=(
+                    _quality_task_id(quality_runner, "challenge", candidate)
+                    if set_name == "P2" else None
+                ),
                 origin=(
                     "initial_wave"
                     if selection_rounds[set_name][candidate["source_identity_sha256"]] == 0
@@ -1232,6 +1779,7 @@ def run_build(
             for name in ("P0", "P1", "P2")
         },
         "p1_supplement": supplement_summary,
+        "p2_adaptive": p2_diagnostics,
         "cross_set_overlap": overlap,
     }
     supplement_sampled = sum(int(item.get("sampled", 0)) for item in supplement_rounds)
@@ -1255,16 +1803,42 @@ def run_build(
             "unallocated_target": unallocated_target,
         }
     )
-    for name in ("P0", "P2"):
-        audits[name].update(
-            {
-                "supplement_sampled": 0,
-                "supplement_after_dedup": 0,
-                "supplement_stage1_pass": 0,
-                "supplement_admitted": 0,
-                "final": len(output[name]),
-            }
-        )
+    audits["P0"].update(
+        {
+            "supplement_sampled": 0,
+            "supplement_after_dedup": 0,
+            "supplement_stage1_pass": 0,
+            "supplement_admitted": 0,
+            "final": len(output["P0"]),
+        }
+    )
+    audits["P2"].update(
+        {
+            "supplement_sampled": sum(
+                batch["sampled"]
+                for value in p2_diagnostics["rounds"][1:]
+                for batch in value["batches"]
+            ),
+            "supplement_after_dedup": sum(
+                batch["after_dedup"]
+                for value in p2_diagnostics["rounds"][1:]
+                for batch in value["batches"]
+            ),
+            "supplement_stage1_pass": sum(
+                batch["stage1_pass"]
+                for value in p2_diagnostics["rounds"][1:]
+                for batch in value["batches"]
+            ),
+            "supplement_admitted": sum(
+                batch["judge_pass"]
+                for value in p2_diagnostics["rounds"][1:]
+                for batch in value["batches"]
+            ),
+            "judge_pass": p2_diagnostics["judge_pass"],
+            "judge_pass_not_admitted": p2_diagnostics["selection"]["judge_pass_not_selected"],
+            "final": len(output["P2"]),
+        }
+    )
     for name in ("P0", "P1", "P2"):
         write_json(run_root / name / "branch_audit.json", audits[name])
         summary["sets"][name].update(audits[name])

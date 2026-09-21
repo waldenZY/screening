@@ -475,4 +475,4 @@ prepare-only
 5. P1 正式文件已统一为该周 P1 labeled Schema；cluster 原生字段需从 supplement 和 provenance 回读。
 6. 首次 50GB+ 索引耗时不可消除；上线前应通过真实数据的准备模式测量吞吐、索引大小和磁盘峰值。
 
-历史方案请参见 [数据筛选链路实现技术方案 v0](screening_pipeline_technical_design_v0.md)。
+历史方案请参见 [数据筛选链路实现技术方案 v0](../../v0/docs/screening_pipeline_technical_design_v0.md)。
