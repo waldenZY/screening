@@ -2,22 +2,23 @@
 
 > 文档状态：当前实现基线（含 P1 逐批补采与 P2 Adaptive）
 > 适用入口：`python -m screening.run_pipeline`
-> 更新日期：2026-09-21
+> 更新日期：2026-10-09
 
 P2 的独立算法说明见 [P2 Adaptive 技术方案](screening_v3_p2_adaptive.md)；尚未实施的
-P0 后续方案见 [P0 Adaptive 讨论稿](screening_v3_p0_adaptive_proposal.md)。
+P0 后续方案见 [P0 Adaptive 讨论稿](../archive/v3_drafts/screening_v3_p0_adaptive_proposal.md)，
+该讨论稿未实施。
 
 ## 1. 目标与边界
 
-Screening v3 从统一的 cluster JSONL 和 taxonomy JSON 出发，独立构建 P0、P1、P2
+Screening v3 从统一的 cluster JSONL、taxonomy JSON 和必填风险关键词 Excel 出发，独立构建 P0、P1、P2
 三套数据。系统先建立可恢复的 canonical 索引，再按三个集合各自的规则选择候选，
 经过 Stage1、P2 Challenge Judge 和 Stage2，形成内部权威的 screened canonical，最后映射为下游依赖的
-28 字段 labeled v4 文件。
+30 字段 labeled v5 文件。
 
 完整链路如下：
 
 ```text
-cluster JSONL + taxonomy JSON
+cluster JSONL + taxonomy JSON + 风险关键词 Excel
 → 流式扫描、校验和 canonical 索引
 → P0 / P1 初始采样；P2 四来源池自适应采样
 → 第一阶段：有效性、基础质量及类别检测
@@ -25,9 +26,10 @@ cluster JSONL + taxonomy JSON
 → P1 按冻结 L2 配额逐批补采，并依据 cluster 反馈调整份额
 → 仅 P2 的 Stage1 PASS 样本进入 Challenge Judge
 → P2 按总量、类型软下限和上限逐批补采与最终选择
-→ 第二阶段：难度及综合质量标签
+→ 第二阶段：难度、综合质量、意图及内部可评测性原因
 → screened canonical
-→ legacy labeled v4 确定性映射
+→ 风险词表、轮次、长度和集合内重复等规则映射 executable
+→ legacy labeled v5 确定性导出
 → JSON/Markdown 批跑报告
 → 全量一致性校验
 → 三文件事务发布
@@ -36,6 +38,7 @@ cluster JSONL + taxonomy JSON
 v3 的运行边界为：
 
 - cluster 是全部候选样本的唯一数据来源；taxonomy 是 L1/L2 的唯一类别来源。
+- 风险关键词 Excel 只参与下游 `executable` 标记，不改变采样、Stage1 准入或集合成员。
 - P0、P1、P2 是三条独立链路。一个源样本可以同时被多个集合选中。
 - 每个集合内部去重，不进行跨集合去重。
 - 第一阶段是三个集合统一的业务准入门槛。
@@ -56,7 +59,7 @@ v3 的运行边界为：
 ### 2.2 决策与标注分离
 
 第一阶段决定三个集合的基础质量准入，Challenge Judge 再决定 P2 的挑战资格和类型；
-第二阶段负责难度和综合质量描述。第二阶段的任意合法结果都不会淘汰成员。
+第二阶段负责难度、综合质量、意图和内部可评测性原因。第二阶段的任意合法结果都不会淘汰成员。
 
 ### 2.3 定位信息与正文分离
 
@@ -125,6 +128,13 @@ taxonomy 顶层必须包含非空 `categories` 数组。每个 L1 需要提供�
 
 P1 的 L2 配额使用 taxonomy 声明的 L2 population；cluster 实际观测数量用于容量
 限制、cluster 内配额和审计。P2 的 L2 配额使用通过其固定门槛后的实际候选数量。
+
+### 3.3 风险关键词 Excel
+
+`inputs.risk_keywords` 必填。工作簿须含 `Sheet1`，仅有 `关键词`、`风险级别` 两列，
+且至少有一条有效词条。加载时按固定前后缀和特殊映射提取核心词，同时保留原词；
+对 `target_query` 做子串匹配。命中任何级别都使 `executable=0`，记录仍保留。
+源文件哈希与词表、规则快照冻结在 run 中，续跑及发布时复验。
 
 ## 4. Canonical candidate 契约
 
@@ -208,7 +218,8 @@ feature_rule_version = 2
 5. 全部规范化轮次用 ` | ` 连接为 `full_text`。
 6. 一轮记为 `single_turn`，两轮及以上记为 `multi_turn`。
 
-仅从目标轮移除完整的多模态/ASR 标记：
+解析器仍保留以下历史输入标记的兼容清理规则，仅作用于目标轮。当前源数据为纯文本，
+Stage2 不接收额外的标记字段；附件依赖由 query 本身的语义判断。
 
 ```text
 [((多模态)输入)]
@@ -497,7 +508,7 @@ primary 选择“去除后最能降低样本难度”的类型；无法区分时
 `implicit_goal`、`boundary`、`long_tail_expr`。Challenge 类型不得放宽 Stage1 的
 exact、self-contained、clear、valid 准入条件。
 
-### 9.3 第二阶段：难度及综合质量
+### 9.3 第二阶段：难度、综合质量与下游语义标签
 
 第二阶段输入为相同五个原始字段，加第一阶段四个结果。输出严格限制为：
 
@@ -506,7 +517,9 @@ exact、self-contained、clear、valid 准入条件。
   "classification_difficulty": "trivial | easy | moderate | hard | not_applicable",
   "task_difficulty": "atomic | simple | moderate | complex | extreme | not_applicable",
   "issue_types": ["none"],
-  "overall_score": 5
+  "overall_score": 5,
+  "intent_label": "task | qa",
+  "execution_issues": []
 }
 ```
 
@@ -521,14 +534,24 @@ truncated
 nonsense
 emotional_only
 too_brief
+no_evaluable_goal
 multi_intent
 ```
 
-第二阶段保留自身四个输出字段之间的逻辑校验，包括：
+`intent_label` 依据完整会话的主要意图区分操作/服务任务和知识/信息/对话问答；
+无可评测目标时归 `qa`。`execution_issues` 允许 `no_evaluable_goal`、
+`attachment_dependency`、`unresolved_reference`、`other_unfit`，为空数组表示没有语义障碍。
+`issue_types` 描述 Stage2 独立质量复核，`execution_issues` 则供下游可评测性映射；
+两者有时指向同一现象，但不能互相替代。交付文件只保留 `quality_issue_types` 和
+映射后的 `executable`，内部原因留在 screened canonical 中审计。
+第二阶段保留自身字段之间的逻辑校验，包括：
 
 - `issue_types` 必须非空、不得重复，且 `none` 不能与其他问题并存；
 - `overall_score=5` 时必须且只能为 `issue_types=["none"]`；
 - 第一阶段满格通过但总分低于 5 时，必须给出具体 issue。
+- `execution_issues` 含 `no_evaluable_goal` 时，`intent_label=qa`、`overall_score=1`，
+  `issue_types` 须包含 `nonsense`、`emotional_only`、`too_brief` 或 `no_evaluable_goal` 中适用的一项；
+  质量问题 `no_evaluable_goal` 只能与同名执行原因一起出现。
 
 Stage2 可以在独立复核中标出 `category_mismatch`、`context_dependent`、`truncated`、
 `ambiguous_intent` 等与 Stage1 不一致的信号，也可以把 difficulty 标为
@@ -542,6 +565,7 @@ intent_ambiguous
 intent_nonsense
 intent_emotional_only
 intent_too_brief
+intent_no_evaluable_goal
 classification_not_applicable
 task_not_applicable
 ```
@@ -655,12 +679,12 @@ Judge 通过但未入集的样本按 `type_cap`、`total_limit` 或 `diversity` 
 
 ## 12. Screened canonical
 
-当前 `screened_schema_version=3`。下面以 P2 记录为例；P0/P1 的顶层
+当前 `screened_schema_version=4`。下面以 P2 记录为例；P0/P1 的顶层
 `challenge` 值为 `null`：
 
 ```json
 {
-  "screened_schema_version": 3,
+  "screened_schema_version": 4,
   "set": "P2",
   "candidate": {},
   "quality": {
@@ -671,16 +695,23 @@ Judge 通过但未入集的样本按 `type_cap`、`total_limit` 或 `diversity` 
     "classification_difficulty": "easy",
     "task_difficulty": "simple",
     "issue_types": ["none"],
-    "overall_score": 5
+    "overall_score": 5,
+    "intent_label": "task",
+    "execution_issues": []
   },
   "quality_consistency": {
     "is_consistent": true,
     "conflict_codes": []
   },
+  "delivery_labels": {
+    "intent_label": "task",
+    "executable": 1,
+    "execution_reasons": []
+  },
   "challenge": {
     "is_challenge": true,
-    "primary_challenge": "multi_turn_context",
-    "challenge_types": ["multi_turn_context", "ambiguity"],
+    "primary_challenge": "long_tail_expr",
+    "challenge_types": ["long_tail_expr", "ambiguity"],
     "challenge_task_id": "..."
   },
   "selection": {
@@ -696,7 +727,7 @@ Judge 通过但未入集的样本按 `type_cap`、`total_limit` 或 `diversity` 
 校验器要求：
 
 - candidate 重新通过 Block A 的完整 canonical 校验；
-- quality 恰好包含 Stage1 与 Stage2 的八个字段且各阶段内部逻辑成立；
+- quality 恰好包含 Stage1 与 Stage2 的十个字段且各阶段内部逻辑成立；
 - `quality_consistency` 必须与 Stage1/Stage2 重新计算出的分歧代码完全一致；
 - 每条记录必须通过统一第一阶段准入条件；
 - P2 的 `challenge` 必须包含合法且 `is_challenge=true` 的 Judge 结果及任务 ID；
@@ -709,16 +740,16 @@ Judge 通过但未入集的样本按 `type_cap`、`total_limit` 或 `diversity` 
 
 每个分支的 `screened.canonical.jsonl` 是 v3 的内部事实源，不复制到下游发布目录。
 
-## 13. Legacy labeled v4 导出
+## 13. Legacy labeled v5 导出
 
 Legacy exporter 不调用 LLM、不重新采样、不修改成员，只做确定性映射。当前版本：
 
 ```text
-legacy_schema = labeled_v4
-legacy_mapping_version = 1
+legacy_schema = labeled_v5
+legacy_mapping_version = 2
 ```
 
-### 13.1 28 字段顺序
+### 13.1 30 字段顺序
 
 P0/P1 的第 15 个字段为 `relevance_p0`，P2 为 `relevance_p2`；其他字段完全一致：
 
@@ -752,6 +783,8 @@ P0/P1 的第 15 个字段为 `relevance_p0`，P2 为 `relevance_p2`；其他字�
 | 26 | `quality_task_difficulty` | 第二阶段同名字段 |
 | 27 | `quality_issue_types` | 第二阶段同名字段 |
 | 28 | `quality_overall_score` | 第二阶段同名字段 |
+| 29 | `intent_label` | 第二阶段 `intent_label` |
+| 30 | `executable` | 风险词表、轮次、语义障碍、长度和集合内精确重复的并集标记 |
 
 `set` 的固定映射为：
 
@@ -763,10 +796,10 @@ P0/P1 的第 15 个字段为 `relevance_p0`，P2 为 `relevance_p2`；其他字�
 
 legacy 校验独立于映射函数，逐条验证字段名称、顺序、数量、类型、枚举、空值及与
 canonical 的对应关系。所有字段都必须存在且不能为 `null`；只有 `context_text`
-允许为空字符串。当前 labeled v4 要求 `cluster_id` 为整数，因此即使 canonical 和
+允许为空字符串。当前 labeled v5 要求 `cluster_id` 为整数，因此即使 canonical 和
 taxonomy 支持统一的字符串 cluster ID，字符串 ID 也会在 legacy 导出阶段明确失败。
 
-当前枚举可无损映射。未来新增 canonical 枚举而 labeled v4 无法表达时，导出必须
+当前枚举可无损映射。未来新增 canonical 枚举而 labeled v5 无法表达时，导出必须
 失败，不能静默降级、删除或写 `null`。
 
 ### 13.2 Provenance
@@ -792,9 +825,9 @@ provenance 用于发现 canonical 或 legacy 文件被修改，以及定位每�
 pipeline_version = 3
 manifest_schema_version = 3
 p012_build_config_version = 2
-quality_contract_version = 3
+quality_contract_version = 6
 checkpoint_schema_version = 1
-screened_schema_version = 3
+screened_schema_version = 4
 run_report_schema_version = 5
 ```
 
@@ -805,6 +838,7 @@ run contract 包含：
 
 - 源文件 SHA-256、stat 和 canonical cache ID；
 - taxonomy SHA-256；
+- 风险关键词 Excel 内容 SHA-256 及规范化规则 SHA-256；
 - canonical schema/index/feature rule 版本；
 - P012 构建配置及版本；
 - P2 算法标识 `adaptive_challenge_batches_1`；
@@ -812,8 +846,8 @@ run contract 包含：
 - 三个 Prompt SHA-256；
 - 模型及公开推理参数；
 - screened canonical schema 版本；
-- legacy schema 和 mapping 版本。
-- run report schema 版本。
+- legacy schema 和 mapping 版本；
+- run report schema 版本；
 - quality contract 与阶段检查点 schema 版本。
 
 以上 contract 的稳定哈希形成 `config_id`。run 目录为：
@@ -876,9 +910,8 @@ P1/P2 补采都可恢复到小批；不在单个小批内部建立检查点。�
 完整 V2 代码由 Git `v2` 分支和提交 `b894753` 固定，文档、配置和 Prompt 快照见
 [V2 归档](../archive/v2/README.md)。
 
-对于升级部署时尚未完成、只被跨阶段分歧阻塞的历史 run，兼容性热修仅替换
-`quality/two_stage.py`，保持原 Prompt、manifest 和 run identity，即可复用原 LLM
-缓存完成该 run。历史 run 完成后再部署完整状态机；不能直接用完整新版恢复旧 run。
+当前 `quality_contract_version=6`。旧质量契约 run 不能按当前 Stage2 规则续跑或发布，
+需要按新契约重新运行。
 
 ## 15. 运行产物
 
@@ -932,7 +965,7 @@ P1/P2 补采都可恢复到小批；不在单个小批内部建立检查点。�
 - `candidate_tasks.jsonl`：初始或补采候选任务；
 - `branch_audit.json`：采样、去重、通过、准入和缺口统计；P1 初采另记录配额截断；
 - `screened.canonical.jsonl`：内部权威成品；
-- 对应的 `*_labeled.jsonl`：28 字段兼容视图；
+- 对应的 `*_labeled.jsonl`：30 字段兼容视图；
 - `export_provenance.jsonl`：逐条哈希和任务来源；
 - `legacy_export_report.json`：分支导出校验报告。
 
@@ -985,14 +1018,14 @@ P1 另外报告冻结配额 L2 覆盖率、配额完成率、最终分布与目�
 下游只接收以下三个文件：
 
 ```text
-P0-冒烟集/P0_smoke_set_v4_labeled.jsonl
-P1-基准集/P1_benchmark_set_v4_labeled.jsonl
-P2-对抗集/P2_adversarial_set_v4_labeled.jsonl
+P0-冒烟集/P0_smoke_set_v5_labeled.jsonl
+P1-基准集/P1_benchmark_set_v5_labeled.jsonl
+P2-对抗集/P2_adversarial_set_v5_labeled.jsonl
 ```
 
 发布前必须满足：
 
-- canonical index、源文件、taxonomy 和冻结 Prompt 未变化；
+- canonical index、源文件、taxonomy、风险词表快照和冻结 Prompt 未变化；
 - canonical 索引的快速指纹、Schema 与元数据校验通过；首次升级、索引恢复或指纹
   异常时还必须通过完整 SQLite 检查；
 - 第一阶段不存在未完成任务；
@@ -1004,13 +1037,15 @@ P2-对抗集/P2_adversarial_set_v4_labeled.jsonl
 - P2 总量、单类上限、类型缺口、未入集原因和候选耗尽统计守恒；
 - 批跑报告与候选任务、Stage1 结果、最终 L2 分布和 Markdown 渲染一致；
 - legacy schema、字段顺序、逐条映射和枚举校验通过；
+- Stage2 意图与内部执行原因、风险词表快照、集合内重复判定及两项交付标签复验通过；
 - provenance 中的 source/canonical/legacy 哈希与实际文件一致；
 - manifest 的产物路径、哈希和行数与磁盘一致。
 
 P1 或 P2 的业务数量缺口本身不阻止发布；任何 LLM 工程失败、契约不完整、文件被
 修改或账本不一致都会阻止发布。
 
-发布必须显式提供 `--publish-root`。三个文件按一个事务处理：
+发布必须在配置中启用 `publication.enabled` 并填写 `publication.publish_root`，
+或通过 CLI 提供 `--publish-root`。三个文件按一个事务处理：
 
 1. 目标文件与运行产物字节完全相同时，视为幂等成功。
 2. 任一同名文件内容不同，默认拒绝整组发布。
@@ -1039,6 +1074,7 @@ CLI 可临时覆盖配置，例如构建并发布：
 python -m screening.run_pipeline `
   --source D:/data/cluster.jsonl `
   --taxonomy D:/data/taxonomy.json `
+  --risk-keywords D:/data/risk_keywords.xlsx `
   --output-root D:/data/screening-runs `
   --publish-root D:/data/delivery
 ```
@@ -1049,6 +1085,7 @@ python -m screening.run_pipeline `
 | --- | --- |
 | `--source` | 覆盖配置中的 cluster JSONL |
 | `--taxonomy` | 覆盖配置中的 taxonomy JSON |
+| `--risk-keywords` | 覆盖必填的风险关键词 Excel |
 | `--output-root` | 覆盖索引和 run 工作区 |
 | `--config` | 选择完整运行配置 |
 | `--stage1-prompt` / `--challenge-prompt` / `--stage2-prompt` | 三个质量阶段的 Prompt |
@@ -1072,6 +1109,7 @@ python -m screening.run_pipeline `
 
 ```text
 artifacts/prompts/quality_stage1.md
+artifacts/prompts/quality_challenge.md
 artifacts/prompts/quality_stage2.md
 ```
 
@@ -1083,100 +1121,13 @@ artifacts/prompts/quality_stage2.md
 | `1` | 配置、输入、契约、构建验证或发布错误 |
 | `2` | 存在可恢复的 LLM 工程失败 |
 
-## 18. 默认完整运行配置
+## 18. 默认运行配置
 
-```json
-{
-  "config_version": 3,
-  "inputs": {
-    "source": "",
-    "taxonomy": ""
-  },
-  "outputs": {
-    "output_root": "../../outputs_v3"
-  },
-  "prompts": {
-    "stage1": "../prompts/quality_stage1.md",
-    "challenge": "../prompts/quality_challenge.md",
-    "stage2": "../prompts/quality_stage2.md"
-  },
-  "quality": {
-    "workers": 8,
-    "max_retries": 10,
-    "sleep_seconds": 1.0
-  },
-  "index": {
-    "cache_root": null,
-    "batch_size": 50000,
-    "progress_every": 100000,
-    "sqlite_cache_mb": 1024,
-    "min_free_space_gb": 10.0,
-    "reserve_free_space_gb": 8.0,
-    "verify_full_source_hash": false
-  },
-  "logging": {
-    "level": "INFO"
-  },
-  "publication": {
-    "enabled": false,
-    "publish_root": null
-  },
-  "sampling": {
-    "p0": {
-      "l1_big_threshold": 3000,
-      "l2_per_l1_big": 3,
-      "l2_per_l1_small": 2,
-      "max_per_cluster": 5,
-      "fallback_pool_size": 10,
-      "mmr_lambda": 0.7,
-      "dedup_threshold": 0.7
-    },
-    "p1": {
-      "target_n": 10000,
-      "probability_weights": {"high": 3, "mid": 2, "boundary": 1},
-      "frequency_weights": {"hot": 2, "warm": 2, "cold": 1},
-      "cold_boundary_floor": 1,
-      "mmr_lambda": 0.7,
-      "dedup_threshold": 0.75
-    },
-    "p2": {
-      "target_n": 2000,
-      "candidate_source_shares": {
-        "complex": 0.3,
-        "multi_turn": 0.3,
-        "boundary": 0.2,
-        "exploration": 0.2
-      },
-      "minimum_complexity": "moderate",
-      "boundary_probability_cap": 0.5,
-      "soft_min_per_type": 100,
-      "max_per_primary": 700,
-      "batch_size": 2000,
-      "dedup_threshold": 0.75
-    }
-  },
-  "p1_supplement": {
-    "max_rounds": 3,
-    "default_pass_rate": 0.55,
-    "pass_rate_prior_strength": 10.0,
-    "minimum_pass_rate": 0.1,
-    "maximum_pass_rate": 0.95,
-    "safety_factor": 1.1
-  },
-  "p2_supplement": {
-    "max_rounds": 3,
-    "default_yield": 0.1,
-    "type_default_yield": 0.0125,
-    "prior_strength": 10.0,
-    "minimum_yield": 0.005,
-    "safety_factor": 1.1,
-    "exploration_share": 0.2
-  }
-}
-```
+当前完整模板以 [pipeline.default.json](../config/pipeline.default.json) 为准。它是配置字段及默认值的唯一维护位置；
+逐字段说明和使用示例见 [配置使用手册](screening_pipeline_configuration_v3.md)。
 
-`inputs.source` 与 `inputs.taxonomy` 允许在模板中暂时留空，但执行前必须由配置或 CLI
-提供。LLM 地址、密钥、模型及请求参数继续存放在不提交 Git 的
+模板中的 `inputs.source`、`inputs.taxonomy` 和 `inputs.risk_keywords` 可暂时留空，
+但运行前均须通过配置或 CLI 提供。LLM 地址、密钥、模型和请求参数放在不提交 Git 的
 `artifacts/config/llm_config.local.json`。
 
 业务采样、质量运行参数、Prompt、模型或输入变化会改变 run identity，不能继续使用
@@ -1196,25 +1147,30 @@ artifacts/prompts/quality_stage2.md
 | `pipeline/checkpoints.py` | 原子阶段检查点、contract 与内容哈希验证 | `CheckpointStore` |
 | `pipeline/config.py` | 完整配置 Schema、相对路径和 CLI 覆盖 | `load_pipeline_config()`、`apply_pipeline_overrides()` |
 | `delivery/screened.py` | 最终 canonical 构建与校验 | `build_screened_canonical_record()`、`validate_screened_canonical_records()` |
-| `delivery/legacy.py` | 28 字段映射、复验和 provenance | `map_screened_to_legacy()`、`validate_legacy_record()`、`export_legacy_branch()` |
+| `delivery/legacy.py` | 30 字段映射、复验和 provenance | `map_screened_to_legacy()`、`validate_legacy_record()`、`export_legacy_branch()` |
+| `delivery/eligibility.py` | 下游可评测性原因与确定性标签映射 | `delivery_labels()` |
+| `shared/risk_keywords.py` | 风险词表加载、规则冻结与命中判定 | `load_risk_keywords()`、`validate_risk_snapshot()` |
 | `delivery/report.py` | 语义树、标签一致率和批跑汇报 | `build_run_report()`、`write_run_report()`、`validate_run_report()` |
 | `pipeline/run_context.py` | run identity、manifest、恢复和计时 | `prepare_run_context()`、`update_manifest()` |
 | `delivery/publish.py` | 产物复验和事务发布 | `collect_and_validate_artifacts()`、`publish_labeled()` |
 | `pipeline/cli.py` | v3 总入口和退出码 | `execute_pipeline()`、`main()` |
 
-默认入口只读取 cluster 和 taxonomy，不读取 labeled 数据作为候选输入，也不使用
+默认入口读取 cluster、taxonomy 和风险关键词 Excel，不读取 labeled 数据作为候选输入，也不使用
 动态补 `null` 的 schema 对齐方式。
 
 ## 20. 测试与验收要求
 
-自动化测试使用 `moto` Python 环境。当前仓库中的测试覆盖：
+自动化测试使用 `moto` Python 环境，文件位于 `project_1/tests/`（`screening/` 的同级目录）。
+相关测试覆盖：
 
 - P1 cluster 反馈份额、分批补采、中断恢复和报告数量守恒；
 - Challenge 输出字段、枚举、顺序、空值、失败重试及缓存复用；
 - P2 四来源边界、重叠去重、份额回填和确定性；
 - 八类软下限、单类上限、稀缺类型替换和不足交付；
 - 模拟 LLM 的三阶段端到端构建、P2 Challenge 准入、Stage2 最终成员限定、恢复及
-  发布前完整复验。
+  发布前完整复验；
+- Stage2 意图与执行原因、风险关键词规则、集合内重复、30 字段 v5 映射、旧契约续跑
+  拒绝及篡改产物阻止发布。
 
 发布校验还会在每次真实运行中复验 canonical、任务账本、P1 配额、P2 Challenge、
 报告数量、legacy 映射、provenance 和 manifest 哈希。当前自动化测试没有替代真实

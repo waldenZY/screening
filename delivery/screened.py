@@ -22,7 +22,7 @@ from ..quality.two_stage import (
 )
 
 
-SCREENED_CANONICAL_SCHEMA_VERSION = 3
+SCREENED_CANONICAL_SCHEMA_VERSION = 4
 SET_NAMES = frozenset({"P0", "P1", "P2"})
 SELECTION_ORIGINS = frozenset({"initial_wave", "supplement_wave"})
 _HASH = re.compile(r"[0-9a-f]{64}")
@@ -44,6 +44,7 @@ def build_screened_canonical_record(
     candidate: JsonObject,
     stage1_result: Mapping[str, Any],
     stage2_result: Mapping[str, Any],
+    delivery_labels: Mapping[str, Any],
     *,
     challenge_result: Mapping[str, Any] | None = None,
     challenge_task_id: str | None = None,
@@ -67,6 +68,7 @@ def build_screened_canonical_record(
             "is_consistent": not conflicts,
             "conflict_codes": list(conflicts),
         },
+        "delivery_labels": dict(delivery_labels),
         "challenge": (
             None
             if set_name != "P2"
@@ -93,7 +95,7 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
         raise ScreenedCanonicalError("screened canonical 必须是对象")
     expected = {
         "screened_schema_version", "set", "candidate", "quality",
-        "quality_consistency", "challenge", "selection"
+        "quality_consistency", "challenge", "selection", "delivery_labels"
     }
     if set(record) != expected:
         raise ScreenedCanonicalError("screened canonical 顶层字段不一致")
@@ -130,6 +132,17 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
     if not stage1_passes(stage1):
         raise ScreenedCanonicalError("screened canonical 包含未通过第一阶段的样本")
     stage2 = validate_stage2_result({key: quality[key] for key in STAGE2_FIELDS}, stage1)
+    labels = record.get("delivery_labels")
+    if (not isinstance(labels, Mapping)
+            or set(labels) != {"intent_label", "executable", "execution_reasons"}
+            or labels.get("intent_label") != stage2["intent_label"]
+            or type(labels.get("executable")) is not int
+            or labels["executable"] not in (0, 1)
+            or not isinstance(labels.get("execution_reasons"), list)
+            or any(reason not in {"risk_keyword", "multi_turn", "no_evaluable_goal", "too_short", "attachment_dependency", "unresolved_reference", "other_unfit", "duplicate_text"} for reason in labels["execution_reasons"])
+            or len(set(labels["execution_reasons"])) != len(labels["execution_reasons"])
+            or labels["executable"] != int(not labels["execution_reasons"])):
+        raise ScreenedCanonicalError("screened canonical 下游标签非法")
     conflicts = stage2_consistency_conflicts(stage2, stage1)
     consistency = record.get("quality_consistency")
     if (

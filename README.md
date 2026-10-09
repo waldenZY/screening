@@ -15,9 +15,10 @@ cluster + taxonomy
 → 第一阶段：有效性、基础质量及类别检测
 → 仅 P1 按冻结 L2 配额补采（每轮分小批，最多三轮）
 → P2 Challenge Judge、类型配额选择与最多三轮补采
-→ 第二阶段：难度及综合质量
+→ 第二阶段：难度、综合质量、意图与内部可评测性原因
 → canonical screened
-→ 28 字段 legacy labeled 导出
+→ 风险词表与集合内重复等确定性规则映射 executable
+→ 30 字段 labeled v5 导出（增加 intent_label、executable）
 → JSON/Markdown 批跑报告
 → 校验与发布
 ```
@@ -40,8 +41,10 @@ Copy-Item screening/artifacts/config/llm_config.example.json `
   screening/artifacts/config/llm_config.local.json
 ```
 
-然后在 `artifacts/config/pipeline.default.json` 中填写 `inputs.source` 和
-`inputs.taxonomy`。默认 `publication.enabled=false`，因此一键启动只构建、不交付：
+然后在 `artifacts/config/pipeline.default.json` 中填写 `inputs.source`、
+`inputs.taxonomy` 和 `inputs.risk_keywords`（Excel 的 `Sheet1`，仅含 `关键词`、`风险级别` 两列）。
+风险词表是必填输入，内容和规范化规则会冻结到 run。默认 `publication.enabled=false`，
+因此一键启动只构建、不交付：
 
 ```powershell
 python -m screening.run_pipeline
@@ -65,6 +68,7 @@ Stage1 是三个集合统一的基础质量准入；P2 还必须通过 Challenge
 python -m screening.run_pipeline `
   --source D:/data/cluster.jsonl `
   --taxonomy D:/data/taxonomy.json `
+  --risk-keywords D:/data/risk_keywords.xlsx `
   --output-root D:/data/screening-runs `
   --publish-root D:/data/delivery
 ```
@@ -74,16 +78,10 @@ python -m screening.run_pipeline `
 
 完整运行配置位于 `artifacts/config/pipeline.default.json`，相对路径以该配置文件
 所在目录为基准。CLI 显式参数优先于配置值。三个 Prompt 默认位于
-`artifacts/prompts/quality_stage1.md`、`quality_challenge.md` 和 `quality_stage2.md`。常用临时覆盖参数：
+`artifacts/prompts/quality_stage1.md`、`quality_challenge.md` 和 `quality_stage2.md`。
+常用临时覆盖参数：
 
-每个配置字段的含义、范围、调大/调小影响和 run identity 关系，参见
-[配置使用手册](artifacts/docs/screening_pipeline_configuration_v3.md)。P1 分批补采由 V2 引入，
-历史设计见 [归档中的 P1 补采优化说明](artifacts/archive/v2/docs/screening_v2_p1_adaptive_supplement.md)；
-当前 P2 细节见 [P2 Adaptive 技术方案](artifacts/docs/screening_v3_p2_adaptive.md)。
-尚未实施的 P0 后续设想单独记录在
-[P0 Adaptive 讨论稿](artifacts/docs/screening_v3_p0_adaptive_proposal.md)，不能作为当前运行口径。
-
-- `--source`、`--taxonomy` 和 `--output-root`；
+- `--source`、`--taxonomy`、`--risk-keywords` 和 `--output-root`；
 - `--workers`、`--max-retries` 和 `--sleep`；
 - `--run-id`，只恢复契约完全一致的 v3 run；
 - `--new-run`，忽略可恢复或可复用 run，新建一次运行；
@@ -92,6 +90,10 @@ python -m screening.run_pipeline `
 - `--no-publish`，临时关闭配置中的自动发布。
 
 `--new-run`、`--run-id` 和 `--replace` 只允许通过 CLI 指定，不写入长期配置。
+
+当前文档入口见 [文档索引](artifacts/docs/README.md)；未实施的设想和旧字段契约见
+[历史归档](artifacts/archive/README.md)。
+开发验证测试位于同级目录 [tests](../tests/)，不参与正式批跑。
 
 退出码：`0` 成功，`1` 配置、数据、契约或发布错误，`2` 存在可以续跑的 LLM
 工程失败。
@@ -109,6 +111,7 @@ python -m screening.run_pipeline `
 │   └── canonical_database_validation.json
 └── runs/<run-id>/
     ├── manifest.json
+    ├── risk_keywords.json
     ├── checkpoints/
     ├── p012_build_summary.json
     ├── legacy_export_report.json
@@ -137,7 +140,7 @@ python -m screening.run_pipeline `
 每个分支保存：
 
 - `screened.canonical.jsonl`：内部权威成品；
-- `*_labeled.jsonl`：旧版 28 字段兼容视图；
+- `*_labeled.jsonl`：30 字段 labeled v5 交付视图；
 - `export_provenance.jsonl`：source/canonical/legacy 逐条哈希关联；
 - `legacy_export_report.json`：字段、类型、空值、枚举与数值转换检查；
 - `candidate_tasks.jsonl` 和 `branch_audit.json`：候选来源及分支统计。
@@ -159,17 +162,21 @@ Run 根目录的两份批跑报告来自同一份指标事实源：
 下游发布目录只接收：
 
 ```text
-P0-冒烟集/P0_smoke_set_v4_labeled.jsonl
-P1-基准集/P1_benchmark_set_v4_labeled.jsonl
-P2-对抗集/P2_adversarial_set_v4_labeled.jsonl
+P0-冒烟集/P0_smoke_set_v5_labeled.jsonl
+P1-基准集/P1_benchmark_set_v5_labeled.jsonl
+P2-对抗集/P2_adversarial_set_v5_labeled.jsonl
 ```
 
 三份文件作为一个事务提交；任一提交失败会恢复发布前的全部文件。
 
-## Legacy 28 字段契约
+## Labeled v5 30 字段契约
 
 面向下游或对外沟通的完整字段字典见
-[Screening 最终交付数据字段说明（labeled v4）](artifacts/docs/screening_labeled_v4_field_dictionary.md)。
+[Screening 最终交付数据字段说明（labeled v5）](artifacts/docs/screening_labeled_v5_field_dictionary.md)。
+
+新增的 `intent_label` 由 Stage2 依据完整会话输出 `task` 或 `qa`；`executable` 在最终映射时
+结合 Stage2 的内部语义原因、风险词表、轮次、长度和本集合内精确重复计算为 `0/1`。
+两项标签都不改变 P0/P1/P2 成员，所有记录照常交付。
 
 P0/P1 第 15 个字段为 `relevance_p0`，P2 为 `relevance_p2`；其余字段名、类型和
 顺序一致。`norm_freq` 与 relevance 在导出时保留四位小数。所有字段必须存在且

@@ -34,6 +34,7 @@ from ..candidate.p2_adaptive import (
     source_yield_rates,
 )
 from ..delivery.legacy import export_legacy_branch
+from ..delivery.eligibility import delivery_labels
 from ..delivery.report import write_run_report
 from ..delivery.screened import (
     build_screened_canonical_record,
@@ -1623,14 +1624,17 @@ def run_build(
         mark("quality_stage2", "completed", restored=True)
         active_logger.info("resume checkpoint=stage2 results=%d", len(stage2))
 
+    risk_snapshot = json.loads((run_root / "risk_keywords.json").read_text(encoding="utf-8"))
     output: dict[str, tuple[JsonObject, ...]] = {}
     for set_name in ("P0", "P1", "P2"):
+        seen_texts: set[str] = set()
         records = tuple(
             build_screened_canonical_record(
                 set_name,
                 candidate,
                 stage1[candidate["source_identity_sha256"]],
                 stage2[candidate["source_identity_sha256"]],
+                delivery_labels(candidate, stage2[candidate["source_identity_sha256"]], risk_snapshot, seen_texts),
                 challenge_result=(
                     challenge_results[candidate["source_identity_sha256"]]
                     if set_name == "P2" else None
@@ -1699,8 +1703,8 @@ def run_build(
         write_json(
             root_export_report,
             {
-                "legacy_schema": "labeled_v4",
-                "legacy_mapping_version": 1,
+                "legacy_schema": "labeled_v5",
+                "legacy_mapping_version": 2,
                 "sets": export_reports,
                 "total_records": sum(len(records) for records in output.values()),
                 "lossy_enum_mappings": 0,

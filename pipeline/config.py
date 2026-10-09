@@ -14,7 +14,7 @@ from ..shared.json_io import JsonObject
 from .orchestrator import BUILD_CONFIG_VERSION, BuildConfig, parse_build_config
 
 
-PIPELINE_CONFIG_VERSION = 3
+PIPELINE_CONFIG_VERSION = 4
 LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 _TOP_LEVEL_FIELDS = {
@@ -77,6 +77,7 @@ _P2_SUPPLEMENT_FIELDS = {
 _OVERRIDE_FIELDS = {
     "source",
     "taxonomy",
+    "risk_keywords",
     "output_root",
     "stage1_prompt",
     "challenge_prompt",
@@ -187,6 +188,7 @@ class PipelineConfig:
     config_path: Path
     source: Path | None
     taxonomy: Path | None
+    risk_keywords: Path | None
     output_root: Path
     stage1_prompt: Path
     challenge_prompt: Path
@@ -213,6 +215,7 @@ class PipelineConfig:
         for label, path in (
             ("inputs.source", self.source),
             ("inputs.taxonomy", self.taxonomy),
+            ("inputs.risk_keywords", self.risk_keywords),
             ("prompts.stage1", self.stage1_prompt),
             ("prompts.challenge", self.challenge_prompt),
             ("prompts.stage2", self.stage2_prompt),
@@ -232,6 +235,7 @@ class PipelineConfig:
             "inputs": {
                 "source": None if self.source is None else str(self.source),
                 "taxonomy": None if self.taxonomy is None else str(self.taxonomy),
+                "risk_keywords": None if self.risk_keywords is None else str(self.risk_keywords),
             },
             "outputs": {"output_root": str(self.output_root)},
             "prompts": {
@@ -318,7 +322,7 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
     index = _object(value["index"], "index")
     logging_value = _object(value["logging"], "logging")
     publication = _object(value["publication"], "publication")
-    _exact_fields(inputs, {"source", "taxonomy"}, "inputs")
+    _exact_fields(inputs, {"source", "taxonomy", "risk_keywords"}, "inputs")
     _exact_fields(outputs, {"output_root"}, "outputs")
     _exact_fields(prompts, {"stage1", "challenge", "stage2"}, "prompts")
     _exact_fields(quality, {"workers", "max_retries", "sleep_seconds"}, "quality")
@@ -355,6 +359,7 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
         config_path=config_path,
         source=_path(inputs["source"], "inputs.source", base_dir, optional=True),
         taxonomy=_path(inputs["taxonomy"], "inputs.taxonomy", base_dir, optional=True),
+        risk_keywords=_path(inputs["risk_keywords"], "inputs.risk_keywords", base_dir, optional=True),
         output_root=_path(outputs["output_root"], "outputs.output_root", base_dir),  # type: ignore[arg-type]
         stage1_prompt=_path(prompts["stage1"], "prompts.stage1", base_dir),  # type: ignore[arg-type]
         challenge_prompt=_path(prompts["challenge"], "prompts.challenge", base_dir),  # type: ignore[arg-type]
@@ -449,6 +454,11 @@ def apply_pipeline_overrides(
             _path(values["taxonomy"], "--taxonomy", base_dir)
             if "taxonomy" in values
             else config.taxonomy
+        ),
+        risk_keywords=(
+            _path(values["risk_keywords"], "--risk-keywords", base_dir)
+            if "risk_keywords" in values
+            else config.risk_keywords
         ),
         output_root=(
             _path(values["output_root"], "--output-root", base_dir)  # type: ignore[arg-type]

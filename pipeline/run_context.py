@@ -16,6 +16,7 @@ from ..candidate.contract import CANONICAL_SCHEMA_VERSION, FEATURE_RULE_VERSION
 from ..candidate.index import CANONICAL_INDEX_VERSION, CanonicalIndexHandle
 from ..candidate.p2_adaptive import P2_ALGORITHM
 from ..shared.json_io import JsonObject, sha256_file, stable_hash, write_json
+from ..shared.risk_keywords import validate_risk_snapshot
 from ..delivery.legacy import LEGACY_MAPPING_VERSION, LEGACY_SCHEMA_NAME
 from ..delivery.report import RUN_REPORT_SCHEMA_VERSION
 from .orchestrator import BUILD_CONFIG_VERSION, BuildConfig
@@ -62,6 +63,7 @@ def build_run_contract(
     challenge_prompt: str,
     stage2_prompt: str,
     llm_metadata: Mapping[str, Any],
+    risk_snapshot: Mapping[str, Any],
 ) -> JsonObject:
     taxonomy_path = taxonomy_path.expanduser().resolve()
     return {
@@ -80,6 +82,8 @@ def build_run_contract(
         "legacy_mapping_version": LEGACY_MAPPING_VERSION,
         "run_report_schema_version": RUN_REPORT_SCHEMA_VERSION,
         "quality_contract_version": QUALITY_CONTRACT_VERSION,
+        "risk_keywords_source_sha256": risk_snapshot["source_sha256"],
+        "risk_keywords_rules_sha256": risk_snapshot["rules_sha256"],
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "build_config": asdict(build_config),
         "quality_run_config": asdict(quality_config),
@@ -130,11 +134,13 @@ def prepare_run_context(
     challenge_prompt: str,
     stage2_prompt: str,
     llm_metadata: Mapping[str, Any],
+    risk_snapshot: Mapping[str, Any],
     run_id: str | None = None,
     new_run: bool = False,
 ) -> RunContext:
     if run_id and new_run:
         raise ValueError("--run-id 与 --new-run 不能同时使用")
+    validate_risk_snapshot(risk_snapshot)
     output_root = output_root.expanduser().resolve()
     source_path = source_path.expanduser().resolve()
     taxonomy_path = taxonomy_path.expanduser().resolve()
@@ -148,6 +154,7 @@ def prepare_run_context(
         challenge_prompt=challenge_prompt,
         stage2_prompt=stage2_prompt,
         llm_metadata=llm_metadata,
+        risk_snapshot=risk_snapshot,
     )
     config_id = stable_hash(contract)
     runs_root = output_root / "runs"
@@ -195,6 +202,7 @@ def prepare_run_context(
         (prompt_root / "stage1.md").write_text(stage1_prompt, encoding="utf-8", newline="\n")
         (prompt_root / "challenge.md").write_text(challenge_prompt, encoding="utf-8", newline="\n")
         (prompt_root / "stage2.md").write_text(stage2_prompt, encoding="utf-8", newline="\n")
+        write_json(run_root / "risk_keywords.json", dict(risk_snapshot))
         now = utc_now()
         manifest: JsonObject = {
             "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
@@ -257,6 +265,10 @@ def prepare_run_context(
 
     selected_root, manifest = selected
     _validate_frozen_run(selected_root, manifest, contract)
+    frozen_risk = json.loads((selected_root / "risk_keywords.json").read_text(encoding="utf-8"))
+    validate_risk_snapshot(frozen_risk)
+    if frozen_risk != dict(risk_snapshot):
+        raise ValueError("冻结的风险词表与当前输入不一致")
     return RunContext(
         run_root=selected_root,
         output_root=output_root,

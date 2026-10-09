@@ -1,8 +1,8 @@
 # Screening v3 配置使用手册
 
 > 适用入口：`python -m screening.run_pipeline`
-> Pipeline 配置版本：`config_version=3`
-> 更新日期：2026-09-21
+> Pipeline 配置版本：`config_version=4`
+> 更新日期：2026-10-09
 
 ## 1. 文档用途
 
@@ -61,7 +61,8 @@ screening/artifacts/config/pipeline.default.json
 ### 2.3 严格续跑条件
 
 要恢复同一个未完成 run，必须保持所有影响数据或 LLM 任务的配置不变，并再次执行同一
-命令。修改输入、Prompt、模型、质量运行参数或采样参数后，系统会创建新 run。
+命令。修改输入（包括风险关键词 Excel 内容）、Prompt、模型、质量运行参数或采样
+参数后，系统会创建新 run。旧质量契约 run 不能按当前 Stage2 规则续跑或发布。
 
 日志、索引性能和发布参数不改变数据 contract；但更换 `output_root` 会切换工作区，
 因此系统无法在新目录中自动找到原 run。
@@ -72,7 +73,7 @@ screening/artifacts/config/pipeline.default.json
 
 ```json
 {
-  "config_version": 3,
+  "config_version": 4,
   "inputs": {},
   "outputs": {},
   "prompts": {},
@@ -99,11 +100,11 @@ screening/artifacts/config/pipeline.default.json
 | 属性 | 内容 |
 | --- | --- |
 | 类型 | 整数 |
-| 当前值 | `3` |
+| 当前值 | `4` |
 | 是否可自行调整 | 否 |
 | 作用 | 标识 pipeline 配置 Schema |
 
-必须保持为 `3`。它不是产品大版本开关，修改后程序会拒绝配置；旧 P2 字段不会被静默解释为新算法。
+必须保持为 `4`。它不是产品大版本开关；旧配置缺少风险词表输入时程序会明确拒绝。
 
 ### 4.2 `inputs.source`
 
@@ -135,7 +136,13 @@ canonical cache 和 run。
 P0 的结构选择、P1 的初始 L2 配额及所有输出标签都依赖 taxonomy。正式批跑前应确认
 cluster ID 类型、L1/L2 映射和 population 已冻结。
 
-### 4.4 `outputs.output_root`
+### 4.4 `inputs.risk_keywords`
+
+`inputs.risk_keywords` 为必填的 `.xlsx` 路径。工作簿必须含 `Sheet1`，仅有
+`关键词`、`风险级别`，且至少有一条有效词条。文件 SHA-256 与规范化规则快照进入 run
+契约；更换词表会创建新 run。CLI 可用 `--risk-keywords` 临时覆盖。
+
+### 4.5 `outputs.output_root`
 
 | 属性 | 内容 |
 | --- | --- |
@@ -147,12 +154,12 @@ cluster ID 类型、L1/L2 映射和 population 已冻结。
 更换目录不会改变算法结果，但会切换缓存和 run 搜索位置。要续跑必须继续指向原来的
 `output_root`。
 
-### 4.5 `prompts.stage1` / `prompts.challenge` / `prompts.stage2`
+### 4.6 `prompts.stage1` / `prompts.challenge` / `prompts.stage2`
 
 | 属性 | Stage1 | Challenge | Stage2 |
 | --- | --- | --- | --- |
 | 默认值 | `../prompts/quality_stage1.md` | `../prompts/quality_challenge.md` | `../prompts/quality_stage2.md` |
-| 作用 | 有效性、基础质量及类别检测 | P2 Challenge 判定与类型 | 难度及综合质量标签 |
+| 作用 | 有效性、基础质量及类别检测 | P2 Challenge 判定与类型 | 难度、综合质量、任务/问答及评测障碍标签 |
 | 是否改变 run | 内容变化时是 | 内容变化时是 | 内容变化时是 |
 
 Prompt 文件必须恰好包含一个 `{CANDIDATE_JSON}`。修改空格或文字也会改变 Prompt 哈希，
@@ -482,6 +489,7 @@ Stage1、Challenge、Stage2 都输出短 JSON，通常不需要非常大的 `max
 | --- | --- | --- |
 | cluster 文件或路径 | 是 | source snapshot 包含文件状态和路径 |
 | taxonomy 内容 | 是 | 使用文件 SHA-256 |
+| 风险关键词 Excel 内容 | 是 | 使用文件和规范化规则 SHA-256；内容变化需新 run |
 | Stage1/Challenge/Stage2 Prompt 内容 | 是 | 使用内容 SHA-256 |
 | P0/P1/P2 采样参数 | 是 | 会改变候选成员 |
 | P1 补采参数 | 是 | 会改变请求量和成员 |
@@ -510,6 +518,7 @@ python -m screening.run_pipeline --help
 | --- | --- |
 | `--source` | `inputs.source` |
 | `--taxonomy` | `inputs.taxonomy` |
+| `--risk-keywords` | `inputs.risk_keywords` |
 | `--output-root` | `outputs.output_root` |
 | `--stage1-prompt` / `--challenge-prompt` / `--stage2-prompt` | `prompts.stage1/challenge/stage2` |
 | `--workers` | `quality.workers` |
@@ -544,6 +553,7 @@ python -m screening.run_pipeline --help
 ```text
 inputs.source
 inputs.taxonomy
+inputs.risk_keywords
 outputs.output_root
 llm_config.local.json
 ```
@@ -624,6 +634,7 @@ tail -f screening.log
 
 - [ ] `inputs.source` 指向正确且已冻结的 cluster JSONL；
 - [ ] `inputs.taxonomy` 的 cluster ID 类型、映射和 population 正确；
+- [ ] `inputs.risk_keywords` 指向冻结的关键词 Excel；
 - [ ] `output_root` 与 `cache_root` 有足够空间；
 - [ ] `llm_config.local.json` 已填写且未提交 Git；
 - [ ] LLM 服务允许当前 `workers` 并发；

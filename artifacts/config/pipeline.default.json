@@ -1,8 +1,9 @@
 {
-  "config_version": 3,
+  "config_version": 4,
   "inputs": {
     "source": "",
-    "taxonomy": ""
+    "taxonomy": "",
+    "risk_keywords": ""
   },
   "outputs": {
     "output_root": "../../outputs_v3"

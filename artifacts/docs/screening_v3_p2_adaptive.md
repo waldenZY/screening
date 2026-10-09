@@ -1,15 +1,16 @@
 # P2 Adaptive 技术方案（已实施）
 
 > 所属产品版本：Screening V3
-> Pipeline 配置版本：3
+> Pipeline 配置版本：`config_version=4`
 > P2 算法标识：`adaptive_challenge_batches_1`
-> 文档状态：当前已实施口径，更新于 2026-09-21
+> 文档状态：当前已实施口径，更新于 2026-10-09
 
 ## 1. 目标
 
 P2 正式目标为 2,000 条同时通过 Stage1 和 Challenge Judge 的样本。八类 `primary_challenge` 各有软下限 100，任一类型最多 700。候选不足时允许少于 2,000 条，并报告缺口。
 
-P0 不受本次改造影响。Stage1、Stage2 的规则保持不变，Stage2 只处理最终成员。
+P0 不受 P2 采样算法影响。当前 Stage1、Stage2 契约以
+[技术方案](screening_pipeline_technical_design_v3.md) 和实际 Prompt 为准；Stage2 只处理最终成员。
 
 ## 2. 数据流
 
@@ -126,8 +127,8 @@ long_tail_expr
 - Challenge 具有独立 Prompt SHA、任务账本、attempts、缓存命中账本、结果账本、SQLite 缓存和批级 checkpoint。
 - `adaptive_challenge_batches_1` 同时进入总 run contract 和 P012 构建契约，算法变化不会误续跑旧检查点。
 - 中断恢复复用已完成结果，不重复调用。
-- screened canonical schema v3：P2 保存三个 Challenge 字段和 `challenge_task_id`；P0/P1 的 `challenge` 为 `null`。
-- P2 允许 `supplement_wave`；legacy 28 字段保持不变。
+- screened canonical schema v4：P2 保存三个 Challenge 字段和 `challenge_task_id`；P0/P1 的 `challenge` 为 `null`。
+- P2 允许 `supplement_wave`；采样与 Challenge 算法不因 labeled v5 新增的两个下游标签改变。
 - P2 汇总写入 `P2/adaptive_summary.json`，总报告写入 `p2_diagnostics`。
 
 ## 8. 报告指标

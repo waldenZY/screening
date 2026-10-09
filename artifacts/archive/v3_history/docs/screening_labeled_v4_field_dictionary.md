@@ -1,6 +1,6 @@
 # Screening 最终交付数据字段说明（labeled v4）
 
-> 文档状态：当前实现口径
+> 文档状态：labeled v4 历史口径；当前交付见 [labeled v5](../../../docs/screening_labeled_v5_field_dictionary.md)
 > 适用版本：Screening v3 / `labeled_v4`
 > 更新日期：2026-09-21
 

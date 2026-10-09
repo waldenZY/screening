@@ -24,6 +24,8 @@ from .legacy import (
     map_screened_to_legacy_unchecked,
     validate_legacy_record,
 )
+from .eligibility import delivery_labels
+from ..shared.risk_keywords import validate_risk_snapshot
 from .report import (
     RUN_REPORT_JSON,
     RUN_REPORT_MARKDOWN,
@@ -37,6 +39,7 @@ from .screened import (
 from ..quality.two_stage import (
     CHALLENGE_FIELDS,
     CHALLENGE_TYPES,
+    QUALITY_CONTRACT_VERSION,
     STAGE1_FIELDS,
     STAGE2_FIELDS,
     stage1_passes,
@@ -49,6 +52,12 @@ from ..quality.two_stage import (
 
 class PublicationError(ValueError):
     """A v3 artifact or safe-publication contract violation."""
+
+
+def _require_current_quality_contract(manifest: Mapping[str, Any]) -> None:
+    contract = manifest.get("contract")
+    if not isinstance(contract, Mapping) or contract.get("quality_contract_version") != QUALITY_CONTRACT_VERSION:
+        raise PublicationError("Stage2 质量契约版本不一致，旧 run 必须重新运行")
 
 
 def _load_object(path: Path) -> JsonObject:
@@ -135,6 +144,13 @@ def _task_maps(
 def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
     """Independently validate every authoritative and compatibility artifact."""
     run_root = run_root.expanduser().resolve()
+    manifest = _load_object(run_root / "manifest.json")
+    _require_current_quality_contract(manifest)
+    risk_snapshot = _load_object(run_root / "risk_keywords.json")
+    validate_risk_snapshot(risk_snapshot)
+    if (risk_snapshot["source_sha256"] != manifest.get("contract", {}).get("risk_keywords_source_sha256")
+            or risk_snapshot["rules_sha256"] != manifest.get("contract", {}).get("risk_keywords_rules_sha256")):
+        raise PublicationError("风险词表快照与 run 契约不一致")
     summary = _load_object(run_root / "p012_build_summary.json")
     aggregate_export = _load_object(run_root / "legacy_export_report.json")
     if aggregate_export.get("legacy_mapping_version") != LEGACY_MAPPING_VERSION:
@@ -197,6 +213,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
     final_l2_counts_by_set: dict[str, Counter[str]] = {}
 
     for set_name in ("P0", "P1", "P2"):
+        seen_texts: set[str] = set()
         branch_root = run_root / set_name
         canonical_path = branch_root / "screened.canonical.jsonl"
         legacy_path = branch_root / LEGACY_FILENAMES[set_name].name
@@ -227,6 +244,10 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         for index, (canonical_row, legacy_row, provenance_row) in enumerate(
             zip(canonical, legacy, provenance), start=1
         ):
+            quality = canonical_row["quality"]
+            expected_labels = delivery_labels(canonical_row["candidate"], quality, risk_snapshot, seen_texts)
+            if canonical_row["delivery_labels"] != expected_labels:
+                raise PublicationError(f"{set_name} 第 {index} 条下游标签不一致")
             validate_legacy_record(set_name, legacy_row, canonical_record=canonical_row)
             if legacy_row != map_screened_to_legacy_unchecked(canonical_row):
                 raise PublicationError(f"{set_name} 第 {index} 条 legacy 映射不一致")
@@ -379,7 +400,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         if (
             report.get("set") != set_name
             or report.get("records") != len(canonical)
-            or report.get("field_count") != 28
+                or report.get("field_count") != 30
             or report.get("null_values") != 0
             or report.get("lossy_enum_mappings") != 0
         ):
@@ -626,6 +647,7 @@ def publish_labeled(
     publish_root = publish_root.expanduser().resolve()
     if manifest.get("pipeline_version") != 3:
         raise PublicationError("仅允许发布 screening v3 run")
+    _require_current_quality_contract(manifest)
     required_stages = (
         "canonical_index", "p012_build", "quality_stage1", "p1_supplement",
         "p2_supplement", "quality_p2_challenge", "quality_stage2",

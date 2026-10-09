@@ -258,6 +258,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="构建并发布 screening v3 P0/P1/P2 数据集")
     parser.add_argument("--source", type=Path, default=None, help="覆盖配置中的 cluster JSONL")
     parser.add_argument("--taxonomy", type=Path, default=None, help="覆盖配置中的 taxonomy JSON")
+    parser.add_argument("--risk-keywords", type=Path, default=None, help="风险关键词 Excel")
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--publish-root", type=Path, default=None)
     parser.add_argument("--no-publish", action="store_true")
@@ -326,6 +327,7 @@ def main(
             {
                 "source": args.source,
                 "taxonomy": args.taxonomy,
+                "risk_keywords": args.risk_keywords,
                 "output_root": args.output_root,
                 "stage1_prompt": args.stage1_prompt,
                 "challenge_prompt": args.challenge_prompt,
@@ -351,7 +353,9 @@ def main(
         logger = logging.getLogger("screening.v3")
         logger.info("screening v3 startup config=%s", effective.config_path)
         effective.validate_for_execution()
-        assert effective.source is not None and effective.taxonomy is not None
+        assert effective.source is not None and effective.taxonomy is not None and effective.risk_keywords is not None
+        from ..shared.risk_keywords import load_risk_keywords
+        risk_snapshot = load_risk_keywords(effective.risk_keywords)
         build_config = effective.build
         quality_config = effective.quality
         stage1_prompt = effective.stage1_prompt.read_text(encoding="utf-8")
@@ -392,6 +396,7 @@ def main(
             challenge_prompt=challenge_prompt,
             stage2_prompt=stage2_prompt,
             llm_metadata=metadata,
+            risk_snapshot=risk_snapshot,
             run_id=args.run_id,
             new_run=args.new_run,
         )

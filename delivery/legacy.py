@@ -31,17 +31,17 @@ from ..quality.two_stage import (
 )
 
 
-LEGACY_MAPPING_VERSION = 1
-LEGACY_SCHEMA_NAME = "labeled_v4"
+LEGACY_MAPPING_VERSION = 2
+LEGACY_SCHEMA_NAME = "labeled_v5"
 LEGACY_SET_VALUES = {
     "P0": "P0_smoke",
     "P1": "P1_benchmark",
     "P2": "P2_adversarial",
 }
 LEGACY_FILENAMES = {
-    "P0": Path("P0-冒烟集") / "P0_smoke_set_v4_labeled.jsonl",
-    "P1": Path("P1-基准集") / "P1_benchmark_set_v4_labeled.jsonl",
-    "P2": Path("P2-对抗集") / "P2_adversarial_set_v4_labeled.jsonl",
+    "P0": Path("P0-冒烟集") / "P0_smoke_set_v5_labeled.jsonl",
+    "P1": Path("P1-基准集") / "P1_benchmark_set_v5_labeled.jsonl",
+    "P2": Path("P2-对抗集") / "P2_adversarial_set_v5_labeled.jsonl",
 }
 LEGACY_COMMON_FIELDS = (
     "text", "raw_text", "context_text", "target_query", "turn_count",
@@ -54,6 +54,7 @@ LEGACY_TRAILING_FIELDS = (
     "quality_intent_clarity", "quality_validity",
     "quality_classification_difficulty", "quality_task_difficulty",
     "quality_issue_types", "quality_overall_score",
+    "intent_label", "executable",
 )
 
 
@@ -115,6 +116,8 @@ def map_screened_to_legacy(record: Mapping[str, Any]) -> JsonObject:
         "quality_task_difficulty": quality["task_difficulty"],
         "quality_issue_types": list(quality["issue_types"]),
         "quality_overall_score": quality["overall_score"],
+        "intent_label": record["delivery_labels"]["intent_label"],
+        "executable": record["delivery_labels"]["executable"],
     }
     mapped = OrderedDict((field, values[field]) for field in legacy_fields(set_name))
     validate_legacy_record(set_name, mapped, canonical_record=record)
@@ -138,7 +141,7 @@ def validate_legacy_record(
     """Independently assert exact old field order, types, enums, and values."""
     expected_fields = legacy_fields(set_name)
     if tuple(record) != expected_fields:
-        raise LegacyExportError("legacy 字段名称或顺序不符合 labeled_v4")
+        raise LegacyExportError("legacy 字段名称或顺序不符合 labeled_v5")
     if any(value is None for value in record.values()):
         raise LegacyExportError("legacy 必需字段不得为 null")
     string_fields = {
@@ -147,6 +150,7 @@ def validate_legacy_record(
         "set", "quality_category_fit", "quality_semantic_completeness",
         "quality_intent_clarity", "quality_validity", "quality_classification_difficulty",
         "quality_task_difficulty",
+        "intent_label",
     }
     for field in string_fields:
         value = record[field]
@@ -155,6 +159,10 @@ def validate_legacy_record(
     for field in ("turn_count", "cluster_id", "frequency", "quality_overall_score"):
         if isinstance(record[field], bool) or not isinstance(record[field], int):
             raise LegacyExportError(f"legacy {field} 必须是整数")
+    if type(record["executable"]) is not int or record["executable"] not in (0, 1):
+        raise LegacyExportError("legacy executable 必须是 0/1 整数")
+    if record["intent_label"] not in {"task", "qa"}:
+        raise LegacyExportError("legacy intent_label 非法")
     relevance_field = "relevance_p2" if set_name == "P2" else "relevance_p0"
     for field in ("cluster_prob", "norm_freq", relevance_field):
         if not _is_number(record[field]):
@@ -236,6 +244,8 @@ def map_screened_to_legacy_unchecked(record: Mapping[str, Any]) -> JsonObject:
         "session_id": candidate["source"]["session_id"],
         "set": LEGACY_SET_VALUES[set_name],
         **{f"quality_{key}": value for key, value in record["quality"].items()},
+        "intent_label": record["delivery_labels"]["intent_label"],
+        "executable": record["delivery_labels"]["executable"],
     }
     return {field: direct[field] for field in legacy_fields(set_name)}
 

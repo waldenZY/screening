@@ -15,6 +15,7 @@ from ..quality.two_stage import (
     CHALLENGE_TYPES,
     CLASSIFICATION_DIFFICULTIES,
     TASK_DIFFICULTIES,
+    STAGE2_FIELDS,
     validate_stage1_result,
     validate_stage2_result,
     stage1_passes,
@@ -344,15 +345,7 @@ def build_run_report(
                 }
             )
             validate_stage2_result(
-                {
-                    key: quality[key]
-                    for key in (
-                        "classification_difficulty",
-                        "task_difficulty",
-                        "issue_types",
-                        "overall_score",
-                    )
-                },
+                {key: quality[key] for key in STAGE2_FIELDS},
                 stage1,
             )
             final_quality["classification_difficulty"][quality["classification_difficulty"]] += 1

@@ -23,8 +23,11 @@ STAGE1_FIELDS = frozenset(
     {"category_fit", "semantic_completeness", "intent_clarity", "validity"}
 )
 STAGE2_FIELDS = frozenset(
-    {"classification_difficulty", "task_difficulty", "issue_types", "overall_score"}
+    {"classification_difficulty", "task_difficulty", "issue_types", "overall_score",
+     "intent_label", "execution_issues"}
 )
+INTENT_LABELS = frozenset({"task", "qa"})
+EXECUTION_ISSUES = frozenset({"no_evaluable_goal", "attachment_dependency", "unresolved_reference", "other_unfit"})
 CHALLENGE_FIELDS = frozenset(
     {"is_challenge", "primary_challenge", "challenge_types"}
 )
@@ -61,10 +64,11 @@ ISSUE_TYPES = frozenset(
         "nonsense",
         "emotional_only",
         "too_brief",
+        "no_evaluable_goal",
         "multi_intent",
     }
 )
-QUALITY_CONTRACT_VERSION = 3
+QUALITY_CONTRACT_VERSION = 6
 
 
 class QualityResponseError(ValueError):
@@ -234,6 +238,8 @@ def validate_stage2_result(value: Any, stage1_result: Mapping[str, Any]) -> Json
     task = value.get("task_difficulty")
     issues = value.get("issue_types")
     score = value.get("overall_score")
+    intent_label = value.get("intent_label")
+    execution_issues = value.get("execution_issues")
     if classification not in CLASSIFICATION_DIFFICULTIES:
         raise QualityResponseError("第二阶段 classification_difficulty 枚举非法")
     if task not in TASK_DIFFICULTIES:
@@ -248,8 +254,23 @@ def validate_stage2_result(value: Any, stage1_result: Mapping[str, Any]) -> Json
         raise QualityResponseError("第二阶段 issue_types 非法")
     if isinstance(score, bool) or not isinstance(score, int) or not 1 <= score <= 5:
         raise QualityResponseError("第二阶段 overall_score 必须是 1~5 整数")
-
+    if intent_label not in INTENT_LABELS:
+        raise QualityResponseError("第二阶段 intent_label 非法")
+    if (not isinstance(execution_issues, list)
+            or any(not isinstance(item, str) or item not in EXECUTION_ISSUES for item in execution_issues)
+            or len(set(execution_issues)) != len(execution_issues)):
+        raise QualityResponseError("第二阶段 execution_issues 非法")
     issue_set = set(issues)
+    no_evaluable_goal = "no_evaluable_goal" in execution_issues
+    if no_evaluable_goal and intent_label != "qa":
+        raise QualityResponseError("无可评测目标时 intent_label 必须是 qa")
+    if no_evaluable_goal and score != 1:
+        raise QualityResponseError("无可评测目标时 overall_score 必须为 1")
+    if no_evaluable_goal and not ({"nonsense", "emotional_only", "too_brief", "no_evaluable_goal"} & issue_set):
+        raise QualityResponseError("无可评测目标时必须标出对应质量问题")
+    if "no_evaluable_goal" in issue_set and not no_evaluable_goal:
+        raise QualityResponseError("质量问题 no_evaluable_goal 必须对应同名 execution_issues")
+
     if score == 5 and issue_set != {"none"}:
         raise QualityResponseError("overall_score=5 时 issue_types 必须为 none")
     if stage1_passes(stage1) and score < 5 and issue_set == {"none"}:
@@ -259,6 +280,8 @@ def validate_stage2_result(value: Any, stage1_result: Mapping[str, Any]) -> Json
         "task_difficulty": task,
         "issue_types": list(issues),
         "overall_score": score,
+        "intent_label": intent_label,
+        "execution_issues": list(execution_issues),
     }
 
 
@@ -283,6 +306,7 @@ def stage2_consistency_conflicts(
             ("nonsense", "intent_nonsense"),
             ("emotional_only", "intent_emotional_only"),
             ("too_brief", "intent_too_brief"),
+            ("no_evaluable_goal", "intent_no_evaluable_goal"),
         ):
             if issue in issues:
                 conflicts.append(code)
@@ -347,9 +371,7 @@ class TwoStageQualityRunner:
         contract_path = self.run_root / "quality_run_contract.json"
         if contract_path.is_file():
             existing = json.loads(contract_path.read_text(encoding="utf-8"))
-            legacy_contract = dict(run_contract)
-            legacy_contract.pop("quality_contract_version", None)
-            if existing not in (run_contract, legacy_contract):
+            if existing != run_contract:
                 raise ValueError("质量 LLM 运行目录与当前 Prompt、模型或配置不兼容")
         else:
             contract_path.write_text(
