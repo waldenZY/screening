@@ -22,7 +22,7 @@ from ..quality.two_stage import (
 )
 
 
-SCREENED_CANONICAL_SCHEMA_VERSION = 4
+SCREENED_CANONICAL_SCHEMA_VERSION = 5
 SET_NAMES = frozenset({"P0", "P1", "P2"})
 SELECTION_ORIGINS = frozenset({"initial_wave", "supplement_wave"})
 _HASH = re.compile(r"[0-9a-f]{64}")
@@ -139,7 +139,7 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
             or type(labels.get("executable")) is not int
             or labels["executable"] not in (0, 1)
             or not isinstance(labels.get("execution_reasons"), list)
-            or any(reason not in {"risk_keyword", "multi_turn", "no_evaluable_goal", "too_short", "attachment_dependency", "unresolved_reference", "other_unfit", "duplicate_text"} for reason in labels["execution_reasons"])
+            or any(reason not in {"risk_keyword", "multi_turn", "no_evaluable_goal", "too_short", "attachment_dependency", "unresolved_reference", "other_unfit"} for reason in labels["execution_reasons"])
             or len(set(labels["execution_reasons"])) != len(labels["execution_reasons"])
             or labels["executable"] != int(not labels["execution_reasons"])):
         raise ScreenedCanonicalError("screened canonical 下游标签非法")

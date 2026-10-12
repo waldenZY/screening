@@ -17,7 +17,9 @@ from ..candidate.index import (
     validate_canonical_source,
 )
 from ..candidate.p2_adaptive import P2_ALGORITHM, P2_SOURCE_NAMES
-from ..shared.json_io import JsonObject, load_jsonl, sha256_file
+from ..candidate.dedup import RULES_SHA256, normalize_text, selection_text
+from ..pipeline.orchestrator import BUILD_CONFIG_VERSION
+from ..shared.json_io import JsonObject, load_jsonl, sha256_file, stable_hash
 from .legacy import (
     LEGACY_FILENAMES,
     LEGACY_MAPPING_VERSION,
@@ -33,6 +35,7 @@ from .report import (
     load_and_validate_run_report,
 )
 from .screened import (
+    SCREENED_CANONICAL_SCHEMA_VERSION,
     stable_record_sha256,
     validate_screened_canonical_records,
 )
@@ -56,6 +59,13 @@ class PublicationError(ValueError):
 
 def _require_current_quality_contract(manifest: Mapping[str, Any]) -> None:
     contract = manifest.get("contract")
+    if (not isinstance(contract, Mapping)
+            or contract.get("p012_build_config_version") != BUILD_CONFIG_VERSION
+            or contract.get("screened_canonical_schema_version") != SCREENED_CANONICAL_SCHEMA_VERSION
+            or contract.get("legacy_mapping_version") != LEGACY_MAPPING_VERSION
+            or contract.get("dedup_rules_sha256") != RULES_SHA256
+            or not isinstance(contract.get("dedup_idf_sha256"), str)):
+        raise PublicationError("Old dedup or mapping contract cannot be published")
     if not isinstance(contract, Mapping) or contract.get("quality_contract_version") != QUALITY_CONTRACT_VERSION:
         raise PublicationError("Stage2 质量契约版本不一致，旧 run 必须重新运行")
 
@@ -146,6 +156,13 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
     run_root = run_root.expanduser().resolve()
     manifest = _load_object(run_root / "manifest.json")
     _require_current_quality_contract(manifest)
+    idf_snapshot = _load_object(run_root / "dedup_idf.json")
+    idf_content = {key: value for key, value in idf_snapshot.items() if key != "content_sha256"}
+    if (idf_snapshot.get("rules_sha256") != RULES_SHA256
+            or idf_snapshot.get("source_snapshot_id") != manifest.get("source", {}).get("sha256")
+            or stable_hash(idf_content) != idf_snapshot.get("content_sha256")
+            or idf_snapshot.get("content_sha256") != manifest["contract"].get("dedup_idf_sha256")):
+        raise PublicationError("Frozen dedup IDF snapshot mismatch")
     risk_snapshot = _load_object(run_root / "risk_keywords.json")
     validate_risk_snapshot(risk_snapshot)
     if (risk_snapshot["source_sha256"] != manifest.get("contract", {}).get("risk_keywords_source_sha256")
@@ -221,6 +238,40 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         candidate_path = branch_root / "candidate_tasks.jsonl"
         branch_report_path = branch_root / "legacy_export_report.json"
         canonical = load_jsonl(canonical_path)
+        dedup_audit = load_jsonl(branch_root / "dedup_audit.jsonl")
+        dedup_rules = summary["config"]["sampling"]["dedup"]
+        dedup_counts = Counter()
+        for row in dedup_audit:
+            if (row.get("decision") not in {"drop", "retain"}
+                    or row.get("reason") not in {"exact_normalized", "near_duplicate", "below_confirmation_threshold"}
+                    or not isinstance(row.get("candidate"), str)
+                    or not isinstance(row.get("representative"), str)
+                    or any(not isinstance(row.get(key), (int, float)) or not 0 <= row[key] <= 1
+                           for key in ("candidate_jaccard", "weighted_jaccard", "edit_similarity"))):
+                raise PublicationError(f"{set_name} invalid dedup audit row")
+            if row["reason"] == "near_duplicate" and (
+                    row["decision"] != "drop"
+                    or row["candidate_jaccard"] < dedup_rules["candidate_jaccard_min"]
+                    or row["weighted_jaccard"] < dedup_rules["weighted_jaccard_min"]
+                    or row["edit_similarity"] < dedup_rules["edit_similarity_min"]):
+                raise PublicationError(f"{set_name} invalid near duplicate decision")
+            if row["reason"] == "exact_normalized" and (
+                    row["decision"] != "drop"
+                    or any(row[key] != 1.0 for key in
+                           ("candidate_jaccard", "weighted_jaccard", "edit_similarity"))):
+                raise PublicationError(f"{set_name} invalid exact duplicate decision")
+            if row["reason"] == "below_confirmation_threshold" and (
+                    row["decision"] != "retain"
+                    or row["candidate_jaccard"] < dedup_rules["candidate_jaccard_min"]
+                    or (row["weighted_jaccard"] >= dedup_rules["weighted_jaccard_min"]
+                        and row["edit_similarity"] >= dedup_rules["edit_similarity_min"])):
+                raise PublicationError(f"{set_name} invalid borderline decision")
+            dedup_counts[row["reason"]] += 1
+        expected_dedup = summary["dedup"][set_name]
+        if (dedup_counts["exact_normalized"] != expected_dedup["exact_dropped"]
+                or dedup_counts["near_duplicate"] != expected_dedup["near_dropped"]
+                or dedup_counts["below_confirmation_threshold"] != expected_dedup["borderline_retained"]):
+            raise PublicationError(f"{set_name} dedup audit totals mismatch")
         legacy = load_jsonl(legacy_path)
         provenance = load_jsonl(provenance_path)
         candidate_rows = load_jsonl(candidate_path)
@@ -245,7 +296,11 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             zip(canonical, legacy, provenance), start=1
         ):
             quality = canonical_row["quality"]
-            expected_labels = delivery_labels(canonical_row["candidate"], quality, risk_snapshot, seen_texts)
+            normalized = normalize_text(selection_text(canonical_row["candidate"]))
+            if normalized in seen_texts:
+                raise PublicationError(f"{set_name} has duplicate normalized text at row {index}")
+            seen_texts.add(normalized)
+            expected_labels = delivery_labels(canonical_row["candidate"], quality, risk_snapshot)
             if canonical_row["delivery_labels"] != expected_labels:
                 raise PublicationError(f"{set_name} 第 {index} 条下游标签不一致")
             validate_legacy_record(set_name, legacy_row, canonical_record=canonical_row)
@@ -412,6 +467,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             "legacy": _jsonl_metadata(legacy_path, run_root, legacy),
             "provenance": _jsonl_metadata(provenance_path, run_root, provenance),
             "candidate_tasks": _jsonl_metadata(candidate_path, run_root, candidate_rows),
+            "dedup_audit": _jsonl_metadata(branch_root / "dedup_audit.jsonl", run_root, dedup_audit),
             "export_report": {
                 "path": branch_report_path.relative_to(run_root).as_posix(),
                 "sha256": sha256_file(branch_report_path),
@@ -433,6 +489,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             }
 
     root_files = {
+        "dedup_idf": {"path": "dedup_idf.json", "sha256": sha256_file(run_root / "dedup_idf.json")},
         "p012_build_summary": {
             "path": "p012_build_summary.json",
             "sha256": sha256_file(run_root / "p012_build_summary.json"),
@@ -452,6 +509,8 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         raise PublicationError(f"批跑报告校验失败: {exc}") from exc
     if run_report.get("run_id") != run_root.name:
         raise PublicationError("批跑报告 run_id 与运行目录不一致")
+    if run_report.get("dedup") != summary.get("dedup"):
+        raise PublicationError("Run report dedup totals mismatch")
     if run_report.get("totals", {}).get("cross_set_overlap") != summary.get(
         "cross_set_overlap", {}
     ):

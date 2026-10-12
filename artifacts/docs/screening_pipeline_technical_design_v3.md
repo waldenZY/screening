@@ -378,8 +378,8 @@ P0 无全局目标数量，不补采，采用结构覆盖策略：
 5. 如果该 cluster 没有 high 样本，使用 `relevance.p0` 最高的 10 条作为回退池。
 6. 在候选池内以 `relevance.p0` 为质量项执行 MMR，`lambda=0.7`。
 7. 每个 cluster 最多选 5 条。
-8. 集合内执行字符二元组 Jaccard 去重；相似度 `>0.7` 视为重复，优先保留
-   `cluster_probability` 更高者。
+8. 候选池先按规范化文本精确去重；集合层按统一的精确及近似规则去重，优先保留
+   `cluster_probability` 更高者。被剔除位置按原采样规则在 Stage1 前补位，候选耗尽时报告缺口。
 
 去重后的候选进入第一阶段，通过即成为 P0 成员。第二阶段只补标签。
 
@@ -399,8 +399,10 @@ P1 的最终目标是第一阶段通过、集合内去重后的 10,000 条，最
    - `boundary+cold` 有候选时最低分配 1 条。
 5. 每个网格内按 `relevance.p0` 执行 MMR，`lambda=0.7`。
 6. 网格不足时按确定性 relevance 顺序回填剩余 cluster 配额。
-7. 集合内字符二元组 Jaccard 相似度 `>0.75` 视为重复，优先保留
+7. 候选池先按规范化文本精确去重；集合层按统一的精确及近似规则去重，优先保留
    `cluster_probability` 更高者。
+
+统一规则只删除 Unicode 空白和标点，不改写正文；规范化文本相同者直接剔除。对字符二元组 Jaccard `≥0.45` 的待比较对，再按完整 canonical 源索引冻结的字符 2/3-gram IDF 加权 Jaccard 和规范化编辑相似度确认。只有 L2 相同、加权 Jaccard `≥0.80` 且编辑相似度 `≥0.90` 才自动剔除。临界保留对及剔除对写入 `dedup_audit.jsonl`，阈值由 `sampling.dedup` 配置并纳入 run 契约。P0/P1/P2 各自去重，跨集合重叠允许保留。
 
 第一阶段结束后，系统按 taxonomy population 和实际容量冻结最终 L2 目标配额。
 初始通过样本超过某个 L2 配额时，只按确定性候选顺序保留配额内样本，未采用的
@@ -599,7 +601,7 @@ run-local SQLite 缓存键包含：
 ## 10. P1 补采
 
 P1 初始第一阶段结束后，按冻结 L2 配额计算当前缺口。每轮只从本次运行尚未处理的
-候选中抽取，并先与已经准入的 P1 样本去重，再调用第一阶段。P0/P2 和 P1 初采规则
+候选中抽取，并先与此前所有已送检的 P1 候选去重，再调用第一阶段。P0/P2 和 P1 初采规则
 不受补采算法影响。
 
 默认补采参数：
@@ -679,12 +681,12 @@ Judge 通过但未入集的样本按 `type_cap`、`total_limit` 或 `diversity` 
 
 ## 12. Screened canonical
 
-当前 `screened_schema_version=4`。下面以 P2 记录为例；P0/P1 的顶层
+当前 `screened_schema_version=5`。下面以 P2 记录为例；P0/P1 的顶层
 `challenge` 值为 `null`：
 
 ```json
 {
-  "screened_schema_version": 4,
+  "screened_schema_version": 5,
   "set": "P2",
   "candidate": {},
   "quality": {
@@ -746,7 +748,7 @@ Legacy exporter 不调用 LLM、不重新采样、不修改成员，只做确定
 
 ```text
 legacy_schema = labeled_v5
-legacy_mapping_version = 2
+legacy_mapping_version = 3
 ```
 
 ### 13.1 30 字段顺序
@@ -824,11 +826,11 @@ provenance 用于发现 canonical 或 legacy 文件被修改，以及定位每�
 ```text
 pipeline_version = 3
 manifest_schema_version = 3
-p012_build_config_version = 2
+p012_build_config_version = 3
 quality_contract_version = 6
 checkpoint_schema_version = 1
-screened_schema_version = 4
-run_report_schema_version = 5
+screened_schema_version = 5
+run_report_schema_version = 6
 ```
 
 P2 Adaptive、Challenge Judge 及对应契约属于 Screening v3；其余内部 schema 版本按
@@ -839,6 +841,7 @@ run contract 包含：
 - 源文件 SHA-256、stat 和 canonical cache ID；
 - taxonomy SHA-256；
 - 风险关键词 Excel 内容 SHA-256 及规范化规则 SHA-256；
+- 候选去重规范化规则、完整源索引 IDF 规则、规则哈希、IDF 内容哈希和三项阈值；
 - canonical schema/index/feature rule 版本；
 - P012 构建配置及版本；
 - P2 算法标识 `adaptive_challenge_batches_1`；
@@ -928,6 +931,7 @@ P1/P2 补采都可恢复到小批；不在单个小批内部建立检查点。�
         ├── manifest.json
         ├── checkpoints/
         ├── p012_run_contract.json
+        ├── dedup_idf.json
         ├── p012_build_summary.json
         ├── legacy_export_report.json
         ├── screening_run_report.json
@@ -964,6 +968,7 @@ P1/P2 补采都可恢复到小批；不在单个小批内部建立检查点。�
 
 - `candidate_tasks.jsonl`：初始或补采候选任务；
 - `branch_audit.json`：采样、去重、通过、准入和缺口统计；P1 初采另记录配额截断；
+- `dedup_audit.jsonl`：候选阶段精确及近似剔除对、临界保留对、代表样本与各项分数；
 - `screened.canonical.jsonl`：内部权威成品；
 - 对应的 `*_labeled.jsonl`：30 字段兼容视图；
 - `export_provenance.jsonl`：逐条哈希和任务来源；

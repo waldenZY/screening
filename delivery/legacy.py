@@ -31,7 +31,7 @@ from ..quality.two_stage import (
 )
 
 
-LEGACY_MAPPING_VERSION = 2
+LEGACY_MAPPING_VERSION = 3
 LEGACY_SCHEMA_NAME = "labeled_v5"
 LEGACY_SET_VALUES = {
     "P0": "P0_smoke",

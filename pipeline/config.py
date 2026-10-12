@@ -14,7 +14,7 @@ from ..shared.json_io import JsonObject
 from .orchestrator import BUILD_CONFIG_VERSION, BuildConfig, parse_build_config
 
 
-PIPELINE_CONFIG_VERSION = 4
+PIPELINE_CONFIG_VERSION = 5
 LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 _TOP_LEVEL_FIELDS = {
@@ -37,7 +37,6 @@ _P0_FIELDS = {
     "max_per_cluster",
     "fallback_pool_size",
     "mmr_lambda",
-    "dedup_threshold",
 }
 _P1_FIELDS = {
     "target_n",
@@ -45,7 +44,6 @@ _P1_FIELDS = {
     "frequency_weights",
     "cold_boundary_floor",
     "mmr_lambda",
-    "dedup_threshold",
 }
 _P2_FIELDS = {
     "target_n",
@@ -55,7 +53,6 @@ _P2_FIELDS = {
     "soft_min_per_type",
     "max_per_primary",
     "batch_size",
-    "dedup_threshold",
 }
 _SUPPLEMENT_FIELDS = {
     "max_rounds",
@@ -273,7 +270,11 @@ class PipelineConfig:
 
 def _parse_build(value: Mapping[str, Any]) -> BuildConfig:
     sampling = _object(value["sampling"], "sampling")
-    _exact_fields(sampling, {"p0", "p1", "p2"}, "sampling")
+    _exact_fields(sampling, {"p0", "p1", "p2", "dedup"}, "sampling")
+    _exact_fields(_object(sampling["dedup"], "sampling.dedup"),
+                  {"normalization_rule", "idf_rule", "rules_sha256",
+                   "candidate_jaccard_min", "weighted_jaccard_min", "edit_similarity_min"},
+                  "sampling.dedup")
     p0 = _object(sampling["p0"], "sampling.p0")
     p1 = _object(sampling["p1"], "sampling.p1")
     p2 = _object(sampling["p2"], "sampling.p2")

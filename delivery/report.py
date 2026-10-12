@@ -25,7 +25,7 @@ from ..shared.taxonomy import TaxonomyMappings
 from .screened import validate_screened_canonical_record
 
 
-RUN_REPORT_SCHEMA_VERSION = 5
+RUN_REPORT_SCHEMA_VERSION = 6
 RUN_REPORT_JSON = "screening_run_report.json"
 RUN_REPORT_MARKDOWN = "screening_run_report.md"
 SET_NAMES = ("P0", "P1", "P2")
@@ -547,6 +547,7 @@ def build_run_report(
         },
         "sets": sets,
         "p1_diagnostics": _p1_diagnostics(build_summary),
+        "dedup": dict(build_summary["dedup"]),
         "p2_diagnostics": _p2_diagnostics(
             build_summary, final_records["P2"], challenge_runtime
         ),
@@ -597,6 +598,7 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         "totals",
         "sets",
         "p1_diagnostics",
+        "dedup",
         "p2_diagnostics",
     }
     if not isinstance(report, Mapping) or set(report) != expected_top:
@@ -608,6 +610,16 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
     if not isinstance(report.get("sets"), Mapping) or set(report["sets"]) != set(SET_NAMES):
         raise RunReportError("批跑报告集合不完整")
     _reject_sensitive_keys(report)
+    dedup = report.get("dedup")
+    if not isinstance(dedup, Mapping) or set(dedup) != set(SET_NAMES):
+        raise RunReportError("Dedup report must include P0/P1/P2")
+    for name, row in dedup.items():
+        if (not isinstance(row, Mapping) or set(row) != {
+                "exact_dropped", "near_dropped", "borderline_retained", "audit_path", "backfill_gap"}
+                or any(type(row[key]) is not int or row[key] < 0 for key in
+                       ("exact_dropped", "near_dropped", "borderline_retained", "backfill_gap"))
+                or row["audit_path"] != f"{name}/dedup_audit.jsonl"):
+            raise RunReportError("Invalid dedup report entry")
     diagnostics = report["p1_diagnostics"]
     if not isinstance(diagnostics, Mapping) or not isinstance(diagnostics.get("rounds"), list):
         raise RunReportError("P1 补采诊断结构非法")
@@ -1082,6 +1094,13 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             "",
         ]
     )
+    lines.extend(["", "## 集合内候选去重", "", "| 集合 | 精确剔除 | 近似剔除 | 临界保留对 | 补位缺口 | 审计 |",
+                  "| --- | ---: | ---: | ---: | ---: | --- |"])
+    for name in ("P0", "P1", "P2"):
+        value = report["dedup"][name]
+        lines.append(f"| {name} | {value['exact_dropped']} | {value['near_dropped']} | "
+                     f"{value['borderline_retained']} | {value['backfill_gap']} | "
+                     f"`{value['audit_path']}` |")
     return "\n".join(lines)
 
 

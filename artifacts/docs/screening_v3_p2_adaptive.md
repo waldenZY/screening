@@ -1,7 +1,7 @@
 # P2 Adaptive 技术方案（已实施）
 
 > 所属产品版本：Screening V3
-> Pipeline 配置版本：`config_version=4`
+> Pipeline 配置版本：`config_version=5`
 > P2 算法标识：`adaptive_challenge_batches_1`
 > 文档状态：当前已实施口径，更新于 2026-10-09
 

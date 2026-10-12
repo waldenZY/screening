@@ -1,8 +1,8 @@
 # Screening v3 配置使用手册
 
 > 适用入口：`python -m screening.run_pipeline`
-> Pipeline 配置版本：`config_version=4`
-> 更新日期：2026-10-09
+> Pipeline 配置版本：`config_version=5`
+> 更新日期：2026-10-11
 
 ## 1. 文档用途
 
@@ -73,7 +73,7 @@ screening/artifacts/config/pipeline.default.json
 
 ```json
 {
-  "config_version": 4,
+  "config_version": 5,
   "inputs": {},
   "outputs": {},
   "prompts": {},
@@ -84,7 +84,8 @@ screening/artifacts/config/pipeline.default.json
   "sampling": {
     "p0": {},
     "p1": {},
-    "p2": {}
+    "p2": {},
+    "dedup": {}
   },
   "p1_supplement": {},
   "p2_supplement": {}
@@ -330,7 +331,7 @@ DEBUG
 
 ## 9. `sampling.p0`：P0 冒烟集参数
 
-P0 没有全局目标数量，只按 taxonomy 结构选取少量高置信度代表样本，不进行补采。
+P0 没有全局目标数量，只按 taxonomy 结构选取少量高置信度代表样本。候选去重造成的 cluster 缺口会在 Stage1 前按原采样规则补位；候选耗尽时报告缺口。
 
 | 参数 | 默认值 | 含义与调整影响 |
 | --- | ---: | --- |
@@ -340,7 +341,6 @@ P0 没有全局目标数量，只按 taxonomy 结构选取少量高置信度代�
 | `max_per_cluster` | `5` | 每个被选 cluster 最多保留多少条。调大增加 P0 总量，但可能增加重复。 |
 | `fallback_pool_size` | `10` | 最大 cluster 没有 high probability 样本时，按 P0 relevance 取前多少条进入回退池。它不是最终必取数量。 |
 | `mmr_lambda` | `0.7` | MMR 中 relevance 权重；范围 `[0,1]`。越大越偏高质量，越小越偏文本多样性。 |
-| `dedup_threshold` | `0.7` | 字符二元组 Jaccard 大于该值视为重复。调低去重更严格，调高保留更多相似文本。 |
 
 P0 每个 L2 只使用观测候选量最大的 cluster，因此它是冒烟集，不代表完整 taxonomy
 覆盖。以上任一参数变化都会建立新 run。
@@ -358,7 +358,6 @@ probability×frequency 九宫格抽样。P1 按 Stage1 通过后的 L2 缺口补
 | `target_n` | `10000` | P1 最终数量目标。初采通过者按冻结 L2 配额限制；补采按剩余缺口逐批准入。候选不足时允许低于目标。 |
 | `cold_boundary_floor` | `1` | 每个 cluster 的 boundary+cold 网格有候选时的最低配额。建议保持 `1`；过大会显著提高低置信度冷样本占比，甚至挤占其他网格。 |
 | `mmr_lambda` | `0.7` | 网格内 MMR 的 P0 relevance 权重；越大越偏高概率/高频，越小越偏表面多样性。 |
-| `dedup_threshold` | `0.75` | 集合内 Jaccard 去重阈值。调低更严格，通常会增加补采量。 |
 
 ### 10.2 `probability_weights`
 
@@ -403,9 +402,21 @@ P2 的 `target_n` 是最终 Challenge 样本目标。只有 Stage1 PASS 且 Chal
 | `soft_min_per_type` | `100` | 八类 primary 的软下限；不足时报告缺口，不用低质量样本填充。 |
 | `max_per_primary` | `700` | 单一 primary 的最终硬上限；必须满足 `8 × max_per_primary >= target_n`。 |
 | `batch_size` | `2000` | 每个 P2 小批最多请求数。 |
-| `dedup_threshold` | `0.75` | P2 集合内文本 Jaccard 去重阈值。 |
 
-旧字段 `multi_turn_ratio`、`probability_cap`、`frequency_quantile` 已删除，配置出现这些
+### `sampling.dedup`：三个集合共用的候选去重规则
+
+| 参数 | 默认值 | 含义 |
+| --- | ---: | --- |
+| `normalization_rule` | `unicode_whitespace_and_category_P_removed_v1` | 固定文本规范化规则；当前版本只允许此值。 |
+| `idf_rule` | `all_indexed_rows_unique_character_2_3grams_log((N+1)/(df+1))+1_v1` | 固定完整源索引文档频次与平滑 IDF 公式；当前版本只允许此值。 |
+| `rules_sha256` | 默认配置中的规则哈希 | 对上述规则名称及版本的冻结哈希；当前版本只允许默认值。 |
+| `candidate_jaccard_min` | `0.45` | 规范化字符二元组 Jaccard 达到此值才进入近似比较；仅用于召回文本对。 |
+| `weighted_jaccard_min` | `0.80` | 完整源索引上字符 2/3-gram IDF 加权 Jaccard 自动剔除下限。 |
+| `edit_similarity_min` | `0.90` | 规范化 Levenshtein 编辑相似度自动剔除下限。 |
+
+先从同一套完整会话文本中移除 Unicode 空白与标点，不改写正文。规范化文本完全相同的候选直接去重，包含单字 query。近似剔除同时要求同一 L2、加权 Jaccard 和编辑相似度达标。保留原有代表样本优先级；临界保留对与被剔除对及分数写入各集合的 `dedup_audit.jsonl`。IDF 从完整 canonical 源索引计算一次并冻结，规则与内容哈希写入 run 契约。上述阈值是保守初值，需按真实 run 审计再校准；调整配置会启动新 run。
+
+旧字段 `multi_turn_ratio`、`probability_cap`、`frequency_quantile` 和各集合的 `dedup_threshold` 已删除，配置出现这些
 字段会直接报错。`frequency` 只保留为诊断字段，不再决定候选准入。
 
 ## 12. `p1_supplement`：P1 补采参数
@@ -562,6 +573,7 @@ llm_config.local.json
 
 ```text
 screening_run_report.md
+P0/P1/P2 的 dedup_audit.jsonl
 P0/P1/P2 的 branch_audit.json
 P1/supplement_summary.json
 P2/adaptive_summary.json

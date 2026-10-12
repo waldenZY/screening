@@ -1,5 +1,5 @@
 {
-  "config_version": 4,
+  "config_version": 5,
   "inputs": {
     "source": "",
     "taxonomy": "",
@@ -41,16 +41,14 @@
       "l2_per_l1_small": 2,
       "max_per_cluster": 5,
       "fallback_pool_size": 10,
-      "mmr_lambda": 0.7,
-      "dedup_threshold": 0.7
+      "mmr_lambda": 0.7
     },
     "p1": {
       "target_n": 10000,
       "probability_weights": {"high": 3, "mid": 2, "boundary": 1},
       "frequency_weights": {"hot": 2, "warm": 2, "cold": 1},
       "cold_boundary_floor": 1,
-      "mmr_lambda": 0.7,
-      "dedup_threshold": 0.75
+      "mmr_lambda": 0.7
     },
     "p2": {
       "target_n": 2000,
@@ -64,8 +62,15 @@
       "boundary_probability_cap": 0.5,
       "soft_min_per_type": 100,
       "max_per_primary": 700,
-      "batch_size": 2000,
-      "dedup_threshold": 0.75
+      "batch_size": 2000
+    },
+    "dedup": {
+      "normalization_rule": "unicode_whitespace_and_category_P_removed_v1",
+      "idf_rule": "all_indexed_rows_unique_character_2_3grams_log((N+1)/(df+1))+1_v1",
+      "rules_sha256": "53925f3af1c77cf27af01754a4da1a384f50312f60cccea8e70d8f9c7a62027a",
+      "candidate_jaccard_min": 0.45,
+      "weighted_jaccard_min": 0.8,
+      "edit_similarity_min": 0.9
     }
   },
   "p1_supplement": {

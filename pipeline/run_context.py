@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 from ..candidate.contract import CANONICAL_SCHEMA_VERSION, FEATURE_RULE_VERSION
 from ..candidate.index import CANONICAL_INDEX_VERSION, CanonicalIndexHandle
+from ..candidate.dedup import RULES_SHA256, load_or_build_idf_snapshot, validate_idf_snapshot
 from ..candidate.p2_adaptive import P2_ALGORITHM
 from ..shared.json_io import JsonObject, sha256_file, stable_hash, write_json
 from ..shared.risk_keywords import validate_risk_snapshot
@@ -64,6 +65,7 @@ def build_run_contract(
     stage2_prompt: str,
     llm_metadata: Mapping[str, Any],
     risk_snapshot: Mapping[str, Any],
+    idf_snapshot: Mapping[str, Any],
 ) -> JsonObject:
     taxonomy_path = taxonomy_path.expanduser().resolve()
     return {
@@ -84,6 +86,8 @@ def build_run_contract(
         "quality_contract_version": QUALITY_CONTRACT_VERSION,
         "risk_keywords_source_sha256": risk_snapshot["source_sha256"],
         "risk_keywords_rules_sha256": risk_snapshot["rules_sha256"],
+        "dedup_rules_sha256": RULES_SHA256,
+        "dedup_idf_sha256": idf_snapshot["content_sha256"],
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "build_config": asdict(build_config),
         "quality_run_config": asdict(quality_config),
@@ -135,6 +139,7 @@ def prepare_run_context(
     stage2_prompt: str,
     llm_metadata: Mapping[str, Any],
     risk_snapshot: Mapping[str, Any],
+    idf_snapshot: Mapping[str, Any] | None = None,
     run_id: str | None = None,
     new_run: bool = False,
 ) -> RunContext:
@@ -143,6 +148,8 @@ def prepare_run_context(
     validate_risk_snapshot(risk_snapshot)
     output_root = output_root.expanduser().resolve()
     source_path = source_path.expanduser().resolve()
+    idf_snapshot = dict(idf_snapshot) if idf_snapshot is not None else load_or_build_idf_snapshot(index, source_path)
+    validate_idf_snapshot(idf_snapshot, index)
     taxonomy_path = taxonomy_path.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     contract = build_run_contract(
@@ -155,6 +162,7 @@ def prepare_run_context(
         stage2_prompt=stage2_prompt,
         llm_metadata=llm_metadata,
         risk_snapshot=risk_snapshot,
+        idf_snapshot=idf_snapshot,
     )
     config_id = stable_hash(contract)
     runs_root = output_root / "runs"
@@ -203,6 +211,7 @@ def prepare_run_context(
         (prompt_root / "challenge.md").write_text(challenge_prompt, encoding="utf-8", newline="\n")
         (prompt_root / "stage2.md").write_text(stage2_prompt, encoding="utf-8", newline="\n")
         write_json(run_root / "risk_keywords.json", dict(risk_snapshot))
+        write_json(run_root / "dedup_idf.json", dict(idf_snapshot))
         now = utc_now()
         manifest: JsonObject = {
             "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
@@ -266,6 +275,10 @@ def prepare_run_context(
     selected_root, manifest = selected
     _validate_frozen_run(selected_root, manifest, contract)
     frozen_risk = json.loads((selected_root / "risk_keywords.json").read_text(encoding="utf-8"))
+    frozen_idf = json.loads((selected_root / "dedup_idf.json").read_text(encoding="utf-8"))
+    validate_idf_snapshot(frozen_idf, index)
+    if frozen_idf != dict(idf_snapshot):
+        raise ValueError("Frozen dedup IDF differs from current source")
     validate_risk_snapshot(frozen_risk)
     if frozen_risk != dict(risk_snapshot):
         raise ValueError("冻结的风险词表与当前输入不一致")

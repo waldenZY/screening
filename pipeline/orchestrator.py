@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 
 from ..candidate.index import CanonicalCandidateIndex, CanonicalIndexHandle
 from ..candidate.contract import validate_canonical_candidate
+from ..candidate.dedup import DedupConfig, load_or_build_idf_snapshot, validate_idf_snapshot, RULES_SHA256
 from ..shared.json_io import JsonObject, load_jsonl, sha256_file, write_json, write_jsonl
 from ..shared.taxonomy import TaxonomyMappings
 from ..candidate.sampling import (
@@ -33,7 +34,7 @@ from ..candidate.p2_adaptive import (
     select_final_p2,
     source_yield_rates,
 )
-from ..delivery.legacy import export_legacy_branch
+from ..delivery.legacy import LEGACY_MAPPING_VERSION, export_legacy_branch
 from ..delivery.eligibility import delivery_labels
 from ..delivery.report import write_run_report
 from ..delivery.screened import (
@@ -49,7 +50,7 @@ from ..quality.two_stage import (
 from .checkpoints import CheckpointStore
 
 
-BUILD_CONFIG_VERSION = 2
+BUILD_CONFIG_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -146,7 +147,14 @@ def parse_build_config(value: Mapping[str, Any]) -> BuildConfig:
     p2_supplement = value.get("p2_supplement", {})
     if not isinstance(sampling, dict) or not isinstance(supplement, dict) or not isinstance(p2_supplement, dict):
         raise ValueError("sampling、p1_supplement 和 p2_supplement 必须是对象")
-    _only(sampling, {"p0", "p1", "p2"}, "sampling")
+    _only(sampling, {"p0", "p1", "p2", "dedup"}, "sampling")
+    dedup_raw = sampling.get("dedup", {})
+    if not isinstance(dedup_raw, dict):
+        raise ValueError("sampling.dedup must be an object")
+    try:
+        dedup_config = DedupConfig(**dedup_raw)
+    except TypeError as exc:
+        raise ValueError(f"sampling.dedup contains invalid fields: {exc}") from exc
     sections: dict[str, Any] = {}
     for key, cls in (("p0", P0SamplingConfig), ("p1", P1SamplingConfig), ("p2", P2SamplingConfig)):
         raw = sampling.get(key, {})
@@ -166,7 +174,7 @@ def parse_build_config(value: Mapping[str, Any]) -> BuildConfig:
         raise ValueError(f"p2_supplement 字段非法: {exc}") from exc
     return BuildConfig(
         config_version=value.get("config_version", BUILD_CONFIG_VERSION),
-        sampling=SamplingConfig(**sections),
+        sampling=SamplingConfig(**sections, dedup=dedup_config),
         p1_supplement=supplement_config,
         p2_supplement=p2_supplement_config,
     )
@@ -195,11 +203,13 @@ def _sample_branch(
     source_path: Path,
     taxonomy: TaxonomyMappings,
     config: SamplingConfig,
+    excluded: Sequence[str] = (),
+    requested_by_cluster: Mapping[Any, int] | None = None,
 ) -> list[JsonObject]:
     with CanonicalCandidateIndex(handle) as index:
         sampler = CandidateSampler(index, source_path, taxonomy, config)
         if set_name == "P0":
-            return sampler.sample_p0()
+            return sampler.sample_p0(excluded, requested_by_cluster=requested_by_cluster)
         if set_name == "P1":
             return sampler.sample_p1()
         raise ValueError(f"初始静态采样只支持 P0/P1，收到: {set_name}")
@@ -210,18 +220,17 @@ def _deduplicate(
     candidates: Sequence[JsonObject],
     existing: Sequence[JsonObject] = (),
     *,
-    threshold: float | None = None,
+    config: DedupConfig,
+    idf_snapshot: Mapping[str, Any],
+    audit: list[JsonObject] | None = None,
 ) -> list[JsonObject]:
     return deduplicate_branch_candidates(
         set_name,
         candidates,
         existing,
-        threshold=threshold,
-        text_getter=lambda item: (
-            item["conversation"]["full_text"]
-            if item["conversation"]["sample_type"] == "multi_turn"
-            else item["conversation"]["target_query"]
-        ),
+        config=config,
+        idf_snapshot=idf_snapshot,
+        audit=audit,
     )
 
 
@@ -456,6 +465,7 @@ def _run_adaptive_p2(
     checkpoints: CheckpointStore,
     materialized: dict[str, JsonObject],
     logger: logging.Logger,
+    idf_snapshot: Mapping[str, Any],
 ) -> JsonObject:
     """Run resumable Stage1 -> Challenge batches and select official P2 members."""
     complete = checkpoints.load("p2_adaptive_complete")
@@ -475,6 +485,7 @@ def _run_adaptive_p2(
     evaluation_rounds: dict[str, int] = {}
     processed: set[str] = set()
     rounds: list[JsonObject] = []
+    dedup_events: list[JsonObject] = []
     source_capacity: dict[str, int] = {source: 0 for source in P2_SOURCE_NAMES}
     source_remaining: dict[str, int] = {source: 0 for source in P2_SOURCE_NAMES}
     exhausted = False
@@ -554,8 +565,10 @@ def _run_adaptive_p2(
                     planning_started = time.monotonic()
                     draw = sampler.draw(requested, processed)
                     raw = _materialize(index, source_path, taxonomy, draw.locators, materialized)
+                    batch_dedup: list[JsonObject] = []
                     new_candidates = _deduplicate(
-                        "P2", raw, evaluated, threshold=p2_config.dedup_threshold
+                        "P2", raw, evaluated, config=config.sampling.dedup,
+                        idf_snapshot=idf_snapshot, audit=batch_dedup,
                     )
                     new_ids = {str(item["source_identity_sha256"]) for item in new_candidates}
                     plan = {
@@ -566,6 +579,7 @@ def _run_adaptive_p2(
                         "sampled_identities": [item["source_identity_sha256"] for item in draw.locators],
                         "sampled_metadata": dict(draw.metadata),
                         "candidates": new_candidates,
+                        "dedup_audit": batch_dedup,
                         "metadata": {
                             identity: value for identity, value in draw.metadata.items()
                             if identity in new_ids
@@ -579,6 +593,7 @@ def _run_adaptive_p2(
                     raise ValueError(f"P2 第 {wave} 轮第 {batch_id} 批计划与续跑状态不一致")
 
                 sampled_ids = {str(value) for value in plan["sampled_identities"]}
+                dedup_events.extend(plan["dedup_audit"])
                 processed.update(sampled_ids)
                 new_candidates = list(plan["candidates"])
                 new_sampled_metadata = {
@@ -835,6 +850,7 @@ def _run_adaptive_p2(
         "evaluation_rounds": evaluation_rounds,
         "selection_rounds": selection_rounds,
         "diagnostics": diagnostic,
+        "dedup_audit": dedup_events,
     }
     quality_root = getattr(quality_runner, "run_root", None)
     if isinstance(quality_root, Path):
@@ -860,10 +876,21 @@ def run_build(
     run_root: Path,
     quality_runner: TwoStageQualityRunner,
     logger: logging.Logger | None = None,
+    idf_snapshot: Mapping[str, Any] | None = None,
 ) -> BuildOutcome:
     """Run B-E as a contract-bound, stage-checkpointed state machine."""
     run_root.mkdir(parents=True, exist_ok=True)
     active_logger = logger or logging.getLogger(__name__)
+    idf_path = run_root / "dedup_idf.json"
+    idf_snapshot = (dict(idf_snapshot) if idf_snapshot is not None else
+                    json.loads(idf_path.read_text(encoding="utf-8")) if idf_path.is_file() else
+                    load_or_build_idf_snapshot(index, source_path))
+    validate_idf_snapshot(idf_snapshot, index)
+    if idf_path.is_file():
+        if json.loads(idf_path.read_text(encoding="utf-8")) != idf_snapshot:
+            raise ValueError("Frozen dedup IDF snapshot changed")
+    else:
+        write_json(idf_path, idf_snapshot)
     run_contract: JsonObject = {
         "config_version": config.config_version,
         "p1_supplement_algorithm": "adaptive_cluster_batches_1",
@@ -873,6 +900,8 @@ def run_build(
         "taxonomy_sha256": index.metadata.get("taxonomy_sha256"),
         "canonical_index_version": index.metadata.get("canonical_index_version"),
         "feature_rule_version": index.metadata.get("feature_rule_version"),
+        "dedup_rules_sha256": RULES_SHA256,
+        "dedup_idf_sha256": idf_snapshot["content_sha256"],
     }
     contract_path = run_root / "p012_run_contract.json"
     if contract_path.is_file():
@@ -956,11 +985,6 @@ def run_build(
     materialized: dict[str, JsonObject] = {}
     final_state = load_stage_checkpoint("final_membership", "final_membership")
     if final_state is None:
-        dedup_thresholds = {
-            "P0": config.sampling.p0.dedup_threshold,
-            "P1": config.sampling.p1.dedup_threshold,
-            "P2": config.sampling.p2.dedup_threshold,
-        }
         branch_states: dict[str, JsonObject] = {}
         missing: list[str] = []
         for set_name in ("P0", "P1"):
@@ -1000,18 +1024,46 @@ def run_build(
                     set_name, started = futures[future]
                     locators = future.result()
                     raw = _materialize(index, source_path, taxonomy, locators, materialized)
+                    dedup_events: list[JsonObject] = []
                     candidates = _deduplicate(
                         set_name,
                         raw,
-                        threshold=dedup_thresholds[set_name],
+                        config=config.sampling.dedup,
+                        idf_snapshot=idf_snapshot,
+                        audit=dedup_events,
                     )
+                    sampled_ids = [locator["source_identity_sha256"] for locator in locators]
+                    p0_gap = 0
+                    if set_name == "P0":
+                        target_by_cluster = Counter(item["cluster_id"] for item in locators)
+                        while True:
+                            kept_by_cluster = Counter(item["taxonomy"]["cluster_id"] for item in candidates)
+                            deficits = {key: count - kept_by_cluster[key] for key, count in target_by_cluster.items()
+                                        if count > kept_by_cluster[key]}
+                            if not deficits:
+                                break
+                            replacements = _sample_branch(
+                                "P0", index, source_path, taxonomy, config.sampling,
+                                sampled_ids, deficits,
+                            )
+                            if not replacements:
+                                p0_gap = sum(deficits.values())
+                                break
+                            sampled_ids.extend(item["source_identity_sha256"] for item in replacements)
+                            replacement_raw = _materialize(index, source_path, taxonomy, replacements, materialized)
+                            additions = _deduplicate(
+                                "P0", replacement_raw, candidates,
+                                config=config.sampling.dedup,
+                                idf_snapshot=idf_snapshot, audit=dedup_events,
+                            )
+                            candidates.extend(additions)
                     state = {
                         "set": set_name,
-                        "sampled_count": len(locators),
-                        "sampled_identities": [
-                            locator["source_identity_sha256"] for locator in locators
-                        ],
+                        "sampled_count": len(sampled_ids),
+                        "sampled_identities": sampled_ids,
                         "candidates": candidates,
+                        "dedup_audit": dedup_events,
+                        "dedup_backfill_gap": p0_gap,
                     }
                     checkpoints.save(f"initial_{set_name.lower()}", state)
                     branch_states[set_name] = state
@@ -1041,6 +1093,9 @@ def run_build(
             "P0": list(branch_states["P0"]["candidates"]),
             "P1": list(branch_states["P1"]["candidates"]),
             "P2": [],
+        }
+        dedup_events_by_set = {
+            name: list(branch_states[name]["dedup_audit"]) for name in ("P0", "P1")
         }
         for set_name, candidates in candidate_sets.items():
             branch_root = run_root / set_name
@@ -1259,9 +1314,11 @@ def run_build(
                     new_materialized = _materialize(
                         index, source_path, taxonomy, locators, materialized
                     )
+                    batch_dedup: list[JsonObject] = []
                     new_candidates = _deduplicate(
-                        "P1", new_materialized, accepted["P1"],
-                        threshold=config.sampling.p1.dedup_threshold,
+                        "P1", new_materialized, evaluated_candidates["P1"],
+                        config=config.sampling.dedup,
+                        idf_snapshot=idf_snapshot, audit=batch_dedup,
                     )
                     sampled_l2 = Counter(item["l2_key"] for item in locators)
                     sampled_cluster = Counter(
@@ -1289,11 +1346,13 @@ def run_build(
                             for cluster, count in sorted(cold_cluster.items(), key=lambda item: str(item[0]))
                         ],
                         "candidates": new_candidates,
+                        "dedup_audit": batch_dedup,
                     }
                     checkpoints.save(plan_name, plan)
                 elif plan["requested_by_l2"] != batch_request:
                     raise ValueError(f"P1 第 {round_id} 轮第 {batch_id} 批计划与续跑状态不一致")
                 processed.update(plan["sampled_identities"])
+                dedup_events_by_set["P1"].extend(plan["dedup_audit"])
                 used.update(plan["sampled_by_l2"])
                 for row in plan["sampled_by_cluster"]:
                     cluster = row["cluster_id"]
@@ -1463,7 +1522,9 @@ def run_build(
             checkpoints=checkpoints,
             materialized=materialized,
             logger=active_logger,
+            idf_snapshot=idf_snapshot,
         )
+        dedup_events_by_set["P2"] = list(p2_state["dedup_audit"])
         accepted["P2"] = list(p2_state["selected"])
         evaluated_candidates["P2"] = list(p2_state["evaluated_candidates"])
         evaluation_rounds["P2"] = dict(p2_state["evaluation_rounds"])
@@ -1496,6 +1557,8 @@ def run_build(
             "evaluated_candidates": evaluated_candidates,
             "evaluation_rounds": evaluation_rounds,
             "audits": audits,
+            "dedup_audits": dedup_events_by_set,
+            "p0_dedup_backfill_gap": branch_states["P0"].get("dedup_backfill_gap", 0),
             "p1_target_quotas": p1_target_quotas,
             "supplement_rounds": supplement_rounds,
             "p1_candidate_remaining_by_l2": {
@@ -1557,6 +1620,10 @@ def run_build(
         for name in ("P0", "P1", "P2")
     }
     audits = {name: dict(final_state["audits"][name]) for name in ("P0", "P1", "P2")}
+    for name in ("P0", "P1", "P2"):
+        branch_root = run_root / name
+        branch_root.mkdir(parents=True, exist_ok=True)
+        write_jsonl(branch_root / "dedup_audit.jsonl", final_state["dedup_audits"][name])
     p1_target_quotas = {
         str(key): int(value) for key, value in final_state["p1_target_quotas"].items()
     }
@@ -1627,14 +1694,13 @@ def run_build(
     risk_snapshot = json.loads((run_root / "risk_keywords.json").read_text(encoding="utf-8"))
     output: dict[str, tuple[JsonObject, ...]] = {}
     for set_name in ("P0", "P1", "P2"):
-        seen_texts: set[str] = set()
         records = tuple(
             build_screened_canonical_record(
                 set_name,
                 candidate,
                 stage1[candidate["source_identity_sha256"]],
                 stage2[candidate["source_identity_sha256"]],
-                delivery_labels(candidate, stage2[candidate["source_identity_sha256"]], risk_snapshot, seen_texts),
+                delivery_labels(candidate, stage2[candidate["source_identity_sha256"]], risk_snapshot),
                 challenge_result=(
                     challenge_results[candidate["source_identity_sha256"]]
                     if set_name == "P2" else None
@@ -1704,7 +1770,7 @@ def run_build(
             root_export_report,
             {
                 "legacy_schema": "labeled_v5",
-                "legacy_mapping_version": 2,
+                "legacy_mapping_version": LEGACY_MAPPING_VERSION,
                 "sets": export_reports,
                 "total_records": sum(len(records) for records in output.values()),
                 "lossy_enum_mappings": 0,
@@ -1797,6 +1863,19 @@ def run_build(
         "P1_P2": len(identities["P1"] & identities["P2"]),
         "P0_P1_P2": len(identities["P0"] & identities["P1"] & identities["P2"]),
     }
+    dedup_summary = {
+        name: {
+            "exact_dropped": sum(row["reason"] == "exact_normalized" and row["decision"] == "drop"
+                                 for row in final_state["dedup_audits"][name]),
+            "near_dropped": sum(row["reason"] == "near_duplicate" and row["decision"] == "drop"
+                                for row in final_state["dedup_audits"][name]),
+            "borderline_retained": sum(row["decision"] == "retain"
+                                       for row in final_state["dedup_audits"][name]),
+            "audit_path": f"{name}/dedup_audit.jsonl",
+            "backfill_gap": int(final_state["p0_dedup_backfill_gap"]) if name == "P0" else 0,
+        }
+        for name in ("P0", "P1", "P2")
+    }
     summary: JsonObject = {
         "config_version": config.config_version,
         "config": asdict(config),
@@ -1817,6 +1896,7 @@ def run_build(
         "p1_supplement": supplement_summary,
         "p2_adaptive": p2_diagnostics,
         "cross_set_overlap": overlap,
+        "dedup": dedup_summary,
     }
     supplement_sampled = sum(int(item.get("sampled", 0)) for item in supplement_rounds)
     supplement_after_dedup = sum(int(item.get("after_dedup", 0)) for item in supplement_rounds)

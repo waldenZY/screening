@@ -1,8 +1,8 @@
 # Screening v3 当前文档
 
-当前运行使用 `config_version=4`、Stage2 `quality_contract_version=6`、
-`screened_schema_version=4`，交付为 30 字段 `labeled_v5`。P0/P1/P2 的采样与准入
-遵循当前实现；`intent_label` 和 `executable` 只增加下游筛选信息，不删减最终成员。
+当前运行使用 `config_version=5`、Stage2 `quality_contract_version=6`、
+`screened_schema_version=5`，交付为 30 字段 `labeled_v5`。P0/P1/P2 的准入
+遵循当前实现；候选去重统一在 Stage1 前执行，`intent_label` 和 `executable` 只增加下游筛选信息，不删减通过准入的最终成员。
 
 | 文档 | 用途 |
 | --- | --- |

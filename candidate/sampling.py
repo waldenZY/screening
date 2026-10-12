@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from .index import CanonicalCandidateIndex
+from .dedup import DedupConfig, normalize_text, selection_text, weighted_jaccard, edit_similarity
 from ..shared.json_io import JsonObject
 from ..shared.taxonomy import TaxonomyMappings
 
@@ -32,7 +33,6 @@ class P0SamplingConfig:
     max_per_cluster: int = 5
     fallback_pool_size: int = 10
     mmr_lambda: float = 0.7
-    dedup_threshold: float = 0.7
 
     def __post_init__(self) -> None:
         for name in (
@@ -42,7 +42,7 @@ class P0SamplingConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"P0 {name} 必须是正整数")
-        if not 0 <= self.mmr_lambda <= 1 or not 0 <= self.dedup_threshold <= 1:
+        if not 0 <= self.mmr_lambda <= 1:
             raise ValueError("P0 MMR/Jaccard 参数必须位于 [0, 1]")
 
 
@@ -57,7 +57,6 @@ class P1SamplingConfig:
     )
     cold_boundary_floor: int = 1
     mmr_lambda: float = 0.7
-    dedup_threshold: float = 0.75
 
     def __post_init__(self) -> None:
         if isinstance(self.target_n, bool) or not isinstance(self.target_n, int) or self.target_n < 1:
@@ -74,7 +73,7 @@ class P1SamplingConfig:
             raise ValueError("P1 九宫格权重不能全为零")
         if isinstance(self.cold_boundary_floor, bool) or not isinstance(self.cold_boundary_floor, int) or self.cold_boundary_floor < 0:
             raise ValueError("P1 cold_boundary_floor 必须是非负整数")
-        if not 0 <= self.mmr_lambda <= 1 or not 0 <= self.dedup_threshold <= 1:
+        if not 0 <= self.mmr_lambda <= 1:
             raise ValueError("P1 MMR/Jaccard 参数必须位于 [0, 1]")
 
 
@@ -92,7 +91,6 @@ class P2SamplingConfig:
     soft_min_per_type: int = 100
     max_per_primary: int = 700
     batch_size: int = 2000
-    dedup_threshold: float = 0.75
 
     def __post_init__(self) -> None:
         if isinstance(self.target_n, bool) or not isinstance(self.target_n, int) or self.target_n < 1:
@@ -123,12 +121,6 @@ class P2SamplingConfig:
             raise ValueError("P2 max_per_primary 不能小于软下限")
         if self.max_per_primary * 8 < self.target_n:
             raise ValueError("P2 八类 primary 上限之和不能小于 target_n")
-        if (
-            isinstance(self.dedup_threshold, bool)
-            or not isinstance(self.dedup_threshold, (int, float))
-            or not 0 <= self.dedup_threshold <= 1
-        ):
-            raise ValueError("P2 dedup_threshold 必须位于 [0, 1]")
         if self.minimum_complexity not in COMPLEXITY_RANK:
             raise ValueError("P2 minimum_complexity 枚举非法")
 
@@ -138,6 +130,7 @@ class SamplingConfig:
     p0: P0SamplingConfig = field(default_factory=P0SamplingConfig)
     p1: P1SamplingConfig = field(default_factory=P1SamplingConfig)
     p2: P2SamplingConfig = field(default_factory=P2SamplingConfig)
+    dedup: DedupConfig = field(default_factory=DedupConfig)
 
 
 def character_bigrams(text: str) -> frozenset[str]:
@@ -320,32 +313,23 @@ class CandidateSampler:
         return self._canonical_cache[identity]
 
     def _text(self, locator: Mapping[str, Any]) -> str:
-        candidate = self._materialize(locator)
-        conversation = candidate["conversation"]
-        return (
-            conversation["full_text"]
-            if conversation["sample_type"] == "multi_turn"
-            else conversation["target_query"]
-        )
+        return selection_text(self._materialize(locator))
 
     def _text_uncached(self, locator: Mapping[str, Any]) -> str:
-        candidate = self.index.materialize(self.source_path, locator, self.taxonomy)
-        conversation = candidate["conversation"]
-        return (
-            conversation["full_text"]
-            if conversation["sample_type"] == "multi_turn"
-            else conversation["target_query"]
-        )
+        return selection_text(self.index.materialize(self.source_path, locator, self.taxonomy))
 
     def _unique_text(self, values: Iterable[JsonObject]) -> list[JsonObject]:
-        result: list[JsonObject] = []
-        seen: set[str] = set()
+        chosen: dict[str, JsonObject] = {}
         for value in values:
-            text = self._text(value)
-            if text not in seen:
-                seen.add(text)
-                result.append(value)
-        return result
+            text = normalize_text(self._text(value))
+            previous = chosen.get(text)
+            if previous is None or (
+                -float(value["cluster_probability"]), int(value["source_line"])
+            ) < (
+                -float(previous["cluster_probability"]), int(previous["source_line"])
+            ):
+                chosen[text] = value
+        return list(chosen.values())
 
     def _mmr(
         self,
@@ -358,13 +342,24 @@ class CandidateSampler:
             return []
         if len(values) <= count:
             return list(values)
+        return self._mmr_order(values, score, lam, count)
+
+    def _mmr_order(
+        self,
+        values: Sequence[JsonObject],
+        score: str,
+        lam: float,
+        limit: int,
+    ) -> list[JsonObject]:
+        if not values:
+            return []
         ranked = sorted(
             values,
             key=lambda value: (-self._score(value, score), int(value["source_line"])),
         )
         selected = [ranked[0]]
         remaining = ranked[1:]
-        while len(selected) < count and remaining:
+        while remaining and len(selected) < limit:
             best = max(
                 remaining,
                 key=lambda value: (
@@ -384,8 +379,12 @@ class CandidateSampler:
             return float(value["cluster_probability"])
         return float(value["features"]["relevance"][score])
 
-    def sample_p0(self) -> list[JsonObject]:
+    def sample_p0(
+        self, excluded: Iterable[str] = (), *,
+        requested_by_cluster: Mapping[Any, int] | None = None,
+    ) -> list[JsonObject]:
         config = self.config.p0
+        excluded_set = set(excluded)
         cluster_counts = self.index.available_counts("cluster")
         result: list[JsonObject] = []
         for l1 in self.taxonomy.l1_order:
@@ -403,14 +402,25 @@ class CandidateSampler:
                 )
                 if not clusters or cluster_counts.get(clusters[0], 0) == 0:
                     continue
+                wanted = config.max_per_cluster if requested_by_cluster is None else requested_by_cluster.get(clusters[0], 0)
+                if wanted <= 0:
+                    continue
                 pool = self._unique_text(self.index.iter_by("cluster", clusters[0]))
                 high = [item for item in pool if item["features"]["probability_band"] == "high"]
                 if not high:
-                    high = sorted(
-                        pool,
+                    high = sorted(pool,
                         key=lambda item: (-self._score(item, "p0"), int(item["source_line"])),
                     )[: config.fallback_pool_size]
-                result.extend(self._mmr(high, config.max_per_cluster, "p0", config.mmr_lambda))
+                if requested_by_cluster is None:
+                    result.extend(self._mmr(high, wanted, "p0", config.mmr_lambda))
+                else:
+                    limit = wanted + sum(
+                        item["source_identity_sha256"] in excluded_set for item in high
+                    )
+                    order = self._mmr_order(high, "p0", config.mmr_lambda, limit)
+                    remaining = [item for item in order
+                                 if item["source_identity_sha256"] not in excluded_set]
+                    result.extend(remaining[:wanted])
                 self._canonical_cache.clear()
         return result
 
@@ -565,22 +575,15 @@ def deduplicate_branch_candidates(
     existing: Sequence[JsonObject] = (),
     *,
     text_getter: Any | None = None,
-    threshold: float | None = None,
+    config: DedupConfig | None = None,
+    idf_snapshot: Mapping[str, Any] | None = None,
+    audit: list[JsonObject] | None = None,
 ) -> list[JsonObject]:
-    """Deduplicate one branch while keeping ``existing`` records immutable."""
+    """Keep the prior representative priority; exact and confirmed near matches drop."""
     if set_name not in {"P0", "P1", "P2"}:
-        raise ValueError(f"未知数据集: {set_name}")
-    limits = {"P0": 0.7, "P1": 0.75, "P2": 0.75}
-    limit = limits[set_name] if threshold is None else threshold
-    if not 0.0 <= limit <= 1.0:
-        raise ValueError("Jaccard 阈值必须位于 [0, 1]")
-    getter = text_getter or (
-        lambda item: (
-            item["conversation"]["full_text"]
-            if "conversation" in item
-            else item["selection_text"]
-        )
-    )
+        raise ValueError(f"Unknown set: {set_name}")
+    rules = config or DedupConfig()
+    getter = text_getter or selection_text
     score_name = "p2" if set_name == "P2" else "cluster_probability"
 
     def score(item: Mapping[str, Any]) -> float:
@@ -591,9 +594,11 @@ def deduplicate_branch_candidates(
         return float(item["features"]["relevance"]["p2"])
 
     accepted = list(existing)
-    accepted_bigrams = [character_bigrams(str(getter(item))) for item in accepted]
+    texts = [normalize_text(str(getter(item))) for item in accepted]
+    bigrams = [character_bigrams(value) for value in texts]
+    exact = {value: index for index, value in enumerate(texts)}
     inverted: dict[str, set[int]] = defaultdict(set)
-    for index, grams in enumerate(accepted_bigrams):
+    for index, grams in enumerate(bigrams):
         for gram in grams:
             inverted[gram].add(index)
     existing_ids = {item["source_identity_sha256"] for item in existing}
@@ -603,22 +608,52 @@ def deduplicate_branch_candidates(
     )
     newly_accepted: list[JsonObject] = []
     for item in ranked:
-        grams = character_bigrams(str(getter(item)))
-        possible: set[int] = set()
-        for gram in grams:
-            possible.update(inverted.get(gram, ()))
-        duplicate = False
-        for index in possible:
-            other = accepted_bigrams[index]
-            similarity = len(grams & other) / len(grams | other) if grams and other else 0.0
-            if similarity > limit:
-                duplicate = True
-                break
-        if duplicate:
+        value = normalize_text(str(getter(item)))
+        grams = character_bigrams(value)
+        exact_index = exact.get(value)
+        if exact_index is not None:
+            if audit is not None:
+                audit.append({"decision": "drop", "reason": "exact_normalized",
+                              "candidate": item["source_identity_sha256"],
+                              "representative": accepted[exact_index]["source_identity_sha256"],
+                              "candidate_jaccard": 1.0, "weighted_jaccard": 1.0, "edit_similarity": 1.0})
             continue
+        possible: set[int] = set(range(len(accepted))) if rules.candidate_jaccard_min == 0 else set()
+        if rules.candidate_jaccard_min > 0:
+            for gram in grams:
+                possible.update(inverted.get(gram, ()))
+        duplicate: JsonObject | None = None
+        borderlines: list[JsonObject] = []
+        for index in sorted(possible):
+            other = bigrams[index]
+            similarity = len(grams & other) / len(grams | other) if grams and other else 0.0
+            item_l2 = item.get("l2_key", item.get("taxonomy", {}).get("l2_key"))
+            other_l2 = accepted[index].get("l2_key", accepted[index].get("taxonomy", {}).get("l2_key"))
+            if similarity < rules.candidate_jaccard_min or item_l2 != other_l2:
+                continue
+            if idf_snapshot is None:
+                raise ValueError("Near duplicate comparison requires a frozen corpus IDF snapshot")
+            weighted = weighted_jaccard(value, texts[index], idf_snapshot)
+            edit = edit_similarity(value, texts[index])
+            comparison = {"candidate": item["source_identity_sha256"],
+                          "representative": accepted[index]["source_identity_sha256"],
+                          "candidate_jaccard": similarity, "weighted_jaccard": weighted,
+                          "edit_similarity": edit}
+            if weighted >= rules.weighted_jaccard_min and edit >= rules.edit_similarity_min:
+                duplicate = {"decision": "drop", "reason": "near_duplicate", **comparison}
+                break
+            borderlines.append({"decision": "retain", "reason": "below_confirmation_threshold", **comparison})
+        if duplicate is not None:
+            if audit is not None:
+                audit.append(duplicate)
+            continue
+        if audit is not None:
+            audit.extend(borderlines)
         index = len(accepted)
         accepted.append(item)
-        accepted_bigrams.append(grams)
+        texts.append(value)
+        bigrams.append(grams)
+        exact[value] = index
         newly_accepted.append(item)
         for gram in grams:
             inverted[gram].add(index)
