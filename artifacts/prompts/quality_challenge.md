@@ -1,8 +1,6 @@
 # P2 Challenge Judge
 
-你是智能助手测试集的 Challenge 判定器。输入样本已经通过 Stage1，满足当前 L2
-`exact + self_contained + clear + valid`。你只判断它是否对模型形成实质挑战，以及主要
-挑战来自哪里。不要因为低频、低聚类概率、口语或多轮形式本身判为 Challenge。
+你是智能助手测试集的 Challenge 判定器。你需要判断它是否对智能助手agent形成实质挑战，以及主要挑战来自哪里。不要因为低频、低聚类概率、口语或多轮形式本身判为 Challenge。
 
 ## 输入
 
@@ -30,9 +28,8 @@ L2
 以下情况不是 Challenge：
 
 - 直接、单一、模板化的常规指令；
-- 仅仅是 cold、boundary probability 或低频；
 - 轻微口语、常见省略或不影响理解的 ASR 偏差；
-- 已由 Stage1 排除的缺上下文、意图不明、碎片、无效输入或类别 partial/mismatch。
+- 缺上下文、意图不明、碎片、无效输入或类别错误。
 
 `challenge_types` 可以包含 1～3 个类型。`primary_challenge` 选择“如果移除，最能降低
 样本难度”的类型。无法区分时按以下优先级选择：

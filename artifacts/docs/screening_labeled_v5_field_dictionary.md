@@ -16,7 +16,7 @@
 | 10 | `session_id` | string | 源会话 ID。 |
 | 11 | `set` | string enum | `P0_smoke`、`P1_benchmark`、`P2_adversarial`。 |
 | 12 | `quality_task_difficulty` | string enum | Stage2 任务难度：`atomic`、`simple`、`moderate`、`complex`、`extreme`、`not_applicable`。 |
-| 13 | `intent_label` | string enum | Stage2 基于完整会话主要意图判断：`task` 或 `qa`。无可评测目标归 `qa`。 |
+| 13 | `intent_label` | string enum | Stage2 基于完整有效任务判断：操作、服务查询、写作、总结、润色和规划归 `task`；知识问答、解释、翻译和计算归 `qa`。混合意图中的有效任务优先；无可评测目标归 `qa`。 |
 | 14 | `executable` | integer enum | `1` 表示未命中下游筛选条件；`0` 表示至少命中一个。正常问答也可以是 `1`。 |
 
 全部字段必须存在且不得为 `null`；只有 `context_text` 可以为空字符串。会话四字段必须满足上表关系。导出按内部记录顺序逐条映射，不改变 P0/P1/P2 成员数。
@@ -29,8 +29,12 @@
 
 ## 内部记录与审计
 
-`screened.canonical.jsonl` 的 `screened_schema_version=6`。它保存交付字段的来源数据、`raw_text`、`sample_type`、`complexity`、`length_bin`、Stage1 的 `category_fit`、`semantic_completeness`、`intent_clarity`、`validity`，Stage2 的 `task_difficulty`、`intent_label`、`execution_issues`，以及来源定位与哈希、P2 Challenge 结果、任务 ID、波次来源等技术元数据。概率档、频次档、归一化频次和相关度只在候选索引与采样中使用，不复制到最终逐条内部记录。`formality` 已从特征和索引移除。
+`screened.canonical.jsonl` 的 `screened_schema_version=7`。它保存交付字段的来源数据、`raw_text`、`sample_type`、`complexity`、`length_bin`、Stage1 的 `category_fit`、`semantic_completeness`、`intent_clarity`、`validity`、`blocking_issues`，Stage2 的 `task_difficulty`、`intent_label`、`execution_issues`，以及来源定位与哈希、P2 Challenge 结果、任务 ID、波次来源等技术元数据。概率档、频次档、归一化频次和相关度只在候选索引与采样中使用，不复制到最终逐条内部记录。`formality` 已从特征和索引移除。
 
-`execution_issues` 是内部语义原因数组；空数组表示没有这些障碍。`no_evaluable_goal` 要求 `intent_label=qa`。内部记录不保存 `quality_consistency` 或 `execution_reasons`。
+公共质量契约为 `quality_contract_version=9`。Stage1 只接收 `sample_type`、完整有序的 `conversation_turns` 和 `candidate_category={L1,L2}`；评价目标为最后一轮，前序用于恢复和核查。`blocking_issues` 六类枚举为 `attachment_dependency`、`missing_required_input`、`unresolved_reference`、`no_evaluable_goal`、`unrecoverable_text`、`unclear_evaluation_boundary`，以固定顺序保存，禁止重复和矛盾标签。四标签通过且该数组为空才准入；borderline 不准入。该数组仅内部保存，不增加交付字段。
+
+Stage2 仍只接收 `sample_type` 和完整有序的 `conversation_turns`，不接收类别或 Stage1 判断。前序片段也可能存在缺失、指代不明或冲突；最后一句的确认不会自动否定完整任务，明确取消或结束的内容不再累计。报告契约为 10，Stage2 语义问题复核信号分母为最终已打标成员，不代表人工真值准确率。
+
+`execution_issues` 是内部语义原因数组；空数组表示没有这些障碍。`task_difficulty=not_applicable` 当且仅当 `execution_issues=["no_evaluable_goal"]`，此时 `intent_label=qa`；无目标不能与其他障碍并列。`attachment_dependency` 根据纯文本所表达的必要内容依赖判断，不依赖附件标记；同一个缺失附件对象不重复记入 `unresolved_reference`。正常工具、权限、实时数据或补槽需求不单独构成 `other_unfit`。内部记录不保存 `quality_consistency` 或 `execution_reasons`。
 
 导出附带 `export_provenance.jsonl` 与 `legacy_export_report.json`，用于逐条哈希、字段和来源复验。旧契约 run 不按当前规则续跑或发布。

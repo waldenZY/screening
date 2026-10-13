@@ -7,11 +7,11 @@
 1. 规范化源数据，构建固定候选索引和采样特征。
 2. 公共索引与冻结输入就绪后，并发启动彼此独立的 P0、P1、P2 分支；各分支在 Stage1 前完成集合内去重。
 3. Stage1 判断准入；P0 随即冻结成员，P1 按冻结 L2 配额补采，P2 经 Challenge 判断并在预算内自适应补采。
-4. 每个分支一旦冻结成员便独立进入 Stage2，输出 `task_difficulty`、`intent_label`、`execution_issues`，只添加标签。
+4. 每个分支一旦冻结成员便独立进入 Stage2。LLM 只接收 `sample_type` 和完整有序的 `conversation_turns`，独立输出 `task_difficulty`、`intent_label`、`execution_issues`，只添加标签。
 5. 用冻结风险词表、会话和 Stage2 语义原因计算 `executable`，映射为 14 字段交付文件。
 6. 各分支独立生成报告、复验并按需事务发布；某分支失败不撤销或阻塞其他分支。所有分支终态后再生成总报告。
 
-Stage1 与 Challenge 的规则和 P0/P1/P2 成员数量规则保持不变。详情见 [技术设计](artifacts/docs/screening_pipeline_technical_design_v3.md)。
+Stage1 只接收完整轮次、样本类型和独立的候选类别，按需求可还原、关键输入可恢复及评价边界明确判断；新增 `blocking_issues`，四标签通过且无阻断原因才准入。当前质量契约为 9，旧 run 不迁移或续跑。Stage2、Challenge 与 P0/P1/P2 数量规则保持现状。详情见 [技术设计](artifacts/docs/screening_pipeline_technical_design_v3.md)。
 
 ## 配置与运行
 

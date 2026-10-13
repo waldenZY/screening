@@ -1,6 +1,6 @@
 # Screening v3 当前文档
 
-当前内部记录为 `screened_schema_version=6`，交付文件仍名为 `labeled_v5`，每条为 **14 字段**，映射契约版本为 4。旧 30 字段 v5 run 不兼容。
+当前内部记录为 `screened_schema_version=7`，质量契约为 9，报告契约为 10；交付文件仍名为 `labeled_v5`，每条为 **14 字段**，映射契约版本为 4。旧 run 不迁移或续跑。
 
 | 文档 | 内容 |
 | --- | --- |

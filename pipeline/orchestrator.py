@@ -46,6 +46,8 @@ from ..quality.two_stage import (
     TwoStageQualityRunner,
     challenge_passes,
     stage1_passes,
+    stage1_issue_summary,
+    stage2_semantic_review,
 )
 from .checkpoints import CheckpointStore
 
@@ -311,20 +313,17 @@ def _branch_audit(
     candidates: Sequence[JsonObject],
     stage1: Mapping[str, JsonObject],
 ) -> JsonObject:
-    rejected = Counter()
-    for candidate in candidates:
-        result = stage1[candidate["source_identity_sha256"]]
-        if not stage1_passes(result):
-            rejected["/".join(result[key] for key in (
-                "category_fit", "semantic_completeness", "intent_clarity", "validity"
-            ))] += 1
+    issues = stage1_issue_summary([
+        stage1[candidate["source_identity_sha256"]] for candidate in candidates
+    ])
+    rejected = sum(issues["stage1_rejection_combinations"].values())
     return {
         "set": set_name,
         "sampled": sampled,
         "after_dedup": deduplicated,
-        "stage1_pass": deduplicated - sum(rejected.values()),
-        "stage1_rejected": sum(rejected.values()),
-        "stage1_rejection_combinations": dict(sorted(rejected.items())),
+        "stage1_pass": deduplicated - rejected,
+        "stage1_rejected": rejected,
+        **issues,
     }
 
 
@@ -368,11 +367,10 @@ def _quality_task_id(
     runner: Any,
     stage: str,
     candidate: Mapping[str, Any],
-    stage1_result: Mapping[str, Any] | None = None,
 ) -> str:
     task_id = getattr(runner, "task_id", None)
     if callable(task_id):
-        return str(task_id(stage, candidate, stage1_result))
+        return str(task_id(stage, candidate))
     # Test doubles may not implement the persistent cache contract.  Keep their
     # screened fixtures deterministic without pretending to reference a ledger.
     return f"{stage}:{candidate['conversation_sha256']}:{candidate['taxonomy']['l2_key']}"
@@ -1161,12 +1159,8 @@ def _finalize_branch(
     stage2_checkpoint = checkpoints.load("stage2")
     if stage2_checkpoint is None:
         _set_branch_status(run_root, set_name, "running", stage="stage2")
-        selected_stage1 = {
-            candidate["source_identity_sha256"]: stage1[candidate["source_identity_sha256"]]
-            for candidate in selected
-        }
         stage2 = _run_quality(
-            quality_runner, "run_stage2", selected, set_name, selected_stage1
+            quality_runner, "run_stage2", selected, set_name
         ) if selected else {}
         checkpoints.save("stage2", {"results": stage2})
     else:
@@ -1198,7 +1192,6 @@ def _finalize_branch(
             stage1_task_id=_quality_task_id(quality_runner, "stage1", candidate),
             stage2_task_id=_quality_task_id(
                 quality_runner, "stage2", candidate,
-                stage1[candidate["source_identity_sha256"]],
             ),
         )
         for candidate in selected
@@ -1212,7 +1205,12 @@ def _finalize_branch(
     )
     _set_branch_status(run_root, set_name, "running", stage="export")
     export_report = export_legacy_branch(set_name, records, branch_root)
-    final_audit = {**audit, "final": len(records)}
+    final_audit = {
+        **audit, "final": len(records),
+        "stage2_semantic_review": stage2_semantic_review([
+            stage2[candidate["source_identity_sha256"]] for candidate in selected
+        ]),
+    }
     write_json(branch_root / "branch_audit.json", final_audit)
     write_json(
         branch_root / "branch_report.json",
@@ -1864,7 +1862,8 @@ def run_build(
                 "completed_sets": sorted(results),
                 "failed_sets": dict(errors),
                 "sets": {
-                    name: {"final_count": len(value["records"]), "status": "completed"}
+                    name: {"final_count": len(value["records"]), "status": "completed",
+                           "audit": value["audit"]}
                     for name, value in results.items()
                 },
                 "cross_set_overlap": summary["cross_set_overlap"],

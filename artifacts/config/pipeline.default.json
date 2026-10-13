@@ -14,8 +14,8 @@
     "stage2": "../prompts/quality_stage2.md"
   },
   "quality": {
-    "workers": 8,
-    "max_retries": 10,
+    "workers": 10,
+    "max_retries": 20,
     "sleep_seconds": 1.0
   },
   "index": {
@@ -98,7 +98,7 @@
     "minimum_yield": 0.005,
     "safety_factor": 1.1,
     "exploration_share": 0.2,
-    "max_sampled": 15000,
+    "max_sampled": 20000,
     "max_tail_sampled": 1000,
     "tail_batch_size": 250,
     "max_stalled_batches": 2

@@ -14,9 +14,13 @@
 
 ## 2. 判断阶段
 
-Stage1 严格 JSON 输出四项：`category_fit`、`semantic_completeness`、`intent_clarity`、`validity`。既有准入标准不变。P2 Challenge 严格 JSON 输出 `is_challenge`、`primary_challenge`、`challenge_types`；它只决定 P2 候选是否满足挑战条件。
+Stage1 输入恰好为 `sample_type`、`conversation_turns`、`candidate_category={L1,L2}`，轮次从 canonical 的 `conversation.full_text` 按既有规则生成，不能由清洗后的目标轮重建。最后一轮为测试目标，前序仅用于理解、恢复和核查；前序有请求不能自动证明目标轮有效。类别只能核验，不能补造目标、对象或状态。调用为一条 user 消息，Prompt 唯一占位符为 `{CANDIDATE_JSON}`，样本中的标注指令不可执行。
 
-成员确定后，Stage2 仅对最终成员独立判断，严格 JSON 只输出：
+Stage1 严格 JSON 输出五项：`category_fit`、`semantic_completeness`、`intent_clarity`、`validity`、`blocking_issues`。统一准入为 `exact + self_contained + clear + valid + blocking_issues=[]`。需求须可还原、关键输入须可恢复、响应须有明确评价边界；允许口语、多轮省略及非唯一答案。普通参数缺失由 LLM 判断能否形成可评价的正常澄清，允许 valid 或 borderline，程序不按关键词强制增删原因；borderline 不准入。
+
+阻断原因固定为 `attachment_dependency`、`missing_required_input`、`unresolved_reference`、`no_evaluable_goal`、`unrecoverable_text`、`unclear_evaluation_boundary`，按此顺序规范化，拒绝非法或重复原因。同一缺失内容不重复归因。非空原因不能为 valid；附件/关键输入/指代缺失必须为 context_dependent；不可恢复文本必须为 fragments；无目标必须为 no_intent。矛盾响应作为契约错误重试，不静默覆盖标签。规则和正反例见 [Stage1 Prompt](../prompts/quality_stage1.md)。P2 Challenge 的输入、缓存和输出保持现状，它只决定 P2 挑战资格。
+
+成员确定后，Stage2 仅对最终成员独立判断。输入严格为 `sample_type` 和有序纯文本数组 `conversation_turns`，从 canonical 的 `conversation.full_text` 按既有轮次规则生成；不从清洗后的 `target_query` 重建，不提供 `L1/L2`、Stage1 判断、采样信号、集合、附件或角色状态字段。Stage1 准入仍由编排器和内部记录校验保证。Stage2 严格 JSON 只输出：
 
 ```json
 {
@@ -26,9 +30,13 @@ Stage1 严格 JSON 输出四项：`category_fit`、`semantic_completeness`、`in
 }
 ```
 
-`task_difficulty` 可取 `atomic`、`simple`、`moderate`、`complex`、`extreme`、`not_applicable`。`intent_label` 基于完整会话的主要意图区分 `task` 与 `qa`；纯语气或情绪且无可评测目标归 `qa`。`execution_issues` 只能包含 `no_evaluable_goal`、`attachment_dependency`、`unresolved_reference`、`other_unfit`，无障碍时为空数组；`no_evaluable_goal` 要求 `intent_label=qa`。判断细则以 [当前 Stage2 Prompt](../prompts/quality_stage2.md) 为准。
+`task_difficulty` 可取 `atomic`、`simple`、`moderate`、`complex`、`extreme`、`not_applicable`，按实质推理、约束组合和步骤依赖判断。完整有效任务包括相关前序目标、补充条件和明确纠正后的要求；明确取消或结束的内容不累计，不能仅凭最后一句确认就判无目标，也不能默认前序正确或已执行。
 
-Stage2 不筛掉成员。其结果进入 `quality/stage2_results.jsonl` 账本及内部逐条记录。任务键和缓存键仍受 Prompt、模型参数、会话及 Stage1 结果约束，以便断点续跑和相同调用复用。旧跨阶段一致率及 `stage2_consistency.jsonl` 已移除。
+`intent_label` 中，操作、服务查询、写作、总结、润色和规划归 `task`，知识问答、解释、翻译和计算归 `qa`；混合意图中的有效操作、服务或生成任务优先。`execution_issues` 只能包含 `no_evaluable_goal`、`attachment_dependency`、`unresolved_reference`、`other_unfit`，无障碍时为空数组。`not_applicable` 当且仅当原因数组只有 `no_evaluable_goal`，此时意图必须为 `qa`。附件依赖根据文字中的必要内容依赖判断，不要求附件标记；正常工具、权限、实时数据和补槽不单独构成障碍。判断细则以 [当前 Stage2 Prompt](../prompts/quality_stage2.md) 为准。
+
+Stage2 不筛掉成员。其结果进入 `quality/stage2_results.jsonl` 账本及内部逐条记录。Stage1 和 Stage2 任务/缓存键均由阶段、Prompt 哈希、模型参数哈希和实际 payload 哈希决定；账本保存 `input_sha256` 而非代表样本完整 taxonomy 摘要。Stage1 的 `candidate_category_sha256` 仅计算实际输入类别，簇等非输入元数据不造成合并冲突。来源身份与行号按相同输入合并；Stage1 同类别同文本可跨分支复用，Stage2 不含类别或 Stage1 结果，可进一步跨分类复用。Challenge 的键保持现状。旧跨阶段一致率及 `stage2_consistency.jsonl` 已移除。
+
+接口为 `run_stage2(candidates, *, branch=...)`、`task_id(stage, candidate)` 和 `validate_stage2_result(value)`，不要求 Stage1 结果参数。当前质量契约从 8 升为 9，新语义创建新 run，不迁移或续跑旧检查点。Stage2 输入及标注语义保持现状。
 
 ## 3. 下游标签
 
@@ -38,14 +46,18 @@ Stage2 不筛掉成员。其结果进入 `quality/stage2_results.jsonl` 账本�
 
 ## 4. 内部记录、交付与报告
 
-每集合的 `screened.canonical.jsonl` 为内部权威记录，`screened_schema_version=6`。逐条记录包含 `set`、候选来源/分类/会话与必要信号、`raw_text`、`sample_type`、`length_bin`、`complexity`、Stage1 四项、Stage2 三项、`delivery_labels` 两项、P2 Challenge、任务关联 ID 和波次元数据。候选阶段的概率档、频次档、归一化频次、相关度不复制到最终内部记录；内部不保存 `quality_consistency` 或 `execution_reasons`。
+每集合的 `screened.canonical.jsonl` 为内部权威记录，`screened_schema_version=7`。逐条记录包含 `set`、候选来源/分类/会话与必要信号、`raw_text`、`sample_type`、`length_bin`、`complexity`、Stage1 五项、Stage2 三项、`delivery_labels` 两项、P2 Challenge、任务关联 ID 和波次元数据。候选阶段的概率档、频次档、归一化频次、相关度不复制到最终内部记录；内部不保存 `quality_consistency` 或 `execution_reasons`。
 
 最终交付仍为 `labeled_v5`、沿用 v5 文件名，但映射契约提升为 `legacy_mapping_version=4`，每条恰好 [14 个固定字段](screening_labeled_v5_field_dictionary.md)。P0/P1/P2 分别写 `P0_smoke_set_v5_labeled.jsonl`、`P1_benchmark_set_v5_labeled.jsonl`、`P2_adversarial_set_v5_labeled.jsonl`。导出依内部记录稳定顺序逐条映射，不删 `executable=0` 的样本。内部 `export_provenance.jsonl` 记录逐条源、内部和导出哈希，`legacy_export_report.json` 记录字段检查。
 
-每个成功分支生成 `branch_report.json`，可独立校验和发布。所有分支进入终态后生成总报告；部分失败时写出成功分支、失败原因、缺失分支和成功分支间 overlap。`screening_run_report.json` / `.md` 报告 Stage1、Challenge、P1/P2 波次、配额、P2 预算、任务难度、`intent_label`、`executable` 与成员数。报告契约为 `report_schema_version=8`。
+每个成功分支生成 `branch_report.json`，可独立校验和发布。所有分支进入终态后生成总报告；部分失败时写出成功分支、失败原因、缺失分支和成功分支间 overlap。报告契约为 `report_schema_version=10`。全量、独立分支及部分失败报告均按分支统计 Stage1 六类阻断原因、borderline、invalid，保留原四标签拒绝组合；多原因计数允许重叠。最终成员的 Stage2 问题数量、分类及比例称为“Stage2 语义问题复核信号”，分母为该分支已完成 Stage2 的最终成员，不是人工真值准确率或误放行率。日志及报告不新增原始 Query 或自由文本理由。
 
 ## 5. 发布复验与兼容性
 
 发布前独立核对当前 run 契约、源和索引、Stage1/Challenge/Stage2 结果账本、最终成员任务、内部记录、每集合文本唯一、14 字段顺序/类型/会话关系、内部与导出逐条一致性、报告统计及产物哈希。`executable` 从冻结词表、会话和 `execution_issues` 重新计算，不能只信任内部存值。交付记录数必须等于最终成员数。
+
+全量与单分支发布均从最终成员重算 Stage1/Stage2 输入哈希和任务键，核对任务来源、结果及 Stage1 无阻断准入条件。分支审计按其候选身份核对 Stage1 结果，Stage2 统计按最终成员核对。单分支不要求其他分支账本全部进入终态。
+
+固定的 [Stage1 离线样例](../evals/stage1_cases.json) 和 [28 条 Stage2 离线样例](../evals/stage2_cases.json) 覆盖标注边界，供人工核对规则和期望标签。Stage2 样例仅同步公共质量契约版本。请求捕获、缓存复用、输出约束和发布复验通过模拟 LLM 验证；这些测试不测量真实模型准确率，本轮不调用真实模型。
 
 manifest 分别记录 P0/P1/P2 的阶段、耗时、错误、产物和发布状态。全部成功时总状态为 `completed` 或 `published`；部分失败为 `partial_failed`；全部失败为 `failed`。当前并发契约不续跑旧 pipeline/build/manifest/report 版本。发布目标若已有同名不同内容，默认停止；使用新目录或显式替换。测试位于项目外部 `tests/`，包括并发上限、公平调度、分支故障隔离、断点续跑与篡改阻止发布。

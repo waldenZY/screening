@@ -15,6 +15,11 @@ from ..quality.two_stage import (
     CHALLENGE_TYPES,
     TASK_DIFFICULTIES,
     STAGE2_FIELDS,
+    STAGE1_FIELDS,
+    STAGE1_BLOCKING_ISSUES,
+    EXECUTION_ISSUES,
+    stage1_issue_summary,
+    stage2_semantic_review,
     validate_stage1_result,
     validate_stage2_result,
     stage1_passes,
@@ -24,12 +29,12 @@ from ..shared.taxonomy import TaxonomyMappings
 from .screened import validate_screened_canonical_record
 
 
-RUN_REPORT_SCHEMA_VERSION = 9
+RUN_REPORT_SCHEMA_VERSION = 10
 RUN_REPORT_JSON = "screening_run_report.json"
 RUN_REPORT_MARKDOWN = "screening_run_report.md"
 SET_NAMES = ("P0", "P1", "P2")
 _CATEGORY_FIT_VALUES = ("exact", "partial", "mismatch")
-_SENSITIVE_KEYS = frozenset({"text", "raw_text", "target_query", "context_turns", "full_text"})
+_SENSITIVE_KEYS = frozenset({"text", "raw_text", "target_query", "context_turns", "conversation_turns", "full_text"})
 
 
 class RunReportError(ValueError):
@@ -51,6 +56,7 @@ def _is_usable(stage1: Mapping[str, Any]) -> bool:
         stage1["semantic_completeness"] == "self_contained"
         and stage1["intent_clarity"] == "clear"
         and stage1["validity"] == "valid"
+        and not stage1["blocking_issues"]
     )
 
 
@@ -333,15 +339,14 @@ def build_run_report(
             round_id = int(record["selection"]["round_id"])
             final_round_counts[round_id] += 1
             quality = record["quality"]
-            stage1 = validate_stage1_result(
+            validate_stage1_result(
                 {
                     key: quality[key]
-                    for key in ("category_fit", "semantic_completeness", "intent_clarity", "validity")
+                    for key in STAGE1_FIELDS
                 }
             )
             validate_stage2_result(
                 {key: quality[key] for key in STAGE2_FIELDS},
-                stage1,
             )
             final_quality["task_difficulty"][quality["task_difficulty"]] += 1
             intent_labels[quality["intent_label"]] += 1
@@ -455,6 +460,14 @@ def build_run_report(
         set_report = {
             "coverage_scope": "p1_target_quota_l2" if set_name == "P1" else "stage1_evaluated_l2",
             **_finalize_counts(set_counts),
+            **stage1_issue_summary([
+                stage1_results[candidate["source_identity_sha256"]]
+                for candidate in evaluated_candidates[set_name]
+            ]),
+            "stage2_semantic_review": stage2_semantic_review([
+                {key: record["quality"][key] for key in STAGE2_FIELDS}
+                for record in final_records[set_name]
+            ]),
             "taxonomy_l1_coverage_rate": _ratio(
                 len(covered_l1), len(taxonomy.l1_order)
             ),
@@ -491,13 +504,13 @@ def build_run_report(
         ),
         "metric_definitions": {
             "query_usability_rate": (
-                "self_contained + clear + valid / all completed stage1 candidates"
+                "self_contained + clear + valid + no blocking issues / all completed stage1 candidates"
             ),
             "semantic_label_fit_rate": (
-                "category_fit=exact among self_contained + clear + valid candidates"
+                "category_fit=exact among self_contained + clear + valid + no blocking issues candidates"
             ),
             "stage1_admission_rate": (
-                "exact + self_contained + clear + valid / all completed stage1 candidates"
+                "exact + self_contained + clear + valid + no blocking issues / all completed stage1 candidates"
             ),
             "scope_l2_coverage_rate": (
                 "final covered L2 / reporting scope L2; P1 uses frozen quota L2, "
@@ -799,6 +812,35 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         set_report = report["sets"][set_name]
         if not isinstance(set_report, Mapping):
             raise RunReportError(f"{set_name} 报告必须是对象")
+        blockers = set_report.get("stage1_blocking_counts")
+        evaluated = set_report.get("stage1_evaluated", 0)
+        if (not isinstance(blockers, Mapping) or set(blockers) != set(STAGE1_BLOCKING_ISSUES)
+                or any(type(count) is not int or not 0 <= count <= evaluated for count in blockers.values())):
+            raise RunReportError(f"{set_name} Stage1 阻断统计非法；多原因计数允许重叠")
+        validity_counts = [set_report.get(key) for key in ("stage1_borderline", "stage1_invalid")]
+        if (any(type(count) is not int or count < 0 for count in validity_counts)
+                or sum(validity_counts) > evaluated - set_report.get("stage1_pass", 0)
+                or any(count > sum(validity_counts) for count in blockers.values())):
+            raise RunReportError(f"{set_name} Stage1 validity 统计不守恒")
+        rejections = set_report.get("stage1_rejection_combinations")
+        if (not isinstance(rejections, Mapping)
+                or any(not isinstance(key, str) or len(key.split("/")) != 4
+                       or type(count) is not int or count <= 0 for key, count in rejections.items())
+                or sum(rejections.values()) != evaluated - set_report.get("stage1_pass", 0)):
+            raise RunReportError(f"{set_name} Stage1 四标签拒绝组合不守恒")
+        review = set_report.get("stage2_semantic_review")
+        if not isinstance(review, Mapping):
+            raise RunReportError(f"{set_name} 缺少 Stage2 语义问题复核信号")
+        final_count = set_report["final_count"]
+        issue_count = review.get("with_issues")
+        issue_counts = review.get("by_issue")
+        if (review.get("evaluated_final") != final_count or type(issue_count) is not int
+                or not 0 <= issue_count <= final_count
+                or not isinstance(issue_counts, Mapping) or set(issue_counts) != set(EXECUTION_ISSUES)
+                or any(type(count) is not int or not 0 <= count <= issue_count for count in issue_counts.values())
+                or sum(issue_counts.values()) < issue_count
+                or review.get("rate") != (round(issue_count / final_count, 6) if final_count else None)):
+            raise RunReportError(f"{set_name} Stage2 语义问题复核统计不守恒")
         for metric in (
             "query_usability_rate",
             "semantic_label_fit_rate",
@@ -905,9 +947,9 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             "",
             "## 指标口径",
             "",
-            "- Query 基础可用率：Stage1 候选中同时满足 self_contained、clear、valid 的比例。",
+            "- Query 基础可用率：Stage1 候选中同时满足 self_contained、clear、valid 且无阻断原因的比例。",
             "- 语义标签一致率：基础可用 Query 中 category_fit=exact 的比例。",
-            "- Stage1 准入率：四项同时满足 exact、self_contained、clear、valid 的比例。",
+            "- Stage1 准入率：同时满足 exact、self_contained、clear、valid 且无阻断原因的比例。",
             "- P1 的目标范围为冻结配额大于 0 的 L2；P0/P2 的目标范围为实际进入 Stage1 的 L2。",
             "- 最终集 category_fit=exact 为准入约束，不作为独立准确率结论。",
         ]
@@ -1007,6 +1049,8 @@ def render_run_report(report: Mapping[str, Any]) -> str:
                 "### 质量与难度摘要",
                 "",
                 f"- Stage1 category_fit：exact={category['exact']}，partial={category['partial']}，mismatch={category['mismatch']}。",
+                f"- Stage1 阻断原因（多原因计数允许重叠）：{json.dumps(value['stage1_blocking_counts'], ensure_ascii=False, sort_keys=True)}；borderline={value['stage1_borderline']}，invalid={value['stage1_invalid']}。",
+                f"- Stage2 语义问题复核信号：{value['stage2_semantic_review']['with_issues']}/{value['stage2_semantic_review']['evaluated_final']}，比例={value['stage2_semantic_review']['rate']}；分类={json.dumps(value['stage2_semantic_review']['by_issue'], ensure_ascii=False, sort_keys=True)}。不是人工真值准确率。",
                 f"- Stage2 task_difficulty：{json.dumps(value['final_quality_distribution']['task_difficulty'], ensure_ascii=False, sort_keys=True)}。",
                 f"- intent_label：{json.dumps(value['final_quality_distribution']['intent_label'], ensure_ascii=False, sort_keys=True)}。",
                 f"- executable：{json.dumps(value['final_quality_distribution']['executable'], ensure_ascii=False, sort_keys=True)}。",

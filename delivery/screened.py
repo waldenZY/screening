@@ -21,7 +21,7 @@ from ..quality.two_stage import (
 )
 
 
-SCREENED_CANONICAL_SCHEMA_VERSION = 6
+SCREENED_CANONICAL_SCHEMA_VERSION = 7
 SET_NAMES = frozenset({"P0", "P1", "P2"})
 SELECTION_ORIGINS = frozenset({"initial_wave", "supplement_wave"})
 _HASH = re.compile(r"[0-9a-f]{64}")
@@ -68,7 +68,7 @@ def build_screened_canonical_record(
         "candidate": screened_candidate,
         "quality": {
             **validate_stage1_result(dict(stage1_result)),
-            **validate_stage2_result(dict(stage2_result), stage1_result),
+            **validate_stage2_result(dict(stage2_result)),
         },
         "delivery_labels": dict(delivery_labels),
         "challenge": (
@@ -133,7 +133,7 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
     stage1 = validate_stage1_result({key: quality[key] for key in STAGE1_FIELDS})
     if not stage1_passes(stage1):
         raise ScreenedCanonicalError("screened canonical 包含未通过第一阶段的样本")
-    stage2 = validate_stage2_result({key: quality[key] for key in STAGE2_FIELDS}, stage1)
+    stage2 = validate_stage2_result({key: quality[key] for key in STAGE2_FIELDS})
     labels = record.get("delivery_labels")
     if (not isinstance(labels, Mapping)
             or set(labels) != {"intent_label", "executable"}

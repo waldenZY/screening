@@ -8,7 +8,7 @@ import logging
 import sqlite3
 import threading
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -18,10 +18,15 @@ from typing import Any, Mapping, Sequence
 from ..shared.json_io import JsonObject, load_jsonl, try_parse_json, write_jsonl
 from ..shared.challenge import CHALLENGE_TYPES
 from ..shared.llm import LlmCall
+from ..candidate.contract import parse_conversation
 
 
 STAGE1_FIELDS = frozenset(
-    {"category_fit", "semantic_completeness", "intent_clarity", "validity"}
+    {"category_fit", "semantic_completeness", "intent_clarity", "validity", "blocking_issues"}
+)
+STAGE1_BLOCKING_ISSUES = (
+    "attachment_dependency", "missing_required_input", "unresolved_reference",
+    "no_evaluable_goal", "unrecoverable_text", "unclear_evaluation_boundary",
 )
 STAGE2_FIELDS = frozenset(
     {"task_difficulty", "intent_label", "execution_issues"}
@@ -41,7 +46,7 @@ STAGE1_ENUMS = {
 TASK_DIFFICULTIES = frozenset(
     {"atomic", "simple", "moderate", "complex", "extreme", "not_applicable"}
 )
-QUALITY_CONTRACT_VERSION = 7
+QUALITY_CONTRACT_VERSION = 9
 
 
 class QualityResponseError(ValueError):
@@ -183,13 +188,83 @@ def quality_input(candidate: Mapping[str, Any]) -> JsonObject:
     }
 
 
+def stage2_quality_input(candidate: Mapping[str, Any]) -> JsonObject:
+    """Describe the whole ordered sample without labels or upstream judgments."""
+    conversation = candidate["conversation"]
+    parsed = parse_conversation(conversation["full_text"])
+    if conversation["sample_type"] != parsed["sample_type"]:
+        raise ValueError("Stage2 sample_type 与完整会话轮次不一致")
+    return {
+        "sample_type": parsed["sample_type"],
+        "conversation_turns": parsed["full_text"].split(" | "),
+    }
+
+
+def stage1_quality_input(candidate: Mapping[str, Any]) -> JsonObject:
+    """Preserve every turn; isolate the candidate category used only for checking."""
+    payload = stage2_quality_input(candidate)
+    taxonomy = candidate["taxonomy"]
+    return {
+        **payload,
+        "candidate_category": {"L1": taxonomy["l1"], "L2": taxonomy["l2"]},
+    }
+
+
+def stage1_input_sha256(candidate: Mapping[str, Any]) -> str:
+    return _stable_hash(stage1_quality_input(candidate))
+
+
+def stage1_task_key(
+    candidate: Mapping[str, Any], *, prompt_sha256: str, options_sha256: str,
+) -> str:
+    return _stable_hash({
+        "stage": "stage1", "prompt": prompt_sha256, "options": options_sha256,
+        "input_sha256": stage1_input_sha256(candidate),
+    })
+
+
+def stage2_input_sha256(candidate: Mapping[str, Any]) -> str:
+    return _stable_hash(stage2_quality_input(candidate))
+
+
+def stage2_task_key(
+    candidate: Mapping[str, Any], *, prompt_sha256: str, options_sha256: str,
+) -> str:
+    """Freeze precisely the content sent to Stage2 and its inference settings."""
+    return _stable_hash({
+        "stage": "stage2",
+        "prompt": prompt_sha256,
+        "options": options_sha256,
+        "input_sha256": stage2_input_sha256(candidate),
+    })
+
+
 def validate_stage1_result(value: Any) -> JsonObject:
     if not isinstance(value, dict) or set(value) != STAGE1_FIELDS:
         raise QualityResponseError("第一阶段响应字段必须与白名单完全一致")
     for key, allowed in STAGE1_ENUMS.items():
-        if value.get(key) not in allowed:
+        if not isinstance(value.get(key), str) or value[key] not in allowed:
             raise QualityResponseError(f"第一阶段 {key} 枚举非法")
-    return {key: value[key] for key in sorted(STAGE1_FIELDS)}
+    issues = value["blocking_issues"]
+    if (
+        not isinstance(issues, list)
+        or any(not isinstance(item, str) or item not in STAGE1_BLOCKING_ISSUES for item in issues)
+        or len(issues) != len(set(issues))
+    ):
+        raise QualityResponseError("第一阶段 blocking_issues 非法")
+    if issues and value["validity"] == "valid":
+        raise QualityResponseError("有 blocking_issues 时 validity 不能为 valid")
+    if set(issues) & {"attachment_dependency", "missing_required_input", "unresolved_reference"}:
+        if value["semantic_completeness"] != "context_dependent":
+            raise QualityResponseError("缺关键输入时 semantic_completeness 必须为 context_dependent")
+    if "unrecoverable_text" in issues and value["semantic_completeness"] != "fragments":
+        raise QualityResponseError("unrecoverable_text 必须对应 fragments")
+    if "no_evaluable_goal" in issues and value["intent_clarity"] != "no_intent":
+        raise QualityResponseError("no_evaluable_goal 必须对应 no_intent")
+    return {
+        **{key: value[key] for key in sorted(STAGE1_ENUMS)},
+        "blocking_issues": [key for key in STAGE1_BLOCKING_ISSUES if key in issues],
+    }
 
 
 def stage1_passes(value: Mapping[str, Any]) -> bool:
@@ -199,6 +274,38 @@ def stage1_passes(value: Mapping[str, Any]) -> bool:
         "intent_clarity": "clear",
         "semantic_completeness": "self_contained",
         "validity": "valid",
+        "blocking_issues": [],
+    }
+
+
+def stage1_issue_summary(results: Sequence[Mapping[str, Any]]) -> JsonObject:
+    """Count per-candidate judgments and overlapping reasons without sample text."""
+    validated = [validate_stage1_result(dict(value)) for value in results]
+    counts = Counter(issue for value in validated for issue in value["blocking_issues"])
+    rejected = Counter(
+        "/".join(value[key] for key in (
+            "category_fit", "semantic_completeness", "intent_clarity", "validity"
+        )) for value in validated if not stage1_passes(value)
+    )
+    return {
+        "stage1_blocking_counts": {key: counts[key] for key in STAGE1_BLOCKING_ISSUES},
+        "stage1_borderline": sum(value["validity"] == "borderline" for value in validated),
+        "stage1_invalid": sum(value["validity"] == "invalid" for value in validated),
+        "stage1_rejection_combinations": dict(sorted(rejected.items())),
+    }
+
+
+def stage2_semantic_review(results: Sequence[Mapping[str, Any]]) -> JsonObject:
+    """Summarize final-member issues without implying human-gold accuracy."""
+    validated = [validate_stage2_result(dict(value)) for value in results]
+    counts = Counter(issue for value in validated for issue in value["execution_issues"])
+    with_issues = sum(bool(value["execution_issues"]) for value in validated)
+    return {
+        "notice": "Stage2 语义问题复核信号；不是人工真值准确率。分类计数允许重叠。",
+        "evaluated_final": len(validated),
+        "with_issues": with_issues,
+        "by_issue": {key: counts[key] for key in sorted(EXECUTION_ISSUES)},
+        "rate": None if not validated else round(with_issues / len(validated), 6),
     }
 
 
@@ -242,16 +349,15 @@ def challenge_passes(value: Mapping[str, Any]) -> bool:
     return bool(validate_challenge_result(dict(value))["is_challenge"])
 
 
-def validate_stage2_result(value: Any, stage1_result: Mapping[str, Any]) -> JsonObject:
-    validate_stage1_result(dict(stage1_result))
+def validate_stage2_result(value: Any) -> JsonObject:
     if not isinstance(value, dict) or set(value) != STAGE2_FIELDS:
         raise QualityResponseError("第二阶段响应字段必须与白名单完全一致")
     task = value.get("task_difficulty")
     intent_label = value.get("intent_label")
     execution_issues = value.get("execution_issues")
-    if task not in TASK_DIFFICULTIES:
+    if not isinstance(task, str) or task not in TASK_DIFFICULTIES:
         raise QualityResponseError("第二阶段 task_difficulty 枚举非法")
-    if intent_label not in INTENT_LABELS:
+    if not isinstance(intent_label, str) or intent_label not in INTENT_LABELS:
         raise QualityResponseError("第二阶段 intent_label 非法")
     if (not isinstance(execution_issues, list)
             or any(not isinstance(item, str) or item not in EXECUTION_ISSUES for item in execution_issues)
@@ -259,6 +365,11 @@ def validate_stage2_result(value: Any, stage1_result: Mapping[str, Any]) -> Json
         raise QualityResponseError("第二阶段 execution_issues 非法")
     if "no_evaluable_goal" in execution_issues and intent_label != "qa":
         raise QualityResponseError("无可评测目标时 intent_label 必须是 qa")
+    no_goal = "no_evaluable_goal" in execution_issues
+    if (task == "not_applicable") != no_goal:
+        raise QualityResponseError("not_applicable 必须与 no_evaluable_goal 同时出现")
+    if no_goal and execution_issues != ["no_evaluable_goal"]:
+        raise QualityResponseError("no_evaluable_goal 不得与其他 execution_issues 并列")
     return {
         "task_difficulty": task,
         "intent_label": intent_label,
@@ -359,8 +470,17 @@ class TwoStageQualityRunner:
         self,
         stage: str,
         candidate: Mapping[str, Any],
-        stage1_result: Mapping[str, Any] | None,
     ) -> str:
+        if stage == "stage1":
+            return stage1_task_key(
+                candidate, prompt_sha256=self.prompt_hashes[stage],
+                options_sha256=self.options_hash,
+            )
+        if stage == "stage2":
+            return stage2_task_key(
+                candidate, prompt_sha256=self.prompt_hashes[stage],
+                options_sha256=self.options_hash,
+            )
         taxonomy = candidate["taxonomy"]
         return _stable_hash(
             {
@@ -370,7 +490,7 @@ class TwoStageQualityRunner:
                 "conversation_sha256": candidate["conversation_sha256"],
                 "l1": taxonomy["l1"],
                 "l2": taxonomy["l2"],
-                "stage1": dict(stage1_result) if stage1_result is not None else None,
+                "stage1": None,
             }
         )
 
@@ -378,18 +498,11 @@ class TwoStageQualityRunner:
         self,
         stage: str,
         candidate: Mapping[str, Any],
-        stage1_result: Mapping[str, Any] | None = None,
     ) -> str:
         """Return the frozen task/cache identity recorded in the quality ledgers."""
         if stage not in {"stage1", "challenge", "stage2"}:
             raise ValueError(f"未知质量阶段: {stage}")
-        if stage == "stage1" and stage1_result is not None:
-            raise ValueError("第一阶段 task identity 不接受第一阶段结果")
-        if stage == "stage2" and stage1_result is None:
-            raise ValueError("第二阶段 task identity 必须包含第一阶段结果")
-        if stage == "challenge" and stage1_result is not None:
-            raise ValueError("Challenge task identity 不接受第一阶段结果")
-        return self._cache_key(stage, candidate, stage1_result)
+        return self._cache_key(stage, candidate)
 
     def _load_cached(self, keys: Sequence[str], stage: str) -> dict[str, JsonObject]:
         if not keys:
@@ -430,12 +543,12 @@ class TwoStageQualityRunner:
         self,
         stage: str,
         candidate: Mapping[str, Any],
-        stage1_result: Mapping[str, Any] | None,
         branch: str,
     ) -> tuple[JsonObject, float, float, str]:
-        payload = quality_input(candidate)
-        if stage1_result is not None:
-            payload.update(validate_stage1_result(dict(stage1_result)))
+        payload = (
+            stage1_quality_input(candidate) if stage == "stage1" else
+            stage2_quality_input(candidate) if stage == "stage2" else quality_input(candidate)
+        )
         prompt = self.prompts[stage].replace(
             "{CANDIDATE_JSON}", json.dumps(payload, ensure_ascii=False, indent=2)
         )
@@ -462,7 +575,7 @@ class TwoStageQualityRunner:
         elif stage == "challenge":
             result = validate_challenge_result(parsed)
         else:
-            result = validate_stage2_result(parsed, stage1_result or {})
+            result = validate_stage2_result(parsed)
         return result, first_latency, full_latency, hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _call_singleflight(
@@ -470,7 +583,6 @@ class TwoStageQualityRunner:
         key: str,
         stage: str,
         candidate: Mapping[str, Any],
-        stage1_result: Mapping[str, Any] | None,
         branch: str,
     ) -> tuple[JsonObject, float, float, str, bool]:
         """Reuse a concurrent branch's result instead of issuing the same request twice."""
@@ -482,7 +594,7 @@ class TwoStageQualityRunner:
                 output_hash = _stable_hash(concurrent_hit)
                 return concurrent_hit, 0.0, 0.0, output_hash, True
             result, first_latency, full_latency, output_hash = self._call(
-                stage, candidate, stage1_result, branch
+                stage, candidate, branch
             )
             # Commit while holding the key lock so every waiter observes the result.
             self._save_cached(stage, {key: result})
@@ -492,26 +604,21 @@ class TwoStageQualityRunner:
         self,
         stage: str,
         candidates: Sequence[JsonObject],
-        stage1_by_identity: Mapping[str, JsonObject] | None = None,
         *,
         branch: str = "shared",
     ) -> dict[str, JsonObject]:
         by_key: dict[str, list[JsonObject]] = defaultdict(list)
-        stage1_for_key: dict[str, JsonObject | None] = {}
         for candidate in candidates:
-            identity = candidate["source_identity_sha256"]
-            stage1 = stage1_by_identity[identity] if stage1_by_identity is not None else None
-            key = self._cache_key(stage, candidate, stage1)
+            key = self._cache_key(stage, candidate)
             by_key[key].append(candidate)
-            stage1_for_key[key] = stage1
         cached = self._load_cached(list(by_key), stage)
-        for matching_key, value in cached.items():
+        for value in cached.values():
             if stage == "stage1":
                 validate_stage1_result(value)
             elif stage == "challenge":
                 validate_challenge_result(value)
             else:
-                validate_stage2_result(value, stage1_for_key[matching_key] or {})
+                validate_stage2_result(value)
         if cached:
             cache_hit_rows = []
             for key in sorted(cached):
@@ -546,7 +653,17 @@ class TwoStageQualityRunner:
                     "source_lines": sorted({int(item["source"]["source_line"]) for item in grouped}),
                     "source_identities": sorted({item["source_identity_sha256"] for item in grouped}),
                     "conversation_sha256": representative["conversation_sha256"],
-                    "taxonomy_sha256": _stable_hash(representative["taxonomy"]),
+                    **(
+                        {"input_sha256": stage2_input_sha256(representative)}
+                        if stage == "stage2"
+                        else {
+                            "input_sha256": stage1_input_sha256(representative),
+                            "candidate_category_sha256": _stable_hash(
+                                stage1_quality_input(representative)["candidate_category"]
+                            ),
+                        } if stage == "stage1"
+                        else {"taxonomy_sha256": _stable_hash(representative["taxonomy"])}
+                    ),
                     "prompt_sha256": self.prompt_hashes[stage],
                     "options_sha256": self.options_hash,
                 }
@@ -585,7 +702,6 @@ class TwoStageQualityRunner:
                         key,
                         stage,
                         by_key[key][0],
-                        stage1_for_key[key],
                         branch,
                     ): key
                     for key in pending
@@ -696,11 +812,10 @@ class TwoStageQualityRunner:
     def run_stage2(
         self,
         candidates: Sequence[JsonObject],
-        stage1_by_identity: Mapping[str, JsonObject],
         *,
         branch: str = "shared",
     ) -> dict[str, JsonObject]:
-        return self._run("stage2", candidates, stage1_by_identity, branch=branch)
+        return self._run("stage2", candidates, branch=branch)
 
 
 def run_stage1(
@@ -723,10 +838,9 @@ def run_challenge(
 
 def run_stage2(
     candidate: JsonObject,
-    stage1_result: JsonObject,
     *,
     runner: TwoStageQualityRunner,
 ) -> JsonObject:
     """Annotate one admitted candidate with the second-stage contract."""
     identity = candidate["source_identity_sha256"]
-    return runner.run_stage2([candidate], {identity: stage1_result})[identity]
+    return runner.run_stage2([candidate])[identity]
