@@ -1,8 +1,8 @@
 # Screening v3 配置使用手册
 
 > 适用入口：`python -m screening.run_pipeline`
-> Pipeline 配置版本：`config_version=5`
-> 更新日期：2026-10-11
+> Pipeline 配置版本：`config_version=7`
+> 更新日期：2026-10-13
 
 ## 1. 文档用途
 
@@ -73,7 +73,7 @@ screening/artifacts/config/pipeline.default.json
 
 ```json
 {
-  "config_version": 5,
+  "config_version": 7,
   "inputs": {},
   "outputs": {},
   "prompts": {},
@@ -174,12 +174,13 @@ Prompt 文件必须恰好包含一个 `{CANDIDATE_JSON}`。修改空格或文字
 | --- | --- |
 | 类型/范围 | 正整数，至少 `1` |
 | 默认值 | `8` |
-| 作用 | 每个质量阶段同时执行的 LLM 请求数 |
+| 作用 | P0/P1/P2 共享的全局在途 LLM 请求上限 |
 | 是否改变 run | 是，当前版本将它纳入质量运行 contract |
 
 - 调大：提高吞吐，但更容易触发服务限流、超时和瞬时资源压力；
 - 调小：更稳定，但总耗时增加。
 
+三个分支的就绪请求按公平轮转取得请求位；某分支暂时没有任务时，其额度自动供其他分支使用。
 建议从服务端明确支持的并发量出发设置。出现大量 HTTP 429、超时或连接错误时优先调小。
 
 ### 5.2 `quality.max_retries`
@@ -395,13 +396,13 @@ P2 的 `target_n` 是最终 Challenge 样本目标。只有 Stage1 PASS 且 Chal
 
 | 参数 | 默认值 | 含义与调整影响 |
 | --- | ---: | --- |
-| `target_n` | `2000` | 最终 P2 目标；候选不足时允许少于目标。 |
+| `target_n` | `1000` | 最终 P2 目标；候选不足时允许少于目标。 |
 | `candidate_source_shares` | `0.3/0.3/0.2/0.2` | 初始轮 complex、multi_turn、boundary、exploration 请求份额；字段必须完整且总和为 1。 |
 | `minimum_complexity` | `moderate` | complex 来源池最低规则复杂度。 |
 | `boundary_probability_cap` | `0.5` | boundary 来源池使用严格小于该值。 |
-| `soft_min_per_type` | `100` | 八类 primary 的软下限；不足时报告缺口，不用低质量样本填充。 |
-| `max_per_primary` | `700` | 单一 primary 的最终硬上限；必须满足 `8 × max_per_primary >= target_n`。 |
-| `batch_size` | `2000` | 每个 P2 小批最多请求数。 |
+| `soft_min_by_primary` | `50/50/50/50/50/20/5/1` | 按八类 `primary_challenge` 配置软下限；键必须完整，值为非负整数，总和不超过目标且单项不超过类型上限。 |
+| `max_per_primary` | `350` | 单一 primary 的最终硬上限；必须满足 `8 × max_per_primary >= target_n`。 |
+| `batch_size` | `1000` | 填充总量时每个 P2 小批最多抽取的候选数。 |
 
 ### `sampling.dedup`：三个集合共用的候选去重规则
 
@@ -457,9 +458,20 @@ ceil(L2 当前缺口 / 估计通过率 × safety_factor)
 | `minimum_yield` | `0.005` | 产出率估计下限。 |
 | `safety_factor` | `1.1` | 按缺口反推请求量时的安全系数。 |
 | `exploration_share` | `0.20` | 补采请求固定保留给 exploration 的份额。 |
+| `max_sampled` | `15000` | 初采和补采实际抽中候选的总上限。 |
+| `max_tail_sampled` | `1000` | 总量达到目标后，为追补类型软下限允许增加的候选上限。 |
+| `tail_batch_size` | `250` | 尾部补采单批最大候选数。 |
+| `max_stalled_batches` | `2` | 连续未缩小八类总缺口的尾部批次数上限；任一批缩小总缺口即归零。 |
 
-补采不设硬请求量上限，但受轮数和未评估候选容量约束。每批完成后更新来源总产出率和
-来源到 primary 的产出率；总量已满但软下限未满足时仍会补采并重新选择最终成员。
+每批完成后更新来源总产出率和来源到 primary 的产出率；总量已满但软下限未满足时进入
+最多 250 条一批的尾部补采并重新选择最终成员。总抽样达到 15,000、尾部达到 1,000，
+或连续两个尾部批次没有缩小类型总缺口时停止，允许带缺口交付。预算计数写入 P2 检查点，
+续跑不会重置。
+
+每批日志以 `P2 batch_progress` 开头并附带 JSON，包含运行模式、计划与实际抽样数、
+Stage1/Challenge 通过数、最终数量与目标缺口、八类数量与缺口、总预算、尾部预算、
+连续无进展批数及 `next_action`。最终的 `P2 adaptive_complete` JSON 重复输出这些关键
+状态和明确的 `stop_reason`。
 
 ## 14. 本地 LLM 配置
 
@@ -577,7 +589,7 @@ P0/P1/P2 的 dedup_audit.jsonl
 P0/P1/P2 的 branch_audit.json
 P1/supplement_summary.json
 P2/adaptive_summary.json
-quality/stage2_consistency.jsonl
+quality/stage2_results.jsonl
 ```
 
 ### 17.2 小规模试跑
@@ -589,14 +601,20 @@ quality/stage2_consistency.jsonl
   "p1": {"target_n": 300},
   "p2": {
     "target_n": 100,
-    "soft_min_per_type": 5,
+    "soft_min_by_primary": {
+      "implicit_goal": 5, "multi_constraint": 5,
+      "multi_turn_context": 5, "long_tail_expr": 5,
+      "ambiguity": 5, "multi_intent": 2,
+      "boundary": 1, "cross_app": 0
+    },
     "batch_size": 100
   }
 }
 ```
 
 上面的片段不是可独立使用的完整配置；实际配置必须保留 P1/P2 对象中的其他字段。
-P2 调整总目标时必须同时保证 `8 × soft_min_per_type <= target_n <= 8 × max_per_primary`。
+P2 调整总目标时必须同时保证分类型软下限之和不超过 `target_n`、每项不超过
+`max_per_primary`，并满足 `target_n <= 8 × max_per_primary`。
 降低目标只减少采样和 LLM 数量，不会缩短
 首次完整 cluster 索引扫描；若要测试索引，需要另外准备小型 cluster fixture。
 
@@ -630,7 +648,7 @@ tail -f screening.log
 ## 18. 常见误区
 
 - P1 `target_n=10000` 是最终目标，但候选耗尽或三轮补采后仍可能不足。
-- P2 `target_n=2000` 是最终 Challenge 目标；候选不足、三轮结束或类型稀缺时可能不足。
+- P2 `target_n=1000` 是最终 Challenge 目标；候选不足、三轮结束或类型稀缺时可能不足。
 - P0 没有全局 target；调大 `max_per_cluster` 不等于固定 P0 总量。
 - 去重阈值越低，去重越严格；不是越高越严格。
 - `mmr_lambda` 越高越偏 relevance，越低越偏文本多样性。

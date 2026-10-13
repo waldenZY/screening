@@ -13,7 +13,6 @@ from typing import Any
 from ..candidate.p2_adaptive import P2_ALGORITHM, P2_SOURCE_NAMES
 from ..quality.two_stage import (
     CHALLENGE_TYPES,
-    CLASSIFICATION_DIFFICULTIES,
     TASK_DIFFICULTIES,
     STAGE2_FIELDS,
     validate_stage1_result,
@@ -25,7 +24,7 @@ from ..shared.taxonomy import TaxonomyMappings
 from .screened import validate_screened_canonical_record
 
 
-RUN_REPORT_SCHEMA_VERSION = 6
+RUN_REPORT_SCHEMA_VERSION = 9
 RUN_REPORT_JSON = "screening_run_report.json"
 RUN_REPORT_MARKDOWN = "screening_run_report.md"
 SET_NAMES = ("P0", "P1", "P2")
@@ -203,6 +202,7 @@ def _p1_diagnostics(build_summary: Mapping[str, Any]) -> JsonObject:
 def _p2_diagnostics(
     build_summary: Mapping[str, Any],
     final_records: Sequence[Mapping[str, Any]],
+    evaluated_candidates: Sequence[Mapping[str, Any]],
     challenge_runtime: Mapping[str, Any] | None,
 ) -> JsonObject:
     value = build_summary.get("p2_adaptive")
@@ -211,24 +211,23 @@ def _p2_diagnostics(
     primary = Counter()
     labels = Counter()
     combinations = Counter()
-    stage2_pairs = Counter()
-    stage2_issue_records = 0
     frequency_bands = Counter()
+    candidates_by_identity = {
+        str(candidate["source_identity_sha256"]): candidate
+        for candidate in evaluated_candidates
+    }
     for record in final_records:
         challenge = record.get("challenge")
         if not isinstance(challenge, Mapping) or challenge.get("is_challenge") is not True:
             raise RunReportError("P2 最终记录缺少 Challenge 结果")
         primary[str(challenge["primary_challenge"])] += 1
-        frequency_bands[str(record["candidate"]["features"]["frequency_band"])] += 1
+        identity = str(record["candidate"]["source_identity_sha256"])
+        if identity not in candidates_by_identity:
+            raise RunReportError("P2 最终记录缺少候选采样特征")
+        frequency_bands[str(candidates_by_identity[identity]["features"]["frequency_band"])] += 1
         types = [str(item) for item in challenge["challenge_types"]]
         labels.update(types)
         combinations["+".join(types)] += 1
-        issues = [str(item) for item in record["quality"]["issue_types"] if item != "none"]
-        if issues:
-            stage2_issue_records += 1
-        for challenge_type in types:
-            for issue in issues:
-                stage2_pairs[f"{challenge_type}|{issue}"] += 1
     selected = value.get("selection", {})
     return {
         "algorithm": value.get("algorithm"),
@@ -244,18 +243,20 @@ def _p2_diagnostics(
         "challenge_type_distribution": {key: int(labels[key]) for key in CHALLENGE_TYPES},
         "challenge_type_combinations": dict(sorted(combinations.items(), key=lambda item: (-item[1], item[0]))),
         "final_frequency_band_distribution": dict(sorted(frequency_bands.items())),
-        "challenge_stage2_pairs": dict(sorted(stage2_pairs.items(), key=lambda item: (-item[1], item[0]))),
-        "stage2_issue_records": stage2_issue_records,
         "judge_pass_not_selected": int(selected.get("judge_pass_not_selected", 0)),
         "not_selected_reasons": dict(selected.get("not_selected_reasons", {})),
         "phase_duration_ms": dict(value.get("phase_duration_ms", {})),
         "target": int(value.get("target", 0)),
-        "soft_min_per_type": int(value.get("soft_min_per_type", 0)),
+        "soft_min_by_primary": {
+            key: int(dict(value.get("soft_min_by_primary", {})).get(key, 0))
+            for key in CHALLENGE_TYPES
+        },
         "max_per_primary": int(value.get("max_per_primary", 0)),
         "final": int(value.get("final", 0)),
         "target_gap": int(value.get("target_gap", 0)),
         "stop_reason": value.get("stop_reason"),
         "candidate_exhausted": bool(value.get("candidate_exhausted", False)),
+        "budget": dict(value.get("budget", {})),
         "challenge_runtime": dict(challenge_runtime or {}),
     }
 
@@ -284,7 +285,6 @@ def build_run_report(
     }
     sets: JsonObject = {}
     total_final = 0
-    total_disagreements = 0
 
     for set_name in SET_NAMES:
         set_counts = _empty_counts()
@@ -314,15 +314,10 @@ def build_run_report(
             _add_stage1(wave_counts[round_id], result)
 
         final_round_counts: Counter[int] = Counter()
-        final_quality = {
-            "classification_difficulty": Counter(),
-            "task_difficulty": Counter(),
-            "issue_types": Counter(),
-            "overall_score": Counter(),
-        }
+        final_quality = {"task_difficulty": Counter()}
+        intent_labels: Counter[str] = Counter()
+        executable_values: Counter[str] = Counter()
         final_l2_counts: Counter[str] = Counter()
-        consistency_conflicts: Counter[str] = Counter()
-        disagreement_records = 0
         for record in final_records[set_name]:
             validate_screened_canonical_record(record)
             if record["set"] != set_name:
@@ -348,15 +343,9 @@ def build_run_report(
                 {key: quality[key] for key in STAGE2_FIELDS},
                 stage1,
             )
-            final_quality["classification_difficulty"][quality["classification_difficulty"]] += 1
             final_quality["task_difficulty"][quality["task_difficulty"]] += 1
-            for issue in quality["issue_types"]:
-                final_quality["issue_types"][issue] += 1
-            final_quality["overall_score"][str(quality["overall_score"])] += 1
-            consistency = record["quality_consistency"]
-            if not consistency["is_consistent"]:
-                disagreement_records += 1
-                consistency_conflicts.update(consistency["conflict_codes"])
+            intent_labels[quality["intent_label"]] += 1
+            executable_values[str(record["delivery_labels"]["executable"])] += 1
 
         target_scope = {
             key for key, value in p1_target_quotas.items() if int(value) > 0
@@ -479,35 +468,19 @@ def build_run_report(
                 _ratio(quota_fulfilled, quota_total) if set_name == "P1" else None
             ),
             "p1_target_distribution_deviation": distribution_deviation,
-            "cross_stage_consistency": {
-                "consistent_records": int(set_counts["final_count"]) - disagreement_records,
-                "disagreement_records": disagreement_records,
-                "consistency_rate": _ratio(
-                    int(set_counts["final_count"]) - disagreement_records,
-                    int(set_counts["final_count"]),
-                ),
-                "conflict_types": dict(sorted(consistency_conflicts.items())),
-            },
             "waves": wave_rows,
             "final_quality_distribution": {
-                "classification_difficulty": _distribution(
-                    final_quality["classification_difficulty"],
-                    sorted(CLASSIFICATION_DIFFICULTIES),
-                ),
                 "task_difficulty": _distribution(
                     final_quality["task_difficulty"],
                     sorted(TASK_DIFFICULTIES),
                 ),
-                "issue_types": _distribution(final_quality["issue_types"]),
-                "overall_score": _distribution(
-                    final_quality["overall_score"], ("1", "2", "3", "4", "5")
-                ),
+                "intent_label": _distribution(intent_labels, ("task", "qa")),
+                "executable": _distribution(executable_values, ("0", "1")),
             },
             "semantic_tree": tree,
         }
         sets[set_name] = set_report
         total_final += int(set_counts["final_count"])
-        total_disagreements += disagreement_records
 
     report: JsonObject = {
         "report_schema_version": RUN_REPORT_SCHEMA_VERSION,
@@ -542,14 +515,13 @@ def build_run_report(
         },
         "totals": {
             "final_records_across_sets": total_final,
-            "cross_stage_disagreement_records": total_disagreements,
             "cross_set_overlap": dict(build_summary.get("cross_set_overlap", {})),
         },
         "sets": sets,
         "p1_diagnostics": _p1_diagnostics(build_summary),
         "dedup": dict(build_summary["dedup"]),
         "p2_diagnostics": _p2_diagnostics(
-            build_summary, final_records["P2"], challenge_runtime
+            build_summary, final_records["P2"], evaluated_candidates["P2"], challenge_runtime
         ),
     }
     validate_run_report(report)
@@ -638,14 +610,19 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         raise RunReportError("P2 自适应诊断与最终数量不守恒")
     target = p2_diagnostics.get("target")
     final = p2_diagnostics.get("final")
-    soft_min = p2_diagnostics.get("soft_min_per_type")
+    soft_mins = p2_diagnostics.get("soft_min_by_primary")
     type_cap = p2_diagnostics.get("max_per_primary")
     final_by_primary = p2_diagnostics.get("final_by_primary")
     deficits = p2_diagnostics.get("soft_min_deficit_by_primary")
     if (
-        any(type(value) is not int or value < 0 for value in (target, final, soft_min, type_cap))
+        any(type(value) is not int or value < 0 for value in (target, final, type_cap))
         or final > target
         or p2_diagnostics.get("target_gap") != target - final
+        or not isinstance(soft_mins, Mapping)
+        or set(soft_mins) != set(CHALLENGE_TYPES)
+        or any(type(value) is not int or value < 0 for value in soft_mins.values())
+        or sum(soft_mins.values()) > target
+        or any(value > type_cap for value in soft_mins.values())
         or not isinstance(final_by_primary, Mapping)
         or set(final_by_primary) != set(CHALLENGE_TYPES)
         or any(type(value) is not int or value < 0 or value > type_cap for value in final_by_primary.values())
@@ -653,10 +630,35 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         or not isinstance(deficits, Mapping)
         or set(deficits) != set(CHALLENGE_TYPES)
         or deficits != {
-            key: max(0, soft_min - int(final_by_primary[key])) for key in CHALLENGE_TYPES
+            key: max(0, int(soft_mins[key]) - int(final_by_primary[key]))
+            for key in CHALLENGE_TYPES
         }
     ):
         raise RunReportError("P2 目标、类型配额或缺口不守恒")
+    budget = p2_diagnostics.get("budget")
+    budget_fields = {
+        "max_sampled", "sampled", "remaining", "max_tail_sampled",
+        "tail_sampled", "tail_remaining", "tail_batch_size",
+        "max_stalled_batches", "stalled_batches",
+    }
+    if (
+        not isinstance(budget, Mapping)
+        or set(budget) != budget_fields
+        or any(type(budget[key]) is not int or budget[key] < 0 for key in budget_fields)
+        or budget["sampled"] > budget["max_sampled"]
+        or budget["remaining"] != budget["max_sampled"] - budget["sampled"]
+        or budget["tail_sampled"] > budget["max_tail_sampled"]
+        or budget["tail_remaining"] != budget["max_tail_sampled"] - budget["tail_sampled"]
+        or budget["tail_batch_size"] < 1
+        or budget["max_stalled_batches"] < 1
+        or budget["stalled_batches"] > budget["max_stalled_batches"]
+    ):
+        raise RunReportError("P2 采样预算结构非法")
+    if p2_diagnostics.get("stop_reason") not in {
+        "target_and_soft_mins_met", "max_sampled", "max_tail_sampled",
+        "stalled_batches", "candidate_exhausted", "max_rounds",
+    }:
+        raise RunReportError("P2 停止原因非法")
     source_funnel = p2_diagnostics.get("source_funnel")
     if not isinstance(source_funnel, Mapping) or set(source_funnel) != set(P2_SOURCE_NAMES):
         raise RunReportError("P2 来源池漏斗结构非法")
@@ -680,6 +682,48 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         ):
             raise RunReportError("P2 轮次请求数量不守恒")
         for batch in round_batches:
+            selected_by_primary = batch.get("selected_by_primary")
+            deficit_by_primary = batch.get("deficit_by_primary")
+            sampled_budget = batch.get("sampled_budget")
+            tail_budget = batch.get("tail_budget")
+            stalled = batch.get("stalled_batches")
+            if (
+                batch.get("mode") not in {"target_fill", "coverage_tail"}
+                or type(batch.get("final")) is not int
+                or type(batch.get("target")) is not int
+                or type(batch.get("target_gap")) is not int
+                or batch["target"] != target
+                or batch["target_gap"] != target - batch["final"]
+                or batch.get("challenge_pass") != batch.get("judge_pass")
+                or not isinstance(selected_by_primary, Mapping)
+                or set(selected_by_primary) != set(CHALLENGE_TYPES)
+                or any(type(value) is not int or value < 0 for value in selected_by_primary.values())
+                or sum(selected_by_primary.values()) != batch["final"]
+                or not isinstance(deficit_by_primary, Mapping)
+                or set(deficit_by_primary) != set(CHALLENGE_TYPES)
+                or deficit_by_primary != {
+                    key: max(0, int(soft_mins[key]) - int(selected_by_primary[key]))
+                    for key in CHALLENGE_TYPES
+                }
+                or not isinstance(sampled_budget, Mapping)
+                or sampled_budget.get("limit") != budget["max_sampled"]
+                or type(sampled_budget.get("used")) is not int
+                or not 0 <= sampled_budget["used"] <= sampled_budget["limit"]
+                or not isinstance(tail_budget, Mapping)
+                or tail_budget.get("limit") != budget["max_tail_sampled"]
+                or type(tail_budget.get("used")) is not int
+                or not 0 <= tail_budget["used"] <= tail_budget["limit"]
+                or not isinstance(stalled, Mapping)
+                or stalled.get("limit") != budget["max_stalled_batches"]
+                or type(stalled.get("used")) is not int
+                or not 0 <= stalled["used"] <= stalled["limit"]
+                or batch.get("next_action") not in {
+                    "continue_target_fill", "continue_coverage_tail",
+                    "target_and_soft_mins_met", "max_sampled", "max_tail_sampled",
+                    "stalled_batches", "candidate_exhausted", "max_rounds",
+                }
+            ):
+                raise RunReportError("P2 批次配额、预算或 next_action 结构非法")
             phase_duration = batch.get("phase_duration_ms")
             if (
                 not isinstance(phase_duration, Mapping)
@@ -769,25 +813,22 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
             _validate_ratio(quota_metric, "P1.p1_quota_fulfillment_rate")
         elif quota_metric is not None:
             raise RunReportError(f"{set_name} 不得包含 P1 配额完成率")
-        consistency = set_report.get("cross_stage_consistency")
-        if not isinstance(consistency, Mapping) or set(consistency) != {
-            "consistent_records", "disagreement_records", "consistency_rate", "conflict_types"
+        quality_distribution = set_report.get("final_quality_distribution")
+        if not isinstance(quality_distribution, Mapping) or set(quality_distribution) != {
+            "task_difficulty", "intent_label", "executable"
         }:
-            raise RunReportError(f"{set_name} 跨阶段一致性统计非法")
-        _validate_ratio(consistency["consistency_rate"], f"{set_name}.cross_stage_consistency")
-        if (
-            type(consistency["consistent_records"]) is not int
-            or type(consistency["disagreement_records"]) is not int
-            or consistency["consistent_records"] + consistency["disagreement_records"]
-            != set_report["final_count"]
-            or consistency["consistency_rate"]["numerator"]
-            != consistency["consistent_records"]
-            or consistency["consistency_rate"]["denominator"]
-            != set_report["final_count"]
-            or not isinstance(consistency["conflict_types"], Mapping)
-            or any(type(value) is not int or value < 1 for value in consistency["conflict_types"].values())
+            raise RunReportError(f"{set_name} 最终标签分布非法")
+        for field, expected_keys in (
+            ("task_difficulty", TASK_DIFFICULTIES),
+            ("intent_label", {"task", "qa"}),
+            ("executable", {"0", "1"}),
         ):
-            raise RunReportError(f"{set_name} 跨阶段一致性数量不守恒")
+            distribution = quality_distribution[field]
+            if (not isinstance(distribution, Mapping)
+                    or set(distribution) != set(expected_keys)
+                    or any(type(value) is not int or value < 0 for value in distribution.values())
+                    or sum(distribution.values()) != set_report["final_count"]):
+                raise RunReportError(f"{set_name} {field} 分布不守恒")
 
         tree = set_report.get("semantic_tree")
         if not isinstance(tree, list) or len(tree) != report["taxonomy"]["l1_count"]:
@@ -821,11 +862,6 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
 
     if report["totals"].get("final_records_across_sets") != total_final:
         raise RunReportError("批跑报告总记录数不守恒")
-    if report["totals"].get("cross_stage_disagreement_records") != sum(
-        int(report["sets"][name]["cross_stage_consistency"]["disagreement_records"])
-        for name in SET_NAMES
-    ):
-        raise RunReportError("批跑报告跨阶段分歧总数不守恒")
 
 
 def _pct(metric: Mapping[str, Any] | None) -> str:
@@ -849,8 +885,8 @@ def render_run_report(report: Mapping[str, Any]) -> str:
         "",
         "## 核心汇报指标",
         "",
-        "| 集合 | Stage1 候选 | Query 基础可用率 | 语义标签一致率 | Stage1 准入率 | 最终数量 | 阶段一致率 | 目标范围 L2 覆盖率 | P1 配额完成率 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 集合 | Stage1 候选 | Query 基础可用率 | 语义标签一致率 | Stage1 准入率 | 最终数量 | 目标范围 L2 覆盖率 | P1 配额完成率 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for set_name in SET_NAMES:
         value = report["sets"][set_name]
@@ -859,7 +895,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             f"{_pct(value['query_usability_rate'])} | "
             f"{_pct(value['semantic_label_fit_rate'])} | "
             f"{_pct(value['stage1_admission_rate'])} | "
-            f"{value['final_count']} | {_pct(value['cross_stage_consistency']['consistency_rate'])} | "
+            f"{value['final_count']} | "
             f"{_pct(value['scope_l2_coverage_rate'])} | "
             f"{_pct(value['p1_quota_fulfillment_rate'])} |"
         )
@@ -874,7 +910,6 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             "- Stage1 准入率：四项同时满足 exact、self_contained、clear、valid 的比例。",
             "- P1 的目标范围为冻结配额大于 0 的 L2；P0/P2 的目标范围为实际进入 Stage1 的 L2。",
             "- 最终集 category_fit=exact 为准入约束，不作为独立准确率结论。",
-            "- 阶段一致率表示Stage2独立复核未发现与Stage1不同判断的最终样本比例；分歧不会改变成员。",
         ]
     )
 
@@ -972,11 +1007,9 @@ def render_run_report(report: Mapping[str, Any]) -> str:
                 "### 质量与难度摘要",
                 "",
                 f"- Stage1 category_fit：exact={category['exact']}，partial={category['partial']}，mismatch={category['mismatch']}。",
-                f"- Stage2 classification_difficulty：{json.dumps(value['final_quality_distribution']['classification_difficulty'], ensure_ascii=False, sort_keys=True)}。",
                 f"- Stage2 task_difficulty：{json.dumps(value['final_quality_distribution']['task_difficulty'], ensure_ascii=False, sort_keys=True)}。",
-                f"- Stage2 overall_score：{json.dumps(value['final_quality_distribution']['overall_score'], ensure_ascii=False, sort_keys=True)}。",
-                f"- Stage1/Stage2 一致率：{_pct(value['cross_stage_consistency']['consistency_rate'])}；分歧记录={value['cross_stage_consistency']['disagreement_records']}。",
-                f"- 分歧类型：{json.dumps(value['cross_stage_consistency']['conflict_types'], ensure_ascii=False, sort_keys=True)}。",
+                f"- intent_label：{json.dumps(value['final_quality_distribution']['intent_label'], ensure_ascii=False, sort_keys=True)}。",
+                f"- executable：{json.dumps(value['final_quality_distribution']['executable'], ensure_ascii=False, sort_keys=True)}。",
             ]
         )
 
@@ -1036,11 +1069,12 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             "## P2 Challenge 诊断",
             "",
             f"- 最终数量：{p2['final']} / {p2['target']}；target_gap={p2['target_gap']}；停止原因={p2['stop_reason']}。",
-            f"- 类型软下限={p2['soft_min_per_type']}；单一 primary 上限={p2['max_per_primary']}。",
+            f"- 分类型软下限={json.dumps(p2['soft_min_by_primary'], ensure_ascii=False, sort_keys=True)}；"
+            f"单一 primary 上限={p2['max_per_primary']}。",
             f"- Judge 通过但未入集：{p2['judge_pass_not_selected']}。",
             f"- 未入集原因：{json.dumps(p2['not_selected_reasons'], ensure_ascii=False, sort_keys=True)}。",
             f"- P2 批处理阶段耗时（ms）：{json.dumps(p2['phase_duration_ms'], ensure_ascii=False, sort_keys=True)}。",
-            f"- Stage2 标出问题的最终记录：{p2['stage2_issue_records']}。",
+            f"- P2 采样预算：{json.dumps(p2['budget'], ensure_ascii=False, sort_keys=True)}。",
             f"- 最终 frequency band：{json.dumps(p2['final_frequency_band_distribution'], ensure_ascii=False, sort_keys=True)}。",
             "",
             "### Primary Challenge 分布",

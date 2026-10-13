@@ -1,5 +1,7 @@
 # Screening 历史资料归档
 
+当前 14 字段交付之前的 v5 资料保存在 `v3_history/docs/screening_labeled_v5_30_field_dictionary.md` 与 `v3_history/docs/screening_pipeline_technical_design_30_field.md`。旧 v2 测试夹具保存在 `v3_history/tests/test_pipeline_v2_legacy.py.txt`，不参与当前回归测试。当前文档见 [文档索引](../docs/README.md)。
+
 此目录保存历史资料和未实施草案。归档文件不会被当前 screening 代码、
 默认配置或 Prompt 加载。
 

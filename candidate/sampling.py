@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import heapq
 import math
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -17,12 +17,23 @@ from typing import Any, Iterable, Mapping, Sequence
 from .index import CanonicalCandidateIndex
 from .dedup import DedupConfig, normalize_text, selection_text, weighted_jaccard, edit_similarity
 from ..shared.json_io import JsonObject
+from ..shared.challenge import CHALLENGE_TYPES as P2_PRIMARY_TYPES
 from ..shared.taxonomy import TaxonomyMappings
 
 
 COMPLEXITY_RANK = {"simple": 0, "moderate": 1, "complex": 2}
 PROBABILITY_ORDER = ("high", "mid", "boundary")
 FREQUENCY_ORDER = ("hot", "warm", "cold")
+DEFAULT_P2_SOFT_MIN_BY_PRIMARY = {
+    "implicit_goal": 50,
+    "multi_constraint": 50,
+    "multi_turn_context": 50,
+    "long_tail_expr": 50,
+    "ambiguity": 50,
+    "multi_intent": 20,
+    "boundary": 5,
+    "cross_app": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -79,7 +90,7 @@ class P1SamplingConfig:
 
 @dataclass(frozen=True)
 class P2SamplingConfig:
-    target_n: int = 2000
+    target_n: int = 1000
     candidate_source_shares: Mapping[str, float] = field(default_factory=lambda: {
         "complex": 0.30,
         "multi_turn": 0.30,
@@ -88,9 +99,11 @@ class P2SamplingConfig:
     })
     minimum_complexity: str = "moderate"
     boundary_probability_cap: float = 0.5
-    soft_min_per_type: int = 100
-    max_per_primary: int = 700
-    batch_size: int = 2000
+    soft_min_by_primary: Mapping[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_P2_SOFT_MIN_BY_PRIMARY)
+    )
+    max_per_primary: int = 350
+    batch_size: int = 1000
 
     def __post_init__(self) -> None:
         if isinstance(self.target_n, bool) or not isinstance(self.target_n, int) or self.target_n < 1:
@@ -113,12 +126,19 @@ class P2SamplingConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"P2 {name} 必须是正整数")
-        if isinstance(self.soft_min_per_type, bool) or not isinstance(self.soft_min_per_type, int) or self.soft_min_per_type < 0:
-            raise ValueError("P2 soft_min_per_type 必须是非负整数")
-        if self.soft_min_per_type * 8 > self.target_n:
+        if not isinstance(self.soft_min_by_primary, Mapping):
+            raise ValueError("P2 soft_min_by_primary 必须是对象")
+        if set(self.soft_min_by_primary) != set(P2_PRIMARY_TYPES):
+            raise ValueError("P2 soft_min_by_primary 必须完整包含八类 primary")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in self.soft_min_by_primary.values()
+        ):
+            raise ValueError("P2 soft_min_by_primary 必须是非负整数")
+        if sum(self.soft_min_by_primary.values()) > self.target_n:
             raise ValueError("P2 八类软下限之和不能超过 target_n")
-        if self.max_per_primary < self.soft_min_per_type:
-            raise ValueError("P2 max_per_primary 不能小于软下限")
+        if any(value > self.max_per_primary for value in self.soft_min_by_primary.values()):
+            raise ValueError("P2 各类软下限不能超过 max_per_primary")
         if self.max_per_primary * 8 < self.target_n:
             raise ValueError("P2 八类 primary 上限之和不能小于 target_n")
         if self.minimum_complexity not in COMPLEXITY_RANK:

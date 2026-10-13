@@ -19,16 +19,19 @@ from ..candidate.index import (
 from ..candidate.p2_adaptive import P2_ALGORITHM, P2_SOURCE_NAMES
 from ..candidate.dedup import RULES_SHA256, normalize_text, selection_text
 from ..pipeline.orchestrator import BUILD_CONFIG_VERSION
+from ..pipeline.run_context import PIPELINE_VERSION
 from ..shared.json_io import JsonObject, load_jsonl, sha256_file, stable_hash
 from .legacy import (
     LEGACY_FILENAMES,
     LEGACY_MAPPING_VERSION,
+    legacy_fields,
     map_screened_to_legacy_unchecked,
     validate_legacy_record,
 )
 from .eligibility import delivery_labels
 from ..shared.risk_keywords import validate_risk_snapshot
 from .report import (
+    RUN_REPORT_SCHEMA_VERSION,
     RUN_REPORT_JSON,
     RUN_REPORT_MARKDOWN,
     RunReportError,
@@ -46,7 +49,6 @@ from ..quality.two_stage import (
     STAGE1_FIELDS,
     STAGE2_FIELDS,
     stage1_passes,
-    stage2_consistency_conflicts,
     validate_challenge_result,
     validate_stage1_result,
     validate_stage2_result,
@@ -200,31 +202,8 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             if previous is not None and previous != validated:
                 raise PublicationError("同一源 identity 对应多个 Challenge 结果")
             challenge_by_identity[identity] = validated
-    consistency_rows = load_jsonl(run_root / "quality" / "stage2_consistency.jsonl")
-    consistency_by_key = {row.get("cache_key"): row for row in consistency_rows}
-    if None in consistency_by_key or len(consistency_by_key) != len(consistency_rows):
-        raise PublicationError("第二阶段一致性账本存在非法或重复 ID")
-    if set(consistency_by_key) != set(stage2_tasks):
-        raise PublicationError("第二阶段一致性账本与任务账本不一致")
     if set(stage2_results) != set(stage2_tasks):
         raise PublicationError("第二阶段任务缺少合法终态")
-    for task_id, task in stage2_tasks.items():
-        identities = [str(value) for value in task.get("source_identities", [])]
-        if not identities or any(identity not in stage1_by_identity for identity in identities):
-            raise PublicationError("第二阶段一致性账本无法关联第一阶段结果")
-        stage1_value = stage1_by_identity[identities[0]]
-        if any(stage1_by_identity[identity] != stage1_value for identity in identities):
-            raise PublicationError("第二阶段任务对应的第一阶段结果不一致")
-        conflicts = list(stage2_consistency_conflicts(stage2_results[task_id], stage1_value))
-        expected_consistency = {
-            "cache_key": task_id,
-            "stage": "stage2",
-            "source_identities": sorted(identities),
-            "is_consistent": not conflicts,
-            "conflict_codes": conflicts,
-        }
-        if consistency_by_key[task_id] != expected_consistency:
-            raise PublicationError("第二阶段一致性账本内容不一致")
     files: JsonObject = {}
     candidate_rows_by_set: dict[str, list[JsonObject]] = {}
     final_l2_counts_by_set: dict[str, Counter[str]] = {}
@@ -437,8 +416,8 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             if (
                 type(target) is not int
                 or adaptive.get("algorithm") != P2_ALGORITHM
-                or adaptive.get("soft_min_per_type")
-                != int(summary["config"]["sampling"]["p2"]["soft_min_per_type"])
+                or adaptive.get("soft_min_by_primary")
+                != dict(summary["config"]["sampling"]["p2"]["soft_min_by_primary"])
                 or adaptive.get("max_per_primary")
                 != int(summary["config"]["sampling"]["p2"]["max_per_primary"])
                 or adaptive.get("final") != len(canonical)
@@ -455,7 +434,9 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         if (
             report.get("set") != set_name
             or report.get("records") != len(canonical)
-                or report.get("field_count") != 30
+                or report.get("field_count") != len(legacy_fields(set_name))
+                or report.get("fields") != list(legacy_fields(set_name))
+                or report.get("rounded_numeric_fields") != []
             or report.get("null_values") != 0
             or report.get("lossy_enum_mappings") != 0
         ):
@@ -589,7 +570,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         "stage1_cache_hits.jsonl", "stage1_results.jsonl", "challenge_tasks.jsonl",
         "challenge_attempts.jsonl", "challenge_cache_hits.jsonl", "challenge_results.jsonl",
         "stage2_tasks.jsonl", "stage2_attempts.jsonl", "stage2_cache_hits.jsonl",
-        "stage2_results.jsonl", "stage2_consistency.jsonl",
+        "stage2_results.jsonl",
     ):
         path = run_root / "quality" / filename
         metadata: JsonObject = {
@@ -704,9 +685,9 @@ def publish_labeled(
     """Publish only the three labeled files after full v3 validation."""
     run_root = run_root.expanduser().resolve()
     publish_root = publish_root.expanduser().resolve()
-    if manifest.get("pipeline_version") != 3:
-        raise PublicationError("仅允许发布 screening v3 run")
     _require_current_quality_contract(manifest)
+    if manifest.get("pipeline_version") != PIPELINE_VERSION:
+        raise PublicationError("仅允许发布当前 screening run")
     required_stages = (
         "canonical_index", "p012_build", "quality_stage1", "p1_supplement",
         "p2_supplement", "quality_p2_challenge", "quality_stage2",
@@ -751,3 +732,87 @@ def publish_labeled(
     if any(not Path(value["destination"]).is_file() or sha256_file(Path(value["destination"])) != value["sha256"] for value in files.values()):
         raise PublicationError("发布后文件校验失败")
     return {"publish_root": str(publish_root), "replaced": bool(conflicts), "files": files}
+
+
+def publish_labeled_branch(
+    run_root: Path,
+    publish_root: Path,
+    manifest: Mapping[str, Any],
+    set_name: str,
+    *,
+    replace: bool = False,
+) -> JsonObject:
+    """Validate and transactionally publish one completed branch."""
+    if set_name not in LEGACY_FILENAMES:
+        raise PublicationError(f"未知发布分支: {set_name}")
+    _require_current_quality_contract(manifest)
+    if manifest.get("pipeline_version") != PIPELINE_VERSION:
+        raise PublicationError("仅允许发布当前 screening run")
+    branch_state = manifest.get("branches", {}).get(set_name, {})
+    if branch_state.get("status") not in {"completed", "published"}:
+        raise PublicationError(f"{set_name} 尚未完成，禁止发布")
+    run_root = run_root.expanduser().resolve()
+    publish_root = publish_root.expanduser().resolve()
+    if publish_root == run_root or publish_root.is_relative_to(run_root):
+        raise PublicationError("publish_root 不能等于或位于 run 目录内")
+    validate_manifest_inputs(run_root, manifest)
+    validate_manifest_source(manifest)
+    branch_root = run_root / set_name
+    canonical_path = branch_root / "screened.canonical.jsonl"
+    legacy_path = branch_root / LEGACY_FILENAMES[set_name].name
+    provenance_path = branch_root / "export_provenance.jsonl"
+    report_path = branch_root / "legacy_export_report.json"
+    branch_report_path = branch_root / "branch_report.json"
+    artifacts = branch_state.get("artifacts")
+    if not isinstance(artifacts, Mapping) or not artifacts:
+        raise PublicationError(f"{set_name} 缺少分支产物快照")
+    for relative_path, expected_hash in artifacts.items():
+        artifact_path = branch_root / str(relative_path)
+        if not artifact_path.is_file() or sha256_file(artifact_path) != expected_hash:
+            raise PublicationError(f"{set_name} 分支产物缺失或哈希不一致: {relative_path}")
+    canonical = load_jsonl(canonical_path)
+    legacy = load_jsonl(legacy_path)
+    provenance = load_jsonl(provenance_path)
+    validate_screened_canonical_records(set_name, canonical)
+    if len(canonical) != len(legacy) or len(canonical) != len(provenance):
+        raise PublicationError(f"{set_name} 导出记录数量不一致")
+    for index, (canonical_row, legacy_row, provenance_row) in enumerate(
+        zip(canonical, legacy, provenance), start=1
+    ):
+        validate_legacy_record(set_name, legacy_row, canonical_record=canonical_row)
+        if (
+            provenance_row.get("output_index") != index
+            or provenance_row.get("canonical_record_sha256") != stable_record_sha256(canonical_row)
+            or provenance_row.get("legacy_record_sha256") != stable_record_sha256(legacy_row)
+        ):
+            raise PublicationError(f"{set_name} 第 {index} 条 provenance 不一致")
+    report = _load_object(report_path)
+    if report.get("set") != set_name or report.get("records") != len(canonical):
+        raise PublicationError(f"{set_name} 分支导出报告不一致")
+    branch_report = _load_object(branch_report_path)
+    if (
+        branch_report.get("report_schema_version") != RUN_REPORT_SCHEMA_VERSION
+        or branch_report.get("set") != set_name
+        or branch_report.get("status") != "completed"
+        or branch_report.get("final") != len(canonical)
+        or branch_report.get("export") != report
+    ):
+        raise PublicationError(f"{set_name} 分支报告不一致")
+    destination = publish_root / LEGACY_FILENAMES[set_name]
+    source_hash = sha256_file(legacy_path)
+    pending: list[tuple[Path, Path]] = []
+    conflict = destination.is_file() and sha256_file(destination) != source_hash
+    if conflict and not replace:
+        raise PublicationError(f"{set_name} 发布目标已有不同内容；如确认替换请使用 --replace")
+    if not destination.is_file() or conflict:
+        pending.append((legacy_path, destination))
+    _transactional_publish(pending)
+    if not destination.is_file() or sha256_file(destination) != source_hash:
+        raise PublicationError(f"{set_name} 发布后文件校验失败")
+    return {
+        "set": set_name,
+        "destination": str(destination),
+        "sha256": source_hash,
+        "records": len(legacy),
+        "replaced": conflict,
+    }

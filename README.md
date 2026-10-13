@@ -1,68 +1,36 @@
 # Screening v3
 
-`screening` v3 从同一份 cluster JSONL 和 taxonomy 构建 P0/P1/P2。它不读取旧 labeled
-数据作为候选来源，也不兼容或恢复旧版 run manifest。
+从 cluster JSONL 和 taxonomy 构建 P0/P1/P2 数据集。当前交付是 **14 字段 `labeled_v5`**，具体字段见 [字段字典](artifacts/docs/screening_labeled_v5_field_dictionary.md)。`executable=0` 只标记，样本仍交付。启动命令与过去一致；历史 30 字段 v5 run 不能按当前契约续跑。
 
-Screening v2 已冻结在 Git `v2` 分支及提交 `b894753`；对应配置、Prompt 和文档快照见
-[V2 归档](artifacts/archive/v2/README.md)。V3 不会恢复或发布 `pipeline_version=2` 的 run。
+## 链路
 
-## 处理链路
+1. 规范化源数据，构建固定候选索引和采样特征。
+2. 公共索引与冻结输入就绪后，并发启动彼此独立的 P0、P1、P2 分支；各分支在 Stage1 前完成集合内去重。
+3. Stage1 判断准入；P0 随即冻结成员，P1 按冻结 L2 配额补采，P2 经 Challenge 判断并在预算内自适应补采。
+4. 每个分支一旦冻结成员便独立进入 Stage2，输出 `task_difficulty`、`intent_label`、`execution_issues`，只添加标签。
+5. 用冻结风险词表、会话和 Stage2 语义原因计算 `executable`，映射为 14 字段交付文件。
+6. 各分支独立生成报告、复验并按需事务发布；某分支失败不撤销或阻塞其他分支。所有分支终态后再生成总报告。
 
-```text
-cluster + taxonomy
-→ canonical 流式索引与固定特征
-→ P0/P1 独立采样；P2 四来源自适应候选召回
-→ 第一阶段：有效性、基础质量及类别检测
-→ 仅 P1 按冻结 L2 配额补采（每轮分小批，最多三轮）
-→ P2 Challenge Judge、类型配额选择与最多三轮补采
-→ 第二阶段：难度、综合质量、意图与内部可评测性原因
-→ canonical screened
-→ 风险词表与集合内重复等确定性规则映射 executable
-→ 30 字段 labeled v5 导出（增加 intent_label、executable）
-→ JSON/Markdown 批跑报告
-→ 校验与发布
-```
+Stage1 与 Challenge 的规则和 P0/P1/P2 成员数量规则保持不变。详情见 [技术设计](artifacts/docs/screening_pipeline_technical_design_v3.md)。
 
-- P0 沿用结构采样，无全局数量目标，不补采。
-- P1 第一阶段通过后的目标为 10,000，并按冻结 L2 配额独立补采。
-- P1 补采保留每轮请求数公式；每批最多抽当前 L2 缺口数，批后根据 cluster
-  Stage1 通过情况重新分配下一批。配额填满或候选耗尽的 L2 立即停止。
-- P2 目标为 2,000 条 Stage1 PASS 且 Challenge PASS 的样本；八类 primary 各有软下限 100、单类上限 700，并支持最多三轮自适应补采。
-- 三个集合均以 `exact + self_contained + clear + valid` 准入。
-- 第二阶段只补充标签，不改变集合成员。
-- 不做跨集合去重；完全相同的 LLM 任务在同一 run 内复用。
+## 配置与运行
 
-## 运行
-
-Python 操作使用 `moto` 环境。先复制并填写本地 LLM 配置：
+若用 Python 操作本项目，使用 `moto` 环境。先复制并填写 LLM 配置：
 
 ```powershell
 Copy-Item screening/artifacts/config/llm_config.example.json `
   screening/artifacts/config/llm_config.local.json
 ```
 
-然后在 `artifacts/config/pipeline.default.json` 中填写 `inputs.source`、
-`inputs.taxonomy` 和 `inputs.risk_keywords`（Excel 的 `Sheet1`，仅含 `关键词`、`风险级别` 两列）。
-风险词表是必填输入，内容和规范化规则会冻结到 run。默认 `publication.enabled=false`，
-因此一键启动只构建、不交付：
+在 `screening/artifacts/config/pipeline.default.json` 填写 `inputs.source`、`inputs.taxonomy`、`inputs.risk_keywords`。风险词表 Excel 的 `Sheet1` 必须含 `关键词`、`风险级别` 两列。默认 `publication.enabled=false`。
+
+从项目根目录运行：
 
 ```powershell
 python -m screening.run_pipeline
 ```
 
-相同配置再次执行会自动恢复未完成 run，只重试缺少合法结果的 LLM 任务；已经完成的
-run 会直接复用。恢复以阶段检查点为事实源：已完成的 P0/P1 采样、Stage1、P1
-补采小批、P2 自适应小批、最终成员和 Stage2 都不会重新执行。输入、Prompt、模型或业务配置变化时
-会建立新 run。
-
-Stage1 是三个集合统一的基础质量准入；P2 还必须通过 Challenge Judge。Stage2 可以
-给出与 Stage1 不同的独立质量判断；这种情况会
-作为“跨阶段分歧”写入 screened canonical、脱敏一致性账本和批跑报告，不会重试、
-中断或改变集合成员。非法 JSON、字段/枚举错误、Challenge 协议矛盾和 Stage2 内部
-评分矛盾属于可续跑的工程失败。
-
-需要自动交付时，在配置中设置 `publication.enabled=true` 并填写 `publish_root`；也可
-使用 CLI 临时覆盖配置：
+也可用 CLI 覆盖路径并发布：
 
 ```powershell
 python -m screening.run_pipeline `
@@ -73,93 +41,13 @@ python -m screening.run_pipeline `
   --publish-root D:/data/delivery
 ```
 
-发布目录已有不同内容时默认拒绝。确认整组三个文件都要替换时显式增加
-`--replace`。相同内容会直接视为幂等成功。
+相同配置重跑会恢复未完成或失败的分支，已完成分支不会重复请求或发布。部分失败时 CLI 返回状态码 `2`，成功分支的产物仍有效。输入、Prompt、模型、索引或映射契约变化需要新 run。`--new-run` 显式新建；`--run-id` 指定兼容的已有 run；`--no-publish` 临时关闭发布。发布目标存在同名不同内容时默认停止；可换发布目录或显式加 `--replace`。参数说明见 [配置文档](artifacts/docs/screening_pipeline_configuration_v3.md)。
 
-完整运行配置位于 `artifacts/config/pipeline.default.json`，相对路径以该配置文件
-所在目录为基准。CLI 显式参数优先于配置值。三个 Prompt 默认位于
-`artifacts/prompts/quality_stage1.md`、`quality_challenge.md` 和 `quality_stage2.md`。
-常用临时覆盖参数：
+## 产物
 
-- `--source`、`--taxonomy`、`--risk-keywords` 和 `--output-root`；
-- `--workers`、`--max-retries` 和 `--sleep`；
-- `--run-id`，只恢复契约完全一致的 v3 run；
-- `--new-run`，忽略可恢复或可复用 run，新建一次运行；
-- `--cache-root`，覆盖默认的 `<output-root>/_canonical_cache`；
-- `--verify-full-source-hash`，索引打开时重新验证完整 cluster SHA-256；
-- `--no-publish`，临时关闭配置中的自动发布。
+`<output-root>/_canonical_cache/` 保存候选索引；`<output-root>/runs/<run-id>/` 保存 manifest、冻结风险快照、质量任务与结果账本、P0/P1/P2 分支及 `screening_run_report.json` / `.md`。
 
-`--new-run`、`--run-id` 和 `--replace` 只允许通过 CLI 指定，不写入长期配置。
-
-当前文档入口见 [文档索引](artifacts/docs/README.md)；未实施的设想和旧字段契约见
-[历史归档](artifacts/archive/README.md)。
-开发验证测试位于同级目录 [tests](../tests/)，不参与正式批跑。
-
-退出码：`0` 成功，`1` 配置、数据、契约或发布错误，`2` 存在可以续跑的 LLM
-工程失败。
-
-## 运行产物与下游交付
-
-工作区结构：
-
-```text
-<output-root>/
-├── _canonical_cache/<cache-id>/
-│   ├── canonical_candidate_index.sqlite
-│   ├── canonical_metadata.json
-│   ├── canonical_input_audit.json
-│   └── canonical_database_validation.json
-└── runs/<run-id>/
-    ├── manifest.json
-    ├── risk_keywords.json
-    ├── checkpoints/
-    ├── p012_build_summary.json
-    ├── legacy_export_report.json
-    ├── screening_run_report.json
-    ├── screening_run_report.md
-    ├── quality/
-    │   ├── stage1_tasks.jsonl
-    │   ├── stage1_attempts.jsonl
-    │   ├── stage1_cache_hits.jsonl
-    │   ├── stage1_results.jsonl
-    │   ├── challenge_tasks.jsonl
-    │   ├── challenge_attempts.jsonl
-    │   ├── challenge_cache_hits.jsonl
-    │   ├── challenge_results.jsonl
-    │   ├── stage2_tasks.jsonl
-    │   ├── stage2_attempts.jsonl
-    │   ├── stage2_cache_hits.jsonl
-    │   ├── stage2_results.jsonl
-    │   ├── stage2_consistency.jsonl
-    │   └── llm_result_cache.sqlite
-    ├── P0/
-    ├── P1/
-    └── P2/
-```
-
-每个分支保存：
-
-- `screened.canonical.jsonl`：内部权威成品；
-- `*_labeled.jsonl`：30 字段 labeled v5 交付视图；
-- `export_provenance.jsonl`：source/canonical/legacy 逐条哈希关联；
-- `legacy_export_report.json`：字段、类型、空值、枚举与数值转换检查；
-- `candidate_tasks.jsonl` 和 `branch_audit.json`：候选来源及分支统计。
-
-Run 根目录的两份批跑报告来自同一份指标事实源：
-
-- `screening_run_report.json`：机器可读指标，适合看板、版本对比和二次分析；
-- `screening_run_report.md`：JSON 指标的可读摘要，包含 P0/P1/P2 核心指标、L1/L2
-  语义树分布、P1 配额完成率、P2 来源及 Challenge 类型漏斗、波次统计和最终难度/质量分布。
-
-报告同时给出 Stage1/Stage2 跨阶段分歧数量、分歧率和分歧类型分布。该指标用于观察
-两次独立判断的稳定性，不是新的淘汰门槛。
-
-报告中的 Query 基础可用率使用 `self_contained + clear + valid`；语义标签一致率是在
-这些可判断 Query 中统计 `category_fit=exact` 的比例。该一致率是 LLM-as-judge
-自动评估结果，不等同于人工金标准确率。P1 的全面性主要通过冻结配额 L2 覆盖率、
-配额完成率和逐 L2 缺口说明。
-
-下游发布目录只接收：
+各分支的 `checkpoints/`、`branch_report.json`、`screened.canonical.jsonl` 和发布事务彼此独立；`*_labeled.jsonl` 是 14 字段交付视图。`export_provenance.jsonl` 将源、内部和交付逐条哈希关联。正式发布沿用以下 v5 文件名：
 
 ```text
 P0-冒烟集/P0_smoke_set_v5_labeled.jsonl
@@ -167,24 +55,4 @@ P1-基准集/P1_benchmark_set_v5_labeled.jsonl
 P2-对抗集/P2_adversarial_set_v5_labeled.jsonl
 ```
 
-三份文件作为一个事务提交；任一提交失败会恢复发布前的全部文件。
-
-## Labeled v5 30 字段契约
-
-面向下游或对外沟通的完整字段字典见
-[Screening 最终交付数据字段说明（labeled v5）](artifacts/docs/screening_labeled_v5_field_dictionary.md)。
-
-新增的 `intent_label` 由 Stage2 依据完整会话输出 `task` 或 `qa`；`executable` 在最终映射时
-结合 Stage2 的内部语义原因、风险词表、轮次、长度和本集合内精确重复计算为 `0/1`。
-两项标签都不改变 P0/P1/P2 成员，所有记录照常交付。
-
-P0/P1 第 15 个字段为 `relevance_p0`，P2 为 `relevance_p2`；其余字段名、类型和
-顺序一致。`norm_freq` 与 relevance 在导出时保留四位小数。所有字段必须存在且
-不得为 `null`，只有 `context_text` 可以是空字符串。
-
-多轮记录中，`context_text` 以 ` | ` 连接前序轮次，`target_query` 为最后一轮，
-`text` 为两者组合；单轮记录的 `text=target_query` 且 `context_text=""`。
-
-发布前会独立重验 canonical、Stage1/Challenge/Stage2 标签、第一阶段准入、任务账本、P1 冻结配额、
-逐 L2 缺口、批跑报告指标、legacy 映射、provenance 和 manifest 哈希。任何必需
-LLM 任务失败、报告被修改或字段契约不一致都会阻止发布。
+完整文档入口见 [文档索引](artifacts/docs/README.md)，开发回归测试位于项目外部 [tests](../tests/)。

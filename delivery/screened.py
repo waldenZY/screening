@@ -15,14 +15,13 @@ from ..quality.two_stage import (
     STAGE1_FIELDS,
     STAGE2_FIELDS,
     stage1_passes,
-    stage2_consistency_conflicts,
     validate_challenge_result,
     validate_stage1_result,
     validate_stage2_result,
 )
 
 
-SCREENED_CANONICAL_SCHEMA_VERSION = 5
+SCREENED_CANONICAL_SCHEMA_VERSION = 6
 SET_NAMES = frozenset({"P0", "P1", "P2"})
 SELECTION_ORIGINS = frozenset({"initial_wave", "supplement_wave"})
 _HASH = re.compile(r"[0-9a-f]{64}")
@@ -55,18 +54,21 @@ def build_screened_canonical_record(
     stage2_task_id: str,
 ) -> JsonObject:
     """Build and independently validate one authoritative screened record."""
-    conflicts = stage2_consistency_conflicts(stage2_result, stage1_result)
+    validate_canonical_candidate(candidate)
+    screened_candidate = {
+        **candidate,
+        "features": {
+            "length_bin": candidate["features"]["length_band"],
+            "complexity": candidate["features"]["complexity"],
+        },
+    }
     record: JsonObject = {
         "screened_schema_version": SCREENED_CANONICAL_SCHEMA_VERSION,
         "set": set_name,
-        "candidate": candidate,
+        "candidate": screened_candidate,
         "quality": {
             **validate_stage1_result(dict(stage1_result)),
             **validate_stage2_result(dict(stage2_result), stage1_result),
-        },
-        "quality_consistency": {
-            "is_consistent": not conflicts,
-            "conflict_codes": list(conflicts),
         },
         "delivery_labels": dict(delivery_labels),
         "challenge": (
@@ -95,7 +97,7 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
         raise ScreenedCanonicalError("screened canonical 必须是对象")
     expected = {
         "screened_schema_version", "set", "candidate", "quality",
-        "quality_consistency", "challenge", "selection", "delivery_labels"
+        "challenge", "selection", "delivery_labels"
     }
     if set(record) != expected:
         raise ScreenedCanonicalError("screened canonical 顶层字段不一致")
@@ -108,7 +110,7 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
     candidate = record.get("candidate")
     if not isinstance(candidate, Mapping):
         raise ScreenedCanonicalError("screened canonical candidate 必须是对象")
-    validate_canonical_candidate(candidate)
+    validate_canonical_candidate(candidate, screened_features=True)
 
     challenge = record.get("challenge")
     if set_name == "P2":
@@ -134,26 +136,11 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
     stage2 = validate_stage2_result({key: quality[key] for key in STAGE2_FIELDS}, stage1)
     labels = record.get("delivery_labels")
     if (not isinstance(labels, Mapping)
-            or set(labels) != {"intent_label", "executable", "execution_reasons"}
+            or set(labels) != {"intent_label", "executable"}
             or labels.get("intent_label") != stage2["intent_label"]
             or type(labels.get("executable")) is not int
-            or labels["executable"] not in (0, 1)
-            or not isinstance(labels.get("execution_reasons"), list)
-            or any(reason not in {"risk_keyword", "multi_turn", "no_evaluable_goal", "too_short", "attachment_dependency", "unresolved_reference", "other_unfit"} for reason in labels["execution_reasons"])
-            or len(set(labels["execution_reasons"])) != len(labels["execution_reasons"])
-            or labels["executable"] != int(not labels["execution_reasons"])):
+            or labels["executable"] not in (0, 1)):
         raise ScreenedCanonicalError("screened canonical 下游标签非法")
-    conflicts = stage2_consistency_conflicts(stage2, stage1)
-    consistency = record.get("quality_consistency")
-    if (
-        not isinstance(consistency, Mapping)
-        or set(consistency) != {"is_consistent", "conflict_codes"}
-        or type(consistency.get("is_consistent")) is not bool
-        or not isinstance(consistency.get("conflict_codes"), list)
-        or consistency["conflict_codes"] != list(conflicts)
-        or consistency["is_consistent"] != (not conflicts)
-    ):
-        raise ScreenedCanonicalError("screened canonical 跨阶段一致性标记非法")
 
     selection = record.get("selection")
     selection_fields = {

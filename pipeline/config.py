@@ -14,7 +14,7 @@ from ..shared.json_io import JsonObject
 from .orchestrator import BUILD_CONFIG_VERSION, BuildConfig, parse_build_config
 
 
-PIPELINE_CONFIG_VERSION = 5
+PIPELINE_CONFIG_VERSION = 7
 LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 _TOP_LEVEL_FIELDS = {
@@ -50,7 +50,7 @@ _P2_FIELDS = {
     "candidate_source_shares",
     "minimum_complexity",
     "boundary_probability_cap",
-    "soft_min_per_type",
+    "soft_min_by_primary",
     "max_per_primary",
     "batch_size",
 }
@@ -70,6 +70,10 @@ _P2_SUPPLEMENT_FIELDS = {
     "minimum_yield",
     "safety_factor",
     "exploration_share",
+    "max_sampled",
+    "max_tail_sampled",
+    "tail_batch_size",
+    "max_stalled_batches",
 }
 _OVERRIDE_FIELDS = {
     "source",

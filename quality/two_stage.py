@@ -8,14 +8,15 @@ import logging
 import sqlite3
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from ..shared.json_io import JsonObject, load_jsonl, try_parse_json, write_jsonl
+from ..shared.challenge import CHALLENGE_TYPES
 from ..shared.llm import LlmCall
 
 
@@ -23,23 +24,12 @@ STAGE1_FIELDS = frozenset(
     {"category_fit", "semantic_completeness", "intent_clarity", "validity"}
 )
 STAGE2_FIELDS = frozenset(
-    {"classification_difficulty", "task_difficulty", "issue_types", "overall_score",
-     "intent_label", "execution_issues"}
+    {"task_difficulty", "intent_label", "execution_issues"}
 )
 INTENT_LABELS = frozenset({"task", "qa"})
 EXECUTION_ISSUES = frozenset({"no_evaluable_goal", "attachment_dependency", "unresolved_reference", "other_unfit"})
 CHALLENGE_FIELDS = frozenset(
     {"is_challenge", "primary_challenge", "challenge_types"}
-)
-CHALLENGE_TYPES = (
-    "implicit_goal",
-    "multi_constraint",
-    "multi_turn_context",
-    "long_tail_expr",
-    "ambiguity",
-    "multi_intent",
-    "boundary",
-    "cross_app",
 )
 CHALLENGE_TYPE_SET = frozenset(CHALLENGE_TYPES)
 STAGE1_ENUMS = {
@@ -48,27 +38,10 @@ STAGE1_ENUMS = {
     "intent_clarity": frozenset({"clear", "vague", "no_intent"}),
     "validity": frozenset({"valid", "borderline", "invalid"}),
 }
-CLASSIFICATION_DIFFICULTIES = frozenset(
-    {"trivial", "easy", "moderate", "hard", "not_applicable"}
-)
 TASK_DIFFICULTIES = frozenset(
     {"atomic", "simple", "moderate", "complex", "extreme", "not_applicable"}
 )
-ISSUE_TYPES = frozenset(
-    {
-        "none",
-        "category_mismatch",
-        "ambiguous_intent",
-        "context_dependent",
-        "truncated",
-        "nonsense",
-        "emotional_only",
-        "too_brief",
-        "no_evaluable_goal",
-        "multi_intent",
-    }
-)
-QUALITY_CONTRACT_VERSION = 6
+QUALITY_CONTRACT_VERSION = 7
 
 
 class QualityResponseError(ValueError):
@@ -82,6 +55,45 @@ class QualityStageIncomplete(RuntimeError):
         self.stage = stage
         self.failures = tuple(failures)
         super().__init__(f"{stage} 存在 {len(failures)} 条工程失败")
+
+
+class _FairRequestGate:
+    """Bound total LLM concurrency and rotate capacity across active branches."""
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self._condition = threading.Condition()
+        self._in_flight = 0
+        self._waiting: dict[str, deque[object]] = {}
+        self._branches: deque[str] = deque()
+
+    def acquire(self, branch: str) -> None:
+        token = object()
+        with self._condition:
+            queue = self._waiting.setdefault(branch, deque())
+            if not queue:
+                self._branches.append(branch)
+            queue.append(token)
+            while (
+                self._in_flight >= self.capacity
+                or not self._branches
+                or self._branches[0] != branch
+                or self._waiting[branch][0] is not token
+            ):
+                self._condition.wait()
+            queue.popleft()
+            self._in_flight += 1
+            self._branches.popleft()
+            if queue:
+                self._branches.append(branch)
+            else:
+                self._waiting.pop(branch, None)
+            self._condition.notify_all()
+
+    def release(self) -> None:
+        with self._condition:
+            self._in_flight -= 1
+            self._condition.notify_all()
 
 
 def _sanitized_error(exc: Exception) -> str:
@@ -231,91 +243,27 @@ def challenge_passes(value: Mapping[str, Any]) -> bool:
 
 
 def validate_stage2_result(value: Any, stage1_result: Mapping[str, Any]) -> JsonObject:
-    stage1 = validate_stage1_result(dict(stage1_result))
+    validate_stage1_result(dict(stage1_result))
     if not isinstance(value, dict) or set(value) != STAGE2_FIELDS:
         raise QualityResponseError("第二阶段响应字段必须与白名单完全一致")
-    classification = value.get("classification_difficulty")
     task = value.get("task_difficulty")
-    issues = value.get("issue_types")
-    score = value.get("overall_score")
     intent_label = value.get("intent_label")
     execution_issues = value.get("execution_issues")
-    if classification not in CLASSIFICATION_DIFFICULTIES:
-        raise QualityResponseError("第二阶段 classification_difficulty 枚举非法")
     if task not in TASK_DIFFICULTIES:
         raise QualityResponseError("第二阶段 task_difficulty 枚举非法")
-    if (
-        not isinstance(issues, list)
-        or not issues
-        or any(not isinstance(item, str) or item not in ISSUE_TYPES for item in issues)
-        or len(set(issues)) != len(issues)
-        or ("none" in issues and len(issues) != 1)
-    ):
-        raise QualityResponseError("第二阶段 issue_types 非法")
-    if isinstance(score, bool) or not isinstance(score, int) or not 1 <= score <= 5:
-        raise QualityResponseError("第二阶段 overall_score 必须是 1~5 整数")
     if intent_label not in INTENT_LABELS:
         raise QualityResponseError("第二阶段 intent_label 非法")
     if (not isinstance(execution_issues, list)
             or any(not isinstance(item, str) or item not in EXECUTION_ISSUES for item in execution_issues)
             or len(set(execution_issues)) != len(execution_issues)):
         raise QualityResponseError("第二阶段 execution_issues 非法")
-    issue_set = set(issues)
-    no_evaluable_goal = "no_evaluable_goal" in execution_issues
-    if no_evaluable_goal and intent_label != "qa":
+    if "no_evaluable_goal" in execution_issues and intent_label != "qa":
         raise QualityResponseError("无可评测目标时 intent_label 必须是 qa")
-    if no_evaluable_goal and score != 1:
-        raise QualityResponseError("无可评测目标时 overall_score 必须为 1")
-    if no_evaluable_goal and not ({"nonsense", "emotional_only", "too_brief", "no_evaluable_goal"} & issue_set):
-        raise QualityResponseError("无可评测目标时必须标出对应质量问题")
-    if "no_evaluable_goal" in issue_set and not no_evaluable_goal:
-        raise QualityResponseError("质量问题 no_evaluable_goal 必须对应同名 execution_issues")
-
-    if score == 5 and issue_set != {"none"}:
-        raise QualityResponseError("overall_score=5 时 issue_types 必须为 none")
-    if stage1_passes(stage1) and score < 5 and issue_set == {"none"}:
-        raise QualityResponseError("满格第一阶段被降分时必须标明 issue_types")
     return {
-        "classification_difficulty": classification,
         "task_difficulty": task,
-        "issue_types": list(issues),
-        "overall_score": score,
         "intent_label": intent_label,
         "execution_issues": list(execution_issues),
     }
-
-
-def stage2_consistency_conflicts(
-    value: Mapping[str, Any], stage1_result: Mapping[str, Any]
-) -> tuple[str, ...]:
-    """Return sanitized cross-stage disagreement codes without rejecting labels."""
-    stage1 = validate_stage1_result(dict(stage1_result))
-    stage2 = validate_stage2_result(dict(value), stage1)
-    issues = set(stage2["issue_types"])
-    conflicts: list[str] = []
-    if stage1["category_fit"] == "exact" and "category_mismatch" in issues:
-        conflicts.append("category_fit")
-    if stage1["semantic_completeness"] == "self_contained":
-        if "context_dependent" in issues:
-            conflicts.append("semantic_context")
-        if "truncated" in issues:
-            conflicts.append("semantic_truncated")
-    if stage1["intent_clarity"] == "clear":
-        for issue, code in (
-            ("ambiguous_intent", "intent_ambiguous"),
-            ("nonsense", "intent_nonsense"),
-            ("emotional_only", "intent_emotional_only"),
-            ("too_brief", "intent_too_brief"),
-            ("no_evaluable_goal", "intent_no_evaluable_goal"),
-        ):
-            if issue in issues:
-                conflicts.append(code)
-    if stage1["validity"] == "valid":
-        if stage2["classification_difficulty"] == "not_applicable":
-            conflicts.append("classification_not_applicable")
-        if stage2["task_difficulty"] == "not_applicable":
-            conflicts.append("task_not_applicable")
-    return tuple(conflicts)
 
 
 class TwoStageQualityRunner:
@@ -355,6 +303,11 @@ class TwoStageQualityRunner:
         self.config = config or QualityRunConfig()
         self.logger = logger or logging.getLogger(__name__)
         self.cache_path = self.run_root / "llm_result_cache.sqlite"
+        self._ledger_lock = threading.RLock()
+        self._cache_lock = threading.RLock()
+        self._key_locks_guard = threading.Lock()
+        self._key_locks: dict[str, threading.Lock] = {}
+        self._request_gate = _FairRequestGate(self.config.workers)
         for stage, prompt in self.prompts.items():
             snapshot = self.run_root / f"{stage}_prompt.md"
             if snapshot.is_file() and snapshot.read_text(encoding="utf-8") != prompt:
@@ -442,18 +395,19 @@ class TwoStageQualityRunner:
         if not keys:
             return {}
         result: dict[str, JsonObject] = {}
-        with sqlite3.connect(self.cache_path) as connection:
-            for key in keys:
-                row = connection.execute(
-                    "SELECT result_json FROM results WHERE cache_key=? AND stage=?",
-                    (key, stage),
-                ).fetchone()
-                if row:
-                    result[key] = json.loads(row[0])
+        with self._cache_lock:
+            with sqlite3.connect(self.cache_path) as connection:
+                for key in keys:
+                    row = connection.execute(
+                        "SELECT result_json FROM results WHERE cache_key=? AND stage=?",
+                        (key, stage),
+                    ).fetchone()
+                    if row:
+                        result[key] = json.loads(row[0])
         return result
 
     def _save_cached(self, stage: str, values: Mapping[str, JsonObject]) -> None:
-        with sqlite3.connect(self.cache_path) as connection:
+        with self._cache_lock, sqlite3.connect(self.cache_path) as connection:
             connection.executemany(
                 """
                 INSERT OR REPLACE INTO results(
@@ -477,6 +431,7 @@ class TwoStageQualityRunner:
         stage: str,
         candidate: Mapping[str, Any],
         stage1_result: Mapping[str, Any] | None,
+        branch: str,
     ) -> tuple[JsonObject, float, float, str]:
         payload = quality_input(candidate)
         if stage1_result is not None:
@@ -486,15 +441,19 @@ class TwoStageQualityRunner:
         )
         if self.config.sleep_seconds:
             time.sleep(self.config.sleep_seconds)
-        raw, first_latency, full_latency = self.llm_call(
-            [{"role": "user", "content": prompt}],
-            model=self.model,
-            max_tokens=int(self.llm_options["max_tokens"]),
-            stream=bool(self.llm_options["stream"]),
-            enable_thinking=bool(self.llm_options["enable_thinking"]),
-            skip_special_tokens=bool(self.llm_options["skip_special_tokens"]),
-            timeout=float(self.llm_options["timeout"]),
-        )
+        self._request_gate.acquire(branch)
+        try:
+            raw, first_latency, full_latency = self.llm_call(
+                [{"role": "user", "content": prompt}],
+                model=self.model,
+                max_tokens=int(self.llm_options["max_tokens"]),
+                stream=bool(self.llm_options["stream"]),
+                enable_thinking=bool(self.llm_options["enable_thinking"]),
+                skip_special_tokens=bool(self.llm_options["skip_special_tokens"]),
+                timeout=float(self.llm_options["timeout"]),
+            )
+        finally:
+            self._request_gate.release()
         success, parsed = try_parse_json(raw)
         if not success:
             raise QualityResponseError("响应不是合法 JSON 对象")
@@ -506,11 +465,36 @@ class TwoStageQualityRunner:
             result = validate_stage2_result(parsed, stage1_result or {})
         return result, first_latency, full_latency, hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+    def _call_singleflight(
+        self,
+        key: str,
+        stage: str,
+        candidate: Mapping[str, Any],
+        stage1_result: Mapping[str, Any] | None,
+        branch: str,
+    ) -> tuple[JsonObject, float, float, str, bool]:
+        """Reuse a concurrent branch's result instead of issuing the same request twice."""
+        with self._key_locks_guard:
+            key_lock = self._key_locks.setdefault(key, threading.Lock())
+        with key_lock:
+            concurrent_hit = self._load_cached([key], stage).get(key)
+            if concurrent_hit is not None:
+                output_hash = _stable_hash(concurrent_hit)
+                return concurrent_hit, 0.0, 0.0, output_hash, True
+            result, first_latency, full_latency, output_hash = self._call(
+                stage, candidate, stage1_result, branch
+            )
+            # Commit while holding the key lock so every waiter observes the result.
+            self._save_cached(stage, {key: result})
+            return result, first_latency, full_latency, output_hash, False
+
     def _run(
         self,
         stage: str,
         candidates: Sequence[JsonObject],
         stage1_by_identity: Mapping[str, JsonObject] | None = None,
+        *,
+        branch: str = "shared",
     ) -> dict[str, JsonObject]:
         by_key: dict[str, list[JsonObject]] = defaultdict(list)
         stage1_for_key: dict[str, JsonObject | None] = {}
@@ -545,11 +529,12 @@ class TwoStageQualityRunner:
                     "stage": stage,
                     "source_identities": identities,
                 })
-            _merge_ledger(
-                self.run_root / f"{stage}_cache_hits.jsonl",
-                cache_hit_rows,
-                "event_id",
-            )
+            with self._ledger_lock:
+                _merge_ledger(
+                    self.run_root / f"{stage}_cache_hits.jsonl",
+                    cache_hit_rows,
+                    "event_id",
+                )
 
         tasks = []
         for key, grouped in sorted(by_key.items()):
@@ -566,7 +551,8 @@ class TwoStageQualityRunner:
                     "options_sha256": self.options_hash,
                 }
             )
-        _merge_task_ledger(self.run_root / f"{stage}_tasks.jsonl", tasks)
+        with self._ledger_lock:
+            _merge_task_ledger(self.run_root / f"{stage}_tasks.jsonl", tasks)
 
         pending = [key for key in by_key if key not in cached]
         self.logger.info(
@@ -578,79 +564,110 @@ class TwoStageQualityRunner:
         )
         failures: dict[str, str] = {}
         attempt_path = self.run_root / f"{stage}_attempts.jsonl"
-        attempt_lock = threading.Lock()
         attempt_path.parent.mkdir(parents=True, exist_ok=True)
-        with attempt_path.open("a", encoding="utf-8", newline="\n") as attempt_file:
-            for attempt_no in range(1, self.config.max_retries + 1):
-                if not pending:
-                    break
-                self.logger.info(
-                    "%s attempt=%d pending=%d workers=%d",
-                    stage,
-                    attempt_no,
-                    len(pending),
-                    self.config.workers,
-                )
-                failures = {}
-                successes: dict[str, JsonObject] = {}
-                with ThreadPoolExecutor(max_workers=self.config.workers) as executor:
-                    futures = {
-                        executor.submit(
-                            self._call,
-                            stage,
-                            by_key[key][0],
-                            stage1_for_key[key],
-                        ): key
-                        for key in pending
+        for attempt_no in range(1, self.config.max_retries + 1):
+            if not pending:
+                break
+            self.logger.info(
+                "%s attempt=%d pending=%d workers=%d",
+                stage,
+                attempt_no,
+                len(pending),
+                self.config.workers,
+            )
+            failures = {}
+            successes: dict[str, JsonObject] = {}
+            concurrent_hits: list[str] = []
+            with ThreadPoolExecutor(max_workers=self.config.workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._call_singleflight,
+                        key,
+                        stage,
+                        by_key[key][0],
+                        stage1_for_key[key],
+                        branch,
+                    ): key
+                    for key in pending
+                }
+                for future in as_completed(futures):
+                    key = futures[future]
+                    attempt: JsonObject = {
+                        "cache_key": key,
+                        "stage": stage,
+                        "attempt_no": attempt_no,
+                        "finished_at": _utc_now(),
                     }
-                    for future in as_completed(futures):
-                        key = futures[future]
-                        attempt: JsonObject = {
-                            "cache_key": key,
+                    try:
+                        result, first_latency, full_latency, output_hash, was_cached = future.result()
+                        successes[key] = result
+                        if was_cached:
+                            concurrent_hits.append(key)
+                        attempt.update(
+                            {
+                                "outcome": "success",
+                                "output_sha256": output_hash,
+                                "first_token_latency_ms": first_latency,
+                                "full_latency_ms": full_latency,
+                                "cache_hit": was_cached,
+                                "error": None,
+                            }
+                        )
+                    except Exception as exc:  # transport and contract failures are both retried
+                        failures[key] = _sanitized_error(exc)
+                        attempt.update(
+                            {
+                                "outcome": "failure",
+                                "output_sha256": None,
+                                "first_token_latency_ms": None,
+                                "full_latency_ms": None,
+                                "cache_hit": False,
+                                "error": failures[key],
+                            }
+                        )
+                    with self._ledger_lock, attempt_path.open(
+                        "a", encoding="utf-8", newline="\n"
+                    ) as attempt_file:
+                        attempt_file.write(json.dumps(attempt, ensure_ascii=False) + "\n")
+            if successes:
+                # _call_singleflight already committed provider results. This update
+                # only merges both provider results and concurrent cache hits locally.
+                cached.update(successes)
+            if concurrent_hits:
+                rows = [
+                    {
+                        "event_id": _stable_hash({
                             "stage": stage,
-                            "attempt_no": attempt_no,
-                            "finished_at": _utc_now(),
-                        }
-                        try:
-                            result, first_latency, full_latency, output_hash = future.result()
-                            successes[key] = result
-                            attempt.update(
-                                {
-                                    "outcome": "success",
-                                    "output_sha256": output_hash,
-                                    "first_token_latency_ms": first_latency,
-                                    "full_latency_ms": full_latency,
-                                    "error": None,
-                                }
-                            )
-                        except Exception as exc:  # transport and contract failures are both retried
-                            failures[key] = _sanitized_error(exc)
-                            attempt.update(
-                                {
-                                    "outcome": "failure",
-                                    "output_sha256": None,
-                                    "first_token_latency_ms": None,
-                                    "full_latency_ms": None,
-                                    "error": failures[key],
-                                }
-                            )
-                        with attempt_lock:
-                            attempt_file.write(json.dumps(attempt, ensure_ascii=False) + "\n")
-                            attempt_file.flush()
-                if successes:
-                    self._save_cached(stage, successes)
-                    cached.update(successes)
-                pending = [key for key in pending if key not in successes]
-                self.logger.info(
-                    "%s attempt=%d succeeded=%d failed=%d remaining=%d",
-                    stage,
-                    attempt_no,
-                    len(successes),
-                    len(failures),
-                    len(pending),
-                )
-                if pending and attempt_no < self.config.max_retries:
-                    time.sleep(min(2**attempt_no, 10))
+                            "cache_key": key,
+                            "source_identities": sorted({
+                                str(candidate["source_identity_sha256"])
+                                for candidate in by_key[key]
+                            }),
+                        }),
+                        "cache_key": key,
+                        "stage": stage,
+                        "source_identities": sorted({
+                            str(candidate["source_identity_sha256"])
+                            for candidate in by_key[key]
+                        }),
+                    }
+                    for key in concurrent_hits
+                ]
+                with self._ledger_lock:
+                    _merge_ledger(
+                        self.run_root / f"{stage}_cache_hits.jsonl", rows, "event_id"
+                    )
+            pending = [key for key in pending if key not in successes]
+            self.logger.info(
+                "%s attempt=%d succeeded=%d failed=%d remaining=%d",
+                stage,
+                attempt_no,
+                len(successes),
+                len(failures),
+                len(pending),
+            )
+            if pending and attempt_no < self.config.max_retries:
+                time.sleep(min(2**attempt_no, 10))
         if pending:
             raise QualityStageIncomplete(stage, [f"{key}:{failures.get(key, 'unknown')}" for key in pending])
 
@@ -658,56 +675,32 @@ class TwoStageQualityRunner:
             {"cache_key": key, "stage": stage, "result": cached[key]}
             for key in sorted(by_key)
         ]
-        _merge_ledger(self.run_root / f"{stage}_results.jsonl", cache_results, "cache_key")
-        if stage == "stage2":
-            consistency_rows = []
-            for key in sorted(by_key):
-                conflicts = stage2_consistency_conflicts(
-                    cached[key], stage1_for_key[key] or {}
-                )
-                consistency_rows.append(
-                    {
-                        "cache_key": key,
-                        "stage": stage,
-                        "source_identities": sorted(
-                            {
-                                candidate["source_identity_sha256"]
-                                for candidate in by_key[key]
-                            }
-                        ),
-                        "is_consistent": not conflicts,
-                        "conflict_codes": list(conflicts),
-                    }
-                )
-            _merge_ledger(
-                self.run_root / "stage2_consistency.jsonl",
-                consistency_rows,
-                "cache_key",
-            )
-            conflict_tasks = sum(not row["is_consistent"] for row in consistency_rows)
-            self.logger.info(
-                "stage2 consistency tasks=%d disagreements=%d",
-                len(consistency_rows),
-                conflict_tasks,
-            )
+        with self._ledger_lock:
+            _merge_ledger(self.run_root / f"{stage}_results.jsonl", cache_results, "cache_key")
         result_by_identity: dict[str, JsonObject] = {}
         for key, grouped in by_key.items():
             for candidate in grouped:
                 result_by_identity[candidate["source_identity_sha256"]] = dict(cached[key])
         return result_by_identity
 
-    def run_stage1(self, candidates: Sequence[JsonObject]) -> dict[str, JsonObject]:
-        return self._run("stage1", candidates)
+    def run_stage1(
+        self, candidates: Sequence[JsonObject], *, branch: str = "shared"
+    ) -> dict[str, JsonObject]:
+        return self._run("stage1", candidates, branch=branch)
 
-    def run_challenge(self, candidates: Sequence[JsonObject]) -> dict[str, JsonObject]:
-        return self._run("challenge", candidates)
+    def run_challenge(
+        self, candidates: Sequence[JsonObject], *, branch: str = "shared"
+    ) -> dict[str, JsonObject]:
+        return self._run("challenge", candidates, branch=branch)
 
     def run_stage2(
         self,
         candidates: Sequence[JsonObject],
         stage1_by_identity: Mapping[str, JsonObject],
+        *,
+        branch: str = "shared",
     ) -> dict[str, JsonObject]:
-        return self._run("stage2", candidates, stage1_by_identity)
+        return self._run("stage2", candidates, stage1_by_identity, branch=branch)
 
 
 def run_stage1(

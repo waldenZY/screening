@@ -1,13 +1,13 @@
 # P2 Adaptive 技术方案（已实施）
 
 > 所属产品版本：Screening V3
-> Pipeline 配置版本：`config_version=5`
-> P2 算法标识：`adaptive_challenge_batches_1`
-> 文档状态：当前已实施口径，更新于 2026-10-09
+> Pipeline 配置版本：`config_version=7`
+> P2 算法标识：`adaptive_challenge_batches_2`
+> 文档状态：当前已实施口径，更新于 2026-10-13
 
 ## 1. 目标
 
-P2 正式目标为 2,000 条同时通过 Stage1 和 Challenge Judge 的样本。八类 `primary_challenge` 各有软下限 100，任一类型最多 700。候选不足时允许少于 2,000 条，并报告缺口。
+P2 正式目标为 1,000 条同时通过 Stage1 和 Challenge Judge 的样本。八类 `primary_challenge` 的软下限依次为 50、50、50、50、50、20、5、1，任一类型最多 350。候选不足或覆盖预算耗尽时允许带缺口交付。
 
 P0 不受 P2 采样算法影响。当前 Stage1、Stage2 契约以
 [技术方案](screening_pipeline_technical_design_v3.md) 和实际 Prompt 为准；Stage2 只处理最终成员。
@@ -27,7 +27,7 @@ P0 不受 P2 采样算法影响。当前 Stage1、Stage2 契约以
 → screened canonical、legacy、报告
 ```
 
-总量已满但某类不足 100 时仍会补采。新增稀缺类型会在重新选择时替换超过软下限的头部类型，最终总量仍保持 2,000。
+总量已满但某类未达到自身软下限时会在有限尾部预算内补采。新增稀缺类型会在重新选择时替换超过软下限的头部类型，最终总量保持 1,000。
 
 ## 3. 候选来源
 
@@ -99,9 +99,9 @@ long_tail_expr
 
 ## 5. 配额与最终选择
 
-1. 每个 primary 先预留最多 100 条；不足时保留实际数量并记录缺口。
+1. 每个 primary 先按 `50/50/50/50/50/20/5/1` 的独立软下限预留；不足时保留实际数量并记录缺口。
 2. 剩余名额按各 primary 可用量平方根分配。
-3. 任一 primary 不超过 700 条。
+3. 任一 primary 不超过 350 条。
 4. 类型内部再次按 L2、Cluster 分层，并使用稳定文本哈希选择。
 5. 每批后从全部 Judge PASS 池重算，支持稀缺类型替换头部类型。
 
@@ -113,20 +113,27 @@ long_tail_expr
 先验强度           10
 最低产出率估计     0.005
 安全系数           1.1
-单批最大请求       2,000
+单批最大请求       1,000
 补采探索保留       20%
 补采轮数           3
+实际抽样总预算     15,000
+目标达成后尾部预算 1,000
+尾部单批上限       250
+无进展批次上限     2
 ```
 
 初始轮使用固定 30/30/20/20。每批完成 Stage1 和 Challenge 后，立即更新来源总产出率、来源到 primary 的产出率、总量缺口和八类软下限缺口。产出率以来源池实际抽取数为分母，因此包含文本去重、Stage1 和 Challenge 三段损耗。补采按缺口及后验产出率路由，同时固定保留 20% exploration。
 
-停止条件为目标和软下限均满足、完成三轮、相关候选耗尽或无未评估候选。不使用连续零命中硬早停。
+每批输出可解析的 `P2 batch_progress` JSON，包含 `target_fill` 或 `coverage_tail` 模式、八类最终数量与缺口、三项预算状态和 `next_action`；结束时输出 `P2 adaptive_complete` JSON 及明确停止原因。
+
+停止条件为目标和软下限均满足、完成三轮、相关候选耗尽、实际抽样达到 15,000、目标达成后的尾部抽样达到 1,000，或连续两个尾部批次没有缩小八类总缺口。任一尾部批次缩小总缺口会把连续计数归零。预算或早停触发时允许 P2 带类型缺口交付，报告明确记录缺口、预算使用和停止原因。
 
 ## 7. 产物与恢复
 
 - Challenge 具有独立 Prompt SHA、任务账本、attempts、缓存命中账本、结果账本、SQLite 缓存和批级 checkpoint。
-- `adaptive_challenge_batches_1` 同时进入总 run contract 和 P012 构建契约，算法变化不会误续跑旧检查点。
+- `adaptive_challenge_batches_2` 同时进入总 run contract 和 P012 构建契约，旧配置和旧检查点不会按新配额语义续跑。
 - 中断恢复复用已完成结果，不重复调用。
+- 总预算、尾部预算和连续无进展批次数进入检查点，续跑不会重置。
 - screened canonical schema v4：P2 保存三个 Challenge 字段和 `challenge_task_id`；P0/P1 的 `challenge` 为 `null`。
 - P2 允许 `supplement_wave`；采样与 Challenge 算法不因 labeled v5 新增的两个下游标签改变。
 - P2 汇总写入 `P2/adaptive_summary.json`，总报告写入 `p2_diagnostics`。
@@ -141,6 +148,7 @@ long_tail_expr
 - Judge 任务量、缓存命中、失败、重试和时延；
 - Judge PASS 但未入集的数量；
 - 最终数量、`target_gap` 和候选耗尽状态；
+- 总抽样与尾部预算的已用、剩余、批次上限、无进展批数和预算停止原因；
 - Challenge 标签与 Stage2 issue 的组合诊断。
 
 ## 9. 实现位置

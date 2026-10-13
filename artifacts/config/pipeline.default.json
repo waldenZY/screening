@@ -1,5 +1,5 @@
 {
-  "config_version": 5,
+  "config_version": 7,
   "inputs": {
     "source": "",
     "taxonomy": "",
@@ -51,7 +51,7 @@
       "mmr_lambda": 0.7
     },
     "p2": {
-      "target_n": 2000,
+      "target_n": 1000,
       "candidate_source_shares": {
         "complex": 0.3,
         "multi_turn": 0.3,
@@ -60,9 +60,18 @@
       },
       "minimum_complexity": "moderate",
       "boundary_probability_cap": 0.5,
-      "soft_min_per_type": 100,
-      "max_per_primary": 700,
-      "batch_size": 2000
+      "soft_min_by_primary": {
+        "implicit_goal": 50,
+        "multi_constraint": 50,
+        "multi_turn_context": 50,
+        "long_tail_expr": 50,
+        "ambiguity": 50,
+        "multi_intent": 20,
+        "boundary": 5,
+        "cross_app": 1
+      },
+      "max_per_primary": 350,
+      "batch_size": 1000
     },
     "dedup": {
       "normalization_rule": "unicode_whitespace_and_category_P_removed_v1",
@@ -88,6 +97,10 @@
     "prior_strength": 10.0,
     "minimum_yield": 0.005,
     "safety_factor": 1.1,
-    "exploration_share": 0.2
+    "exploration_share": 0.2,
+    "max_sampled": 15000,
+    "max_tail_sampled": 1000,
+    "tail_batch_size": 250,
+    "max_stalled_batches": 2
   }
 }

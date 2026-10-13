@@ -1,19 +1,12 @@
 # Screening v3 当前文档
 
-当前运行使用 `config_version=5`、Stage2 `quality_contract_version=6`、
-`screened_schema_version=5`，交付为 30 字段 `labeled_v5`。P0/P1/P2 的准入
-遵循当前实现；候选去重统一在 Stage1 前执行，`intent_label` 和 `executable` 只增加下游筛选信息，不删减通过准入的最终成员。
+当前内部记录为 `screened_schema_version=6`，交付文件仍名为 `labeled_v5`，每条为 **14 字段**，映射契约版本为 4。旧 30 字段 v5 run 不兼容。
 
-| 文档 | 用途 |
+| 文档 | 内容 |
 | --- | --- |
-| [技术方案](screening_pipeline_technical_design_v3.md) | 数据链路、阶段契约、恢复和发布 |
-| [配置使用手册](screening_pipeline_configuration_v3.md) | 配置字段、CLI 覆盖与 run identity |
-| [labeled v5 字段字典](screening_labeled_v5_field_dictionary.md) | 30 字段顺序、取值及下游标签含义 |
-| [P2 Adaptive 技术方案](screening_v3_p2_adaptive.md) | 已实施的 P2 采样与 Challenge 细节 |
+| [技术设计](screening_pipeline_technical_design_v3.md) | 当前链路、Stage1/Challenge/Stage2、内部记录、导出和发布复验 |
+| [字段字典](screening_labeled_v5_field_dictionary.md) | 14 字段顺序、类型、语义及 `executable` 口径 |
+| [配置说明](screening_pipeline_configuration_v3.md) | 启动参数、配置和运行契约 |
+| [P2 自适应采样](screening_v3_p2_adaptive.md) | P2 来源、波次、配额及补采 |
 
-实际默认值以 [pipeline.default.json](../config/pipeline.default.json) 为准；Stage1、
-Challenge、Stage2 的判断依据分别以 [quality_stage1.md](../prompts/quality_stage1.md)、
-[quality_challenge.md](../prompts/quality_challenge.md)、
-[quality_stage2.md](../prompts/quality_stage2.md) 为准。
-
-旧版字段说明和未实施方案已移至 [历史归档](../archive/README.md)，不作为当前运行口径。
+历史 30 字段说明见 [归档目录](../archive/v3_history/docs/)。开发测试位于项目外部 [tests](../../../tests/)。

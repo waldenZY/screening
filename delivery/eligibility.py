@@ -30,6 +30,7 @@ def delivery_labels(
         "unresolved_reference": "unresolved_reference" in semantic,
         "other_unfit": "other_unfit" in semantic,
     }
-    reasons = [name for name in REASON_ORDER if found[name]]
-    return {"intent_label": stage2["intent_label"], "executable": int(not reasons),
-            "execution_reasons": reasons}
+    return {
+        "intent_label": stage2["intent_label"],
+        "executable": int(not any(found[name] for name in REASON_ORDER)),
+    }

@@ -34,7 +34,7 @@ from ..shared.json_io import JsonObject, stable_hash, write_json
 from ..shared.taxonomy import TaxonomyMappings
 
 
-CANONICAL_INDEX_VERSION = 2
+CANONICAL_INDEX_VERSION = 3
 DATABASE_NAME = "canonical_candidate_index.sqlite"
 BUILDING_DATABASE_NAME = "canonical_candidate_index.building.sqlite"
 METADATA_NAME = "canonical_metadata.json"
@@ -50,7 +50,7 @@ _CANDIDATE_COLUMNS = (
     "sample_type", "cluster_probability", "frequency", "frequency_less_count",
     "cluster_frequency_count", "probability_band", "frequency_band",
     "normalized_frequency", "relevance_p0", "relevance_p2", "length_band",
-    "complexity", "formality",
+    "complexity",
 )
 
 
@@ -304,8 +304,7 @@ def _initialize(connection: sqlite3.Connection, source: Mapping[str, Any]) -> No
             relevance_p0 REAL,
             relevance_p2 REAL,
             length_band TEXT NOT NULL,
-            complexity TEXT NOT NULL,
-            formality TEXT NOT NULL
+            complexity TEXT NOT NULL
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS candidates_l1_source
             ON candidates(l1, source_line);
@@ -889,8 +888,8 @@ def _scan(
                                 source_line, byte_offset, byte_length, record_sha256,
                                 cluster_json, l1, l2, l2_key, sample_type,
                                 cluster_probability, frequency, probability_band,
-                                length_band, complexity, formality
-                            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                length_band, complexity
+                            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 source_identity,
@@ -909,7 +908,6 @@ def _scan(
                                 provisional["probability_band"],
                                 provisional["length_band"],
                                 provisional["complexity"],
-                                provisional["formality"],
                             ),
                         )
                         checkpoint["candidate_rows"] = int(checkpoint.get("candidate_rows", 0)) + 1
@@ -1231,7 +1229,7 @@ class CanonicalCandidateIndex:
                    cluster_probability, frequency, frequency_less_count,
                    cluster_frequency_count, probability_band,
                    frequency_band, normalized_frequency, relevance_p0,
-                   relevance_p2, length_band, complexity, formality
+                   relevance_p2, length_band, complexity
             FROM candidates
             WHERE {column}=?
             ORDER BY source_line
@@ -1270,7 +1268,6 @@ class CanonicalCandidateIndex:
                         "relevance": {"p0": float(row[18]), "p2": float(row[19])},
                         "length_band": row[20],
                         "complexity": row[21],
-                        "formality": row[22],
                     },
                 }
 

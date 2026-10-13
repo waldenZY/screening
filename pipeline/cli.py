@@ -29,6 +29,7 @@ from ..delivery.publish import (
     PublicationError,
     collect_and_validate_artifacts,
     publish_labeled,
+    publish_labeled_branch,
     validate_manifest_artifacts,
     validate_manifest_inputs,
     validate_manifest_source,
@@ -116,6 +117,37 @@ def _execute_pipeline_impl(
         stages={"p012_build": {"status": "running", "error": None}},
     )
     build_started_ns = time.monotonic_ns()
+    branch_publication: JsonObject = {}
+
+    def publish_completed_branch(set_name: str, _result: JsonObject) -> None:
+        if publish_root is None:
+            return
+        current_manifest = _read_manifest(context.run_root)
+        branch_state = current_manifest.get("branches", {}).get(set_name, {})
+        if branch_state.get("status") == "published":
+            existing = branch_state.get("publication")
+            if isinstance(existing, Mapping):
+                branch_publication[set_name] = dict(existing)
+            return
+        result = publish_labeled_branch(
+            context.run_root,
+            publish_root,
+            current_manifest,
+            set_name,
+            replace=replace,
+        )
+        result["published_at"] = utc_now()
+        branch_publication[set_name] = result
+        update_manifest(
+            context.run_root,
+            branches={set_name: {
+                "status": "published",
+                "stage": "published",
+                "publication": result,
+                "error": None,
+            }},
+        )
+
     try:
         outcome = run_build(
             index,
@@ -125,6 +157,7 @@ def _execute_pipeline_impl(
             run_root=context.run_root,
             quality_runner=quality_runner,
             logger=logging.getLogger("screening.v3"),
+            on_branch_complete=publish_completed_branch,
         )
     except QualityStageIncomplete as exc:
         current_manifest = _read_manifest(context.run_root)
@@ -161,9 +194,34 @@ def _execute_pipeline_impl(
     finally:
         record_stage_duration(context.run_root, "p012_build", build_started_ns)
 
+    if outcome.errors:
+        status = "partial_failed" if outcome.records else "failed"
+        update_manifest(
+            context.run_root,
+            status=status,
+            stages={
+                "p012_build": {
+                    "status": status,
+                    "failed_branches": dict(outcome.errors),
+                    "error": None,
+                }
+            },
+            publication=branch_publication,
+        )
+        return 2
+
     artifacts = collect_and_validate_artifacts(context.run_root)
+    current_branches = _read_manifest(context.run_root).get("branches", {})
     branch_details = {
-        name: {"status": "completed", "summary": outcome.summary["sets"][name], "error": None}
+        name: {
+            "status": current_branches.get(name, {}).get("status", "completed"),
+            "stage": current_branches.get(name, {}).get("stage", "completed"),
+            "duration_ms": current_branches.get(name, {}).get("duration_ms", 0),
+            "summary": outcome.summary["sets"][name],
+            "artifacts": current_branches.get(name, {}).get("artifacts", {}),
+            "publication": current_branches.get(name, {}).get("publication"),
+            "error": None,
+        }
         for name in ("P0", "P1", "P2")
     }
     update_manifest(
@@ -202,6 +260,7 @@ def _execute_pipeline_impl(
         },
         branches=branch_details,
         artifacts=artifacts,
+        publication=branch_publication if branch_publication else None,
     )
     manifest = _read_manifest(context.run_root)
     validate_manifest_artifacts(context.run_root, manifest)
@@ -433,7 +492,17 @@ def main(
             publish_root=effective.publish_root,
             replace=args.replace,
         )
-        print(f"v3 run={context.run_id} status={_read_manifest(context.run_root)['status']}")
+        final_manifest = _read_manifest(context.run_root)
+        print(f"v3 run={context.run_id} status={final_manifest['status']}")
+        if result == 2:
+            branch_states = final_manifest.get("branches", {})
+            print(
+                "branches "
+                + " ".join(
+                    f"{name}={branch_states.get(name, {}).get('status', 'unknown')}"
+                    for name in ("P0", "P1", "P2")
+                )
+            )
         return result
     except (OSError, ValueError, RuntimeError, KeyError, PublicationError) as exc:
         print(f"screening v3 failed: {exc}")

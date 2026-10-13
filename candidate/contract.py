@@ -13,15 +13,14 @@ from ..shared.json_io import JsonObject
 from ..shared.taxonomy import TaxonomyMappings
 
 
-CANONICAL_SCHEMA_VERSION = 1
-FEATURE_RULE_VERSION = 2
+CANONICAL_SCHEMA_VERSION = 2
+FEATURE_RULE_VERSION = 3
 MAX_SQLITE_INTEGER = 2**63 - 1
 
 PROBABILITY_BANDS = frozenset({"high", "mid", "boundary"})
 FREQUENCY_BANDS = frozenset({"hot", "warm", "cold"})
 LENGTH_BANDS = frozenset({"short", "mid", "long"})
 COMPLEXITY_LEVELS = frozenset({"simple", "moderate", "complex"})
-FORMALITY_LEVELS = frozenset({"formal", "mixed", "colloquial"})
 SAMPLE_TYPES = frozenset({"single_turn", "multi_turn"})
 
 TRACE_FIELDS = (
@@ -44,13 +43,6 @@ _MULTIMODAL_MARKERS = re.compile(MULTIMODAL_MARKER_PATTERN)
 _LEADING_MULTIMODAL_MARKER = re.compile(rf"^(?:{MULTIMODAL_MARKER_PATTERN})")
 _WHITESPACE = re.compile(r"\s+")
 
-_PARTICLES = set("呢嘛吧啊哦哈啦呗呀哇咯撒咔咚嘞喽咧")
-_COLLOQUIAL_CHARS = set("啥咋俺咱整搁")
-_CASUAL_WORDS = re.compile(
-    r"(咋整|干哈|干啥|整啥|咋么|俺们|啥子|咋办|啥意思|整一下|咋样"
-    r"|麻了|离谱|裂开|烦死了|无语|救命|服了|没谁了|我靠|卧槽|尼玛)"
-)
-_BADWORDS = re.compile(r"(他妈的|他妈|操你|傻逼|煞笔|脑残|垃圾|废物|狗屁|cnm|rnm|tm的|sb)")
 _ACTIONS = re.compile(
     r"打开|关闭|取消|设置|删除|修改|查询|播放|停止|暂停|重启|关机|发送|拨号|"
     r"导航|翻译|截图|搜索|计算|定位|预约|订|买"
@@ -324,38 +316,13 @@ def _complexity(text: str) -> str:
     return "complex"
 
 
-def _formality(text: str) -> str:
-    cleaned = clean_text(text)
-    score = sum(1 for char in cleaned if char in _PARTICLES) * 0.25
-    score += sum(1 for char in cleaned if char in _COLLOQUIAL_CHARS) * 0.4
-    score += len(_CASUAL_WORDS.findall(cleaned)) * 0.6
-    if _BADWORDS.search(cleaned.lower()):
-        score += 1.0
-    if re.search(r"~~{1,}", cleaned):
-        score += 0.5
-    if re.search(r"！{2,}", cleaned):
-        score += 0.3
-    # Kept for output compatibility: this is the historical rule and threshold.
-    if re.search(r".{3,}", cleaned):
-        score += 0.3
-    if re.search(r"(.)\1{2,}", cleaned):
-        score += 0.5
-    if re.search(r"[\U0001F300-\U0001F9FF]|[;:][-~^]?[)D(p]", text):
-        score += 0.3
-    if score <= 0.5:
-        return "formal"
-    if score <= 1.5:
-        return "mixed"
-    return "colloquial"
-
-
 def compute_fixed_features(
     signals: Mapping[str, Any],
     conversation: Mapping[str, Any],
     cluster_frequency_stats: Mapping[str, Any],
     config: FixedFeatureConfig | Mapping[str, Any] | None = None,
 ) -> JsonObject:
-    """Compute deterministic legacy-compatible features without rounding."""
+    """Compute deterministic sampling features without rounding."""
     if config is None:
         rules = DEFAULT_FIXED_FEATURE_CONFIG
     elif isinstance(config, FixedFeatureConfig):
@@ -438,7 +405,6 @@ def compute_fixed_features(
         },
         "length_band": _length_band(full_text),
         "complexity": _complexity(full_text),
-        "formality": _formality(full_text),
     }
 
 
@@ -515,7 +481,6 @@ def build_canonical_candidate(
             "relevance",
             "length_band",
             "complexity",
-            "formality",
         }
         features = {key: indexed_features[key] for key in feature_keys if key in indexed_features}
 
@@ -561,8 +526,10 @@ def _is_number(value: Any) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 
 
-def validate_canonical_candidate(record: Mapping[str, Any]) -> None:
-    """Strictly validate canonical shape, types, enum values and invariants."""
+def validate_canonical_candidate(
+    record: Mapping[str, Any], *, screened_features: bool = False
+) -> None:
+    """Validate the full candidate or its frozen screened feature projection."""
     if not isinstance(record, Mapping):
         raise CanonicalContractError("canonical_not_object", "canonical record 必须是对象")
     _require_exact_keys(
@@ -683,29 +650,25 @@ def validate_canonical_candidate(record: Mapping[str, Any]) -> None:
     ):
         raise CanonicalContractError("canonical_invalid_signals", "frequency 非法")
 
-    _require_exact_keys(
-        features,
-        {
-            "probability_band",
-            "frequency_band",
-            "normalized_frequency",
-            "relevance",
-            "length_band",
-            "complexity",
-            "formality",
-        },
-        "features",
-    )
-    enum_checks = (
-        ("probability_band", PROBABILITY_BANDS),
-        ("frequency_band", FREQUENCY_BANDS),
-        ("length_band", LENGTH_BANDS),
+    selected_features = {"length_bin", "complexity"} if screened_features else {"length_band", "complexity"}
+    full_features = selected_features | {
+        "probability_band", "frequency_band", "normalized_frequency", "relevance"
+    }
+    _require_exact_keys(features, selected_features if screened_features else full_features, "features")
+    enum_checks = [
+        ("length_bin" if screened_features else "length_band", LENGTH_BANDS),
         ("complexity", COMPLEXITY_LEVELS),
-        ("formality", FORMALITY_LEVELS),
-    )
+    ]
+    if not screened_features:
+        enum_checks.extend((
+            ("probability_band", PROBABILITY_BANDS),
+            ("frequency_band", FREQUENCY_BANDS),
+        ))
     for key, allowed in enum_checks:
         if features.get(key) not in allowed:
             raise CanonicalContractError("canonical_invalid_feature", f"features.{key} 非法")
+    if screened_features:
+        return
     normalized = features.get("normalized_frequency")
     if not _is_number(normalized) or not 0 <= float(normalized) <= 1:
         raise CanonicalContractError("canonical_invalid_feature", "normalized_frequency 非法")

@@ -1,0 +1,376 @@
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+
+import pytest
+
+import screening.delivery.publish as publish_module
+import screening.candidate.sampling as sampling_module
+from screening.candidate.index import ensure_canonical_candidate_index
+from screening.shared.json_io import sha256_file
+from screening.shared.taxonomy import load_taxonomy_mappings
+from screening.delivery.legacy import LEGACY_FILENAMES
+from screening.pipeline.orchestrator import BuildConfig
+from screening.candidate.sampling import SamplingConfig, P1SamplingConfig, P2SamplingConfig
+from screening.quality.two_stage import QualityRunConfig, TwoStageQualityRunner
+from screening.pipeline.cli import execute_pipeline
+from screening.delivery.publish import PublicationError
+from screening.pipeline.run_context import prepare_run_context
+
+
+def _write_jsonl(path, rows):
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _fixture(tmp_path):
+    taxonomy_path = tmp_path / "taxonomy.json"
+    taxonomy_path.write_text(
+        json.dumps(
+            {
+                "categories": [
+                    {
+                        "name": "工具",
+                        "total_size": 8,
+                        "assigned_clusters": [1],
+                        "sub_intents": [{"name": "操作", "cluster_ids": [1], "size": 8}],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    source = tmp_path / "cluster.jsonl"
+    texts = [
+        "打开客厅空调", "查询明日天气", "播放古典音乐", "导航最近车站",
+        "设置早餐闹钟", "计算贷款利息", "翻译英文邮件", "关闭卧室灯光",
+    ]
+    _write_jsonl(
+        source,
+        [
+            {"session": f"s{i}", "text": text, "cluster": 1, "cluster_prob": 0.95, "frequency": i}
+            for i, text in enumerate(texts, start=1)
+        ],
+    )
+    taxonomy = load_taxonomy_mappings(taxonomy_path)
+    index = ensure_canonical_candidate_index(
+        source,
+        taxonomy,
+        taxonomy_sha256=sha256_file(taxonomy_path),
+        cache_root=tmp_path / "cache",
+        min_free_bytes=0,
+        reserve_free_bytes=0,
+        cache_mb=1,
+        progress_every=100,
+    )
+    config = BuildConfig(
+        sampling=SamplingConfig(
+            p1=replace(P1SamplingConfig(), target_n=3),
+            p2=replace(P2SamplingConfig(), target_n=2),
+        )
+    )
+    quality_config = QualityRunConfig(workers=2, sleep_seconds=0, max_retries=1)
+    prompts = ("stage1 {CANDIDATE_JSON}", "stage2 difficulty {CANDIDATE_JSON}")
+    llm_metadata = {
+        "endpoint_sha256": "e" * 64,
+        "model": "fake",
+        "max_tokens": 100,
+        "timeout": 1.0,
+        "stream": False,
+        "enable_thinking": False,
+        "skip_special_tokens": False,
+    }
+    context = prepare_run_context(
+        tmp_path / "outputs",
+        source,
+        taxonomy_path,
+        index,
+        config,
+        quality_config,
+        stage1_prompt=prompts[0],
+        stage2_prompt=prompts[1],
+        llm_metadata=llm_metadata,
+    )
+    return source, taxonomy_path, taxonomy, index, config, quality_config, prompts, llm_metadata, context
+
+
+def test_v2_end_to_end_resume_and_safe_publish(tmp_path):
+    source, taxonomy_path, taxonomy, index, config, quality_config, prompts, metadata, context = _fixture(tmp_path)
+    calls = []
+
+    def fake_llm(messages, **kwargs):
+        prompt = messages[0]["content"]
+        calls.append(prompt)
+        value = (
+            {"classification_difficulty": "easy", "task_difficulty": "atomic", "issue_types": ["none"], "overall_score": 5}
+            if prompt.startswith("stage2")
+            else {"category_fit": "exact", "semantic_completeness": "self_contained", "intent_clarity": "clear", "validity": "valid"}
+        )
+        return json.dumps(value), 1.0, 2.0
+
+    runner = TwoStageQualityRunner(
+        context.run_root / "quality",
+        stage1_prompt=prompts[0],
+        stage2_prompt=prompts[1],
+        model="fake",
+        llm_options={"max_tokens": 100, "timeout": 1.0, "stream": False, "enable_thinking": False, "skip_special_tokens": False},
+        llm_call=fake_llm,
+        config=quality_config,
+    )
+    assert execute_pipeline(context, index, config, taxonomy, runner, publish_root=None) == 0
+    manifest = json.loads((context.run_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "completed"
+    assert manifest["timing"]["invocation_count"] == 1
+    assert manifest["timing"]["active_duration_ms"] >= 0
+    assert manifest["stages"]["p012_build"]["timing"]["execution_count"] == 1
+    assert manifest["stages"]["batch_report"]["status"] == "completed"
+    assert all((context.run_root / name / "screened.canonical.jsonl").is_file() for name in ("P0", "P1", "P2"))
+    report_path = context.run_root / "screening_run_report.json"
+    markdown_path = context.run_root / "screening_run_report.md"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert markdown_path.is_file()
+    assert report["sets"]["P1"]["p1_quota_fulfillment_rate"]["rate"] == 1.0
+    assert report["sets"]["P1"]["semantic_label_fit_rate"]["rate"] == 1.0
+    assert manifest["artifacts"]["root"]["screening_run_report_json"]["path"] == report_path.name
+
+    reused = prepare_run_context(
+        tmp_path / "outputs", source, taxonomy_path, index, config, quality_config,
+        stage1_prompt=prompts[0], stage2_prompt=prompts[1], llm_metadata=metadata,
+    )
+    assert reused.disposition == "reused"
+    publish_root = tmp_path / "delivery"
+    before = len(calls)
+    original_markdown = markdown_path.read_text(encoding="utf-8")
+    markdown_path.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(PublicationError, match="批跑报告"):
+        publish_module.validate_manifest_artifacts(reused.run_root, manifest)
+    markdown_path.write_text(original_markdown, encoding="utf-8", newline="\n")
+    assert execute_pipeline(reused, index, config, taxonomy, runner, publish_root=publish_root) == 0
+    assert len(calls) == before
+    assert all((publish_root / LEGACY_FILENAMES[name]).is_file() for name in ("P0", "P1", "P2"))
+
+    conflict = publish_root / LEGACY_FILENAMES["P0"]
+    conflict.write_text("different\n", encoding="utf-8")
+    with pytest.raises(PublicationError):
+        execute_pipeline(reused, index, config, taxonomy, runner, publish_root=publish_root)
+    assert execute_pipeline(reused, index, config, taxonomy, runner, publish_root=publish_root, replace=True) == 0
+
+
+def test_explicit_old_manifest_is_not_compatible_with_v2(tmp_path):
+    source, taxonomy_path, _, index, config, quality_config, prompts, metadata, _ = _fixture(tmp_path)
+    old_root = tmp_path / "other-outputs"
+    run_root = old_root / "runs" / "old-run"
+    run_root.mkdir(parents=True)
+    (run_root / "manifest.json").write_text(
+        json.dumps({"schema_version": 8, "pipeline_version": 8, "run_id": "old-run"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="v2 不兼容"):
+        prepare_run_context(
+            old_root, source, taxonomy_path, index, config, quality_config,
+            stage1_prompt=prompts[0], stage2_prompt=prompts[1],
+            llm_metadata=metadata, run_id="old-run",
+        )
+
+
+def test_v2_resumes_only_engineering_failures(tmp_path):
+    source, taxonomy_path, taxonomy, index, config, quality_config, prompts, metadata, context = _fixture(tmp_path)
+    first_calls = 0
+
+    def flaky_llm(messages, **kwargs):
+        nonlocal first_calls
+        first_calls += 1
+        prompt = messages[0]["content"]
+        if first_calls == 1:
+            return "not-json", 1.0, 2.0
+        value = (
+            {"classification_difficulty": "easy", "task_difficulty": "atomic", "issue_types": ["none"], "overall_score": 5}
+            if prompt.startswith("stage2")
+            else {"category_fit": "exact", "semantic_completeness": "self_contained", "intent_clarity": "clear", "validity": "valid"}
+        )
+        return json.dumps(value), 1.0, 2.0
+
+    first_runner = TwoStageQualityRunner(
+        context.run_root / "quality",
+        stage1_prompt=prompts[0], stage2_prompt=prompts[1], model="fake",
+        llm_options={"max_tokens": 100, "timeout": 1.0, "stream": False, "enable_thinking": False, "skip_special_tokens": False},
+        llm_call=flaky_llm, config=quality_config,
+    )
+    assert execute_pipeline(context, index, config, taxonomy, first_runner, publish_root=None) == 2
+    failed = json.loads((context.run_root / "manifest.json").read_text(encoding="utf-8"))
+    assert failed["status"] == "incomplete"
+    assert failed["stages"]["quality_stage1"]["engineering_failure_count"] == 1
+    stage1_attempts_before = len(
+        (context.run_root / "quality" / "stage1_attempts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+
+    resumed = prepare_run_context(
+        tmp_path / "outputs", source, taxonomy_path, index, config, quality_config,
+        stage1_prompt=prompts[0], stage2_prompt=prompts[1], llm_metadata=metadata,
+    )
+    assert resumed.disposition == "resumed"
+    second_calls = 0
+
+    def healthy_llm(messages, **kwargs):
+        nonlocal second_calls
+        second_calls += 1
+        prompt = messages[0]["content"]
+        value = (
+            {"classification_difficulty": "easy", "task_difficulty": "atomic", "issue_types": ["none"], "overall_score": 5}
+            if prompt.startswith("stage2")
+            else {"category_fit": "exact", "semantic_completeness": "self_contained", "intent_clarity": "clear", "validity": "valid"}
+        )
+        return json.dumps(value), 1.0, 2.0
+
+    second_runner = TwoStageQualityRunner(
+        resumed.run_root / "quality",
+        stage1_prompt=prompts[0], stage2_prompt=prompts[1], model="fake",
+        llm_options={"max_tokens": 100, "timeout": 1.0, "stream": False, "enable_thinking": False, "skip_special_tokens": False},
+        llm_call=healthy_llm, config=quality_config,
+    )
+    assert execute_pipeline(resumed, index, config, taxonomy, second_runner, publish_root=None) == 0
+    completed = json.loads((resumed.run_root / "manifest.json").read_text(encoding="utf-8"))
+    assert completed["timing"]["resume_count"] == 1
+    stage1_attempts_after = len(
+        (context.run_root / "quality" / "stage1_attempts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert stage1_attempts_after == stage1_attempts_before + 1
+
+
+def test_stage2_resume_uses_final_membership_without_resampling(tmp_path, monkeypatch):
+    source, taxonomy_path, taxonomy, index, config, quality_config, prompts, metadata, context = _fixture(tmp_path)
+
+    def fail_stage2(messages, **kwargs):
+        prompt = messages[0]["content"]
+        if prompt.startswith("stage2"):
+            return "not-json", 1.0, 2.0
+        return json.dumps(
+            {"category_fit": "exact", "semantic_completeness": "self_contained", "intent_clarity": "clear", "validity": "valid"}
+        ), 1.0, 2.0
+
+    first_runner = TwoStageQualityRunner(
+        context.run_root / "quality",
+        stage1_prompt=prompts[0], stage2_prompt=prompts[1], model="fake",
+        llm_options={"max_tokens": 100, "timeout": 1.0, "stream": False, "enable_thinking": False, "skip_special_tokens": False},
+        llm_call=fail_stage2, config=quality_config,
+    )
+    assert execute_pipeline(context, index, config, taxonomy, first_runner, publish_root=None) == 2
+    assert (context.run_root / "checkpoints" / "final_membership.json").is_file()
+
+    resumed = prepare_run_context(
+        tmp_path / "outputs", source, taxonomy_path, index, config, quality_config,
+        stage1_prompt=prompts[0], stage2_prompt=prompts[1], llm_metadata=metadata,
+    )
+    monkeypatch.setattr(
+        sampling_module.CandidateSampler,
+        "sample_p0",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("P0 resampled")),
+    )
+    monkeypatch.setattr(
+        sampling_module.CandidateSampler,
+        "sample_p1",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("P1 resampled")),
+    )
+    monkeypatch.setattr(
+        sampling_module.CandidateSampler,
+        "sample_p2",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("P2 resampled")),
+    )
+    resumed_prompts = []
+
+    def healthy_stage2(messages, **kwargs):
+        prompt = messages[0]["content"]
+        resumed_prompts.append(prompt)
+        assert prompt.startswith("stage2")
+        return json.dumps(
+            {"classification_difficulty": "easy", "task_difficulty": "atomic", "issue_types": ["none"], "overall_score": 5}
+        ), 1.0, 2.0
+
+    second_runner = TwoStageQualityRunner(
+        resumed.run_root / "quality",
+        stage1_prompt=prompts[0], stage2_prompt=prompts[1], model="fake",
+        llm_options={"max_tokens": 100, "timeout": 1.0, "stream": False, "enable_thinking": False, "skip_special_tokens": False},
+        llm_call=healthy_stage2, config=quality_config,
+    )
+    assert execute_pipeline(resumed, index, config, taxonomy, second_runner, publish_root=None) == 0
+    assert resumed_prompts
+    manifest = json.loads((resumed.run_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["stages"]["final_membership"]["status"] == "completed"
+    assert manifest["stages"]["quality_stage2"]["status"] == "completed"
+
+
+def test_cross_stage_disagreement_is_reported_not_retried(tmp_path):
+    source, _, taxonomy, index, config, quality_config, prompts, _, context = _fixture(tmp_path)
+    calls = []
+
+    def disagreeing_llm(messages, **kwargs):
+        prompt = messages[0]["content"]
+        calls.append(prompt)
+        if prompt.startswith("stage2"):
+            value = {
+                "classification_difficulty": "easy",
+                "task_difficulty": "atomic",
+                "issue_types": ["category_mismatch"],
+                "overall_score": 4,
+            }
+        else:
+            value = {
+                "category_fit": "exact",
+                "semantic_completeness": "self_contained",
+                "intent_clarity": "clear",
+                "validity": "valid",
+            }
+        return json.dumps(value), 1.0, 2.0
+
+    runner = TwoStageQualityRunner(
+        context.run_root / "quality",
+        stage1_prompt=prompts[0], stage2_prompt=prompts[1], model="fake",
+        llm_options={"max_tokens": 100, "timeout": 1.0, "stream": False, "enable_thinking": False, "skip_special_tokens": False},
+        llm_call=disagreeing_llm, config=quality_config,
+    )
+    assert execute_pipeline(context, index, config, taxonomy, runner, publish_root=None) == 0
+    report = json.loads((context.run_root / "screening_run_report.json").read_text(encoding="utf-8"))
+    assert report["totals"]["cross_stage_disagreement_records"] > 0
+    assert report["sets"]["P0"]["cross_stage_consistency"]["conflict_types"] == {
+        "category_fit": report["sets"]["P0"]["final_count"]
+    }
+    ledger = (context.run_root / "quality" / "stage2_consistency.jsonl").read_text(encoding="utf-8")
+    assert "打开客厅空调" not in ledger
+    assert len([prompt for prompt in calls if prompt.startswith("stage2")]) > 0
+
+
+def test_v2_transaction_rolls_back_all_destinations(monkeypatch, tmp_path):
+    sources = []
+    destinations = []
+    for index in range(2):
+        source = tmp_path / f"source-{index}"
+        destination = tmp_path / "dest" / f"file-{index}"
+        source.write_text(f"new-{index}", encoding="utf-8")
+        destination.parent.mkdir(exist_ok=True)
+        destination.write_text(f"old-{index}", encoding="utf-8")
+        sources.append(source)
+        destinations.append(destination)
+    original_replace = publish_module.os.replace
+    commits = 0
+
+    def fail_second_commit(source, destination):
+        nonlocal commits
+        if str(source).endswith(".publish.tmp"):
+            commits += 1
+            if commits == 2:
+                raise OSError("commit failed")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(publish_module.os, "replace", fail_second_commit)
+    with pytest.raises(OSError):
+        publish_module._transactional_publish(list(zip(sources, destinations)))
+    assert [path.read_text(encoding="utf-8") for path in destinations] == ["old-0", "old-1"]
+    assert not list(tmp_path.rglob("*.tmp"))

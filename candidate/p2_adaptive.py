@@ -16,7 +16,7 @@ from ..shared.json_io import JsonObject
 
 
 P2_SOURCE_NAMES = ("complex", "multi_turn", "boundary", "exploration")
-P2_ALGORITHM = "adaptive_challenge_batches_1"
+P2_ALGORITHM = "adaptive_challenge_batches_2"
 
 
 def source_tags(locator: Mapping[str, Any], config: P2SamplingConfig) -> tuple[str, ...]:
@@ -240,7 +240,7 @@ class AdaptiveP2Sampler:
                        c.cluster_probability, c.frequency, c.frequency_less_count,
                        c.cluster_frequency_count, c.probability_band,
                        c.frequency_band, c.normalized_frequency, c.relevance_p0,
-                       c.relevance_p2, c.length_band, c.complexity, c.formality,
+                       c.relevance_p2, c.length_band, c.complexity,
                        q.quota,
                        ROW_NUMBER() OVER (
                            PARTITION BY c.l2_key, c.cluster_json
@@ -277,7 +277,7 @@ class AdaptiveP2Sampler:
                     "probability_band": row[15], "frequency_band": row[16],
                     "normalized_frequency": float(row[17]),
                     "relevance": {"p0": float(row[18]), "p2": float(row[19])},
-                    "length_band": row[20], "complexity": row[21], "formality": row[22],
+                    "length_band": row[20], "complexity": row[21],
                 },
             })
         return locators, available
@@ -363,7 +363,11 @@ def select_final_p2(
     selected_ids: set[str] = set()
     counts: Counter[str] = Counter()
     for challenge_type in CHALLENGE_TYPES:
-        take = min(config.soft_min_per_type, config.max_per_primary, len(groups[challenge_type]))
+        take = min(
+            config.soft_min_by_primary[challenge_type],
+            config.max_per_primary,
+            len(groups[challenge_type]),
+        )
         values = _diverse_take(groups[challenge_type], take)
         selected.extend(values)
         selected_ids.update(str(item["source_identity_sha256"]) for item in values)
@@ -391,7 +395,8 @@ def select_final_p2(
         _candidate_order(item),
     ))
     deficits = {
-        key: max(0, config.soft_min_per_type - counts[key]) for key in CHALLENGE_TYPES
+        key: max(0, config.soft_min_by_primary[key] - counts[key])
+        for key in CHALLENGE_TYPES
     }
     type_cap_excluded = sum(
         max(0, len(groups[key]) - config.max_per_primary) for key in CHALLENGE_TYPES

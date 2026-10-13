@@ -27,10 +27,10 @@ from ..quality.two_stage import QUALITY_CONTRACT_VERSION
 from .checkpoints import CHECKPOINT_SCHEMA_VERSION
 
 
-PIPELINE_VERSION = 3
-MANIFEST_SCHEMA_VERSION = 3
+PIPELINE_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 4
 _LOCK = threading.RLock()
-_RESUMABLE = {"created", "running", "incomplete", "publish_failed"}
+_RESUMABLE = {"created", "running", "incomplete", "partial_failed", "publish_failed"}
 _REUSABLE = {"completed", "published"}
 
 
