@@ -22,6 +22,25 @@ DEDUP_RULE_VERSION = 1
 NORMALIZATION_RULE = "unicode_whitespace_and_category_P_removed_v1"
 IDF_RULE = "all_indexed_rows_unique_character_2_3grams_log((N+1)/(df+1))+1_v1"
 RULES_SHA256 = stable_hash({"version": DEDUP_RULE_VERSION, "normalization": NORMALIZATION_RULE, "idf": IDF_RULE})
+SIMILARITY_BOUNDARY_TOLERANCE = 1e-12
+
+
+def normalize_unit_similarity(value: Any) -> float:
+    """Clamp only roundoff outside [0, 1]; never relax a dedup decision threshold."""
+    if not isinstance(value, (int, float)):
+        raise ValueError("Similarity must be numeric")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        finite = False
+    if (not finite or value < -SIMILARITY_BOUNDARY_TOLERANCE
+            or value > 1.0 + SIMILARITY_BOUNDARY_TOLERANCE):
+        raise ValueError("Similarity must be finite and within the unit boundary tolerance")
+    if value < 0:
+        return 0.0
+    if value > 1:
+        return 1.0
+    return value
 
 
 def normalize_text(value: str) -> str:
@@ -115,7 +134,11 @@ def weighted_jaccard(left: str, right: str, snapshot: Mapping[str, Any]) -> floa
     def weight(gram: str) -> float:
         return math.log((count + 1) / (int(df.get(gram, 0)) + 1)) + 1
     union = a | b
-    return sum(weight(gram) for gram in a & b) / sum(weight(gram) for gram in union)
+    numerator = math.fsum(weight(gram) for gram in a & b)
+    denominator = math.fsum(weight(gram) for gram in union)
+    if not math.isfinite(numerator) or not math.isfinite(denominator) or denominator <= 0:
+        raise ValueError("Weighted Jaccard requires finite sums and a positive denominator")
+    return normalize_unit_similarity(numerator / denominator)
 
 
 def edit_similarity(left: str, right: str) -> float:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -17,10 +18,10 @@ from ..candidate.index import (
     validate_canonical_source,
 )
 from ..candidate.p2_adaptive import P2_ALGORITHM, P2_SOURCE_NAMES
-from ..candidate.dedup import RULES_SHA256, normalize_text, selection_text
+from ..candidate.dedup import RULES_SHA256, normalize_text, selection_text, normalize_unit_similarity
 from ..pipeline.orchestrator import BUILD_CONFIG_VERSION
 from ..pipeline.run_context import PIPELINE_VERSION
-from ..shared.json_io import JsonObject, load_jsonl, sha256_file, stable_hash
+from ..shared.json_io import JsonObject, iter_jsonl, load_jsonl, sha256_file, stable_hash
 from .legacy import (
     LEGACY_FILENAMES,
     LEGACY_MAPPING_VERSION,
@@ -64,6 +65,72 @@ from ..quality.two_stage import (
 
 class PublicationError(ValueError):
     """A v3 artifact or safe-publication contract violation."""
+
+
+def _log_content_conflict(set_name: str, destination: Path, *, replace: bool) -> None:
+    logging.getLogger(__name__).warning("publication %s", json.dumps({
+        "check": "content_conflict", "set": set_name, "path": str(destination),
+        "next_action": "transactional_replace" if replace else "stop_without_replace",
+    }, ensure_ascii=False, sort_keys=True))
+
+
+def _validate_dedup_audit_row(
+    set_name: str, path: Path, line_no: int, row: JsonObject, rules: Mapping[str, Any],
+) -> JsonObject:
+    """Validate an in-memory copy, preserving historical audit bytes and hashes."""
+    metrics = ("candidate_jaccard", "weighted_jaccard", "edit_similarity")
+    labels = {"drop", "retain", "exact_normalized", "near_duplicate", "below_confirmation_threshold"}
+
+    def fail(fields: tuple[str, ...], message: str = "invalid dedup audit row") -> None:
+        values = {}
+        for field in fields:
+            value = row.get(field)
+            if isinstance(value, (int, float)) or (isinstance(value, str) and value in labels):
+                values[field] = repr(value)
+            else:
+                values[field] = f"<{type(value).__name__}>"
+        details = {"file": str(path), "line": line_no, "fields": list(fields), "values": values}
+        raise PublicationError(f"{set_name} {message}: " + json.dumps(details, ensure_ascii=False, sort_keys=True))
+
+    if not isinstance(row.get("decision"), str) or row["decision"] not in {"drop", "retain"}:
+        fail(("decision",))
+    if not isinstance(row.get("reason"), str) or row["reason"] not in {
+        "exact_normalized", "near_duplicate", "below_confirmation_threshold"
+    }:
+        fail(("reason",))
+    for field in ("candidate", "representative"):
+        if not isinstance(row.get(field), str):
+            fail((field,))
+    checked = dict(row)
+    for field in metrics:
+        try:
+            checked[field] = normalize_unit_similarity(row.get(field))
+        except ValueError:
+            fail((field,))
+    reason = checked["reason"]
+    if reason == "near_duplicate":
+        if checked["decision"] != "drop":
+            fail(("decision",), "invalid near duplicate decision")
+        for field, threshold in zip(metrics, (
+            "candidate_jaccard_min", "weighted_jaccard_min", "edit_similarity_min"
+        )):
+            if checked[field] < rules[threshold]:
+                fail((field,), "invalid near duplicate decision")
+    elif reason == "exact_normalized":
+        if checked["decision"] != "drop":
+            fail(("decision",), "invalid exact duplicate decision")
+        for field in metrics:
+            if checked[field] != 1.0:
+                fail((field,), "invalid exact duplicate decision")
+    else:
+        if checked["decision"] != "retain":
+            fail(("decision",), "invalid borderline decision")
+        if checked["candidate_jaccard"] < rules["candidate_jaccard_min"]:
+            fail(("candidate_jaccard",), "invalid borderline decision")
+        if (checked["weighted_jaccard"] >= rules["weighted_jaccard_min"]
+                and checked["edit_similarity"] >= rules["edit_similarity_min"]):
+            fail(("weighted_jaccard", "edit_similarity"), "invalid borderline decision")
+    return checked
 
 
 def _require_current_quality_contract(manifest: Mapping[str, Any]) -> None:
@@ -303,34 +370,13 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         candidate_path = branch_root / "candidate_tasks.jsonl"
         branch_report_path = branch_root / "legacy_export_report.json"
         canonical = load_jsonl(canonical_path)
-        dedup_audit = load_jsonl(branch_root / "dedup_audit.jsonl")
+        dedup_audit_path = branch_root / "dedup_audit.jsonl"
+        dedup_audit = []
         dedup_rules = summary["config"]["sampling"]["dedup"]
         dedup_counts = Counter()
-        for row in dedup_audit:
-            if (row.get("decision") not in {"drop", "retain"}
-                    or row.get("reason") not in {"exact_normalized", "near_duplicate", "below_confirmation_threshold"}
-                    or not isinstance(row.get("candidate"), str)
-                    or not isinstance(row.get("representative"), str)
-                    or any(not isinstance(row.get(key), (int, float)) or not 0 <= row[key] <= 1
-                           for key in ("candidate_jaccard", "weighted_jaccard", "edit_similarity"))):
-                raise PublicationError(f"{set_name} invalid dedup audit row")
-            if row["reason"] == "near_duplicate" and (
-                    row["decision"] != "drop"
-                    or row["candidate_jaccard"] < dedup_rules["candidate_jaccard_min"]
-                    or row["weighted_jaccard"] < dedup_rules["weighted_jaccard_min"]
-                    or row["edit_similarity"] < dedup_rules["edit_similarity_min"]):
-                raise PublicationError(f"{set_name} invalid near duplicate decision")
-            if row["reason"] == "exact_normalized" and (
-                    row["decision"] != "drop"
-                    or any(row[key] != 1.0 for key in
-                           ("candidate_jaccard", "weighted_jaccard", "edit_similarity"))):
-                raise PublicationError(f"{set_name} invalid exact duplicate decision")
-            if row["reason"] == "below_confirmation_threshold" and (
-                    row["decision"] != "retain"
-                    or row["candidate_jaccard"] < dedup_rules["candidate_jaccard_min"]
-                    or (row["weighted_jaccard"] >= dedup_rules["weighted_jaccard_min"]
-                        and row["edit_similarity"] >= dedup_rules["edit_similarity_min"])):
-                raise PublicationError(f"{set_name} invalid borderline decision")
+        for line_no, original in iter_jsonl(dedup_audit_path):
+            row = _validate_dedup_audit_row(set_name, dedup_audit_path, line_no, original, dedup_rules)
+            dedup_audit.append(original)
             dedup_counts[row["reason"]] += 1
         expected_dedup = summary["dedup"][set_name]
         if (dedup_counts["exact_normalized"] != expected_dedup["exact_dropped"]
@@ -809,6 +855,7 @@ def publish_labeled(
         source_hash = sha256_file(source)
         if destination.is_file():
             if sha256_file(destination) != source_hash:
+                _log_content_conflict(set_name, destination, replace=replace)
                 conflicts.append(str(destination))
                 if replace:
                     pending.append((source, destination))
@@ -943,6 +990,8 @@ def publish_labeled_branch(
     source_hash = sha256_file(legacy_path)
     pending: list[tuple[Path, Path]] = []
     conflict = destination.is_file() and sha256_file(destination) != source_hash
+    if conflict:
+        _log_content_conflict(set_name, destination, replace=replace)
     if conflict and not replace:
         raise PublicationError(f"{set_name} 发布目标已有不同内容；如确认替换请使用 --replace")
     if not destination.is_file() or conflict:

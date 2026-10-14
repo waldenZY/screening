@@ -12,7 +12,11 @@
 
 三个分支共享一个公平 LLM 请求门。总在途请求不超过 `quality.workers`，等待分支按轮转取得请求位，空闲额度可由其他分支使用。同一缓存键并发出现时只发送一次请求；缓存、任务账本和结果账本的写入加锁提交。
 
+输入加载后、正式索引和三个分支启动前，执行 [启动预检](screening_pipeline_configuration_v3.md#24-启动预检与故障定位)：提前检查 Prompt 占位符、目录临时文件的写入/原子替换/删除、发布目标类型和读权限，然后发送一次固定短文本 LLM 请求。失败立即结束；成功诊断记录在 manifest 的 `preflight`，不改变数据契约或质量阶段账本。已有同名发布文件只提前提示，内容冲突仍在导出后按哈希确认。所有预检日志隐藏凭证、服务地址和响应正文。
+
 ## 2. 判断阶段
+
+评判依据和边界示例见 [Stage1 / Stage2 评判标准](screening_quality_judgment_standards.md)；下文说明工程输入、输出和门禁。
 
 Stage1 输入恰好为 `sample_type`、`conversation_turns`、`candidate_category={L1,L2}`，轮次从 canonical 的 `conversation.full_text` 按既有规则生成，不能由清洗后的目标轮重建。最后一轮为测试目标，前序仅用于理解、恢复和核查；前序有请求不能自动证明目标轮有效。类别只能核验，不能补造目标、对象或状态。调用为一条 user 消息，Prompt 唯一占位符为 `{CANDIDATE_JSON}`，样本中的标注指令不可执行。
 
@@ -60,4 +64,4 @@ Stage2 不筛掉成员。其结果进入 `quality/stage2_results.jsonl` 账本�
 
 固定的 [Stage1 离线样例](../evals/stage1_cases.json) 和 [28 条 Stage2 离线样例](../evals/stage2_cases.json) 覆盖标注边界，供人工核对规则和期望标签。Stage2 样例仅同步公共质量契约版本。请求捕获、缓存复用、输出约束和发布复验通过模拟 LLM 验证；这些测试不测量真实模型准确率，本轮不调用真实模型。
 
-manifest 分别记录 P0/P1/P2 的阶段、耗时、错误、产物和发布状态。全部成功时总状态为 `completed` 或 `published`；部分失败为 `partial_failed`；全部失败为 `failed`。当前并发契约不续跑旧 pipeline/build/manifest/report 版本。发布目标若已有同名不同内容，默认停止；使用新目录或显式替换。测试位于项目外部 `tests/`，包括并发上限、公平调度、分支故障隔离、断点续跑与篡改阻止发布。
+manifest 分别记录 P0/P1/P2 的阶段、耗时、错误、产物和发布状态。全部成功时总状态为 `completed` 或 `published`；部分失败为 `partial_failed`；全部失败为 `failed`。当前并发契约不续跑旧 pipeline/build/manifest/report 版本。发布目标若已有同名不同内容，默认停止；使用新目录或显式替换。当前工作区未保留 `tests/`。工程验收使用 `moto` 环境和模拟 LLM；本轮数值修复在项目外临时目录验证浮点边界、历史审计复验、指定 run 续跑、独立发布及文件哈希不变，不新增常驻测试或诊断脚本。

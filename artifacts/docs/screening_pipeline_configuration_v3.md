@@ -67,6 +67,30 @@ screening/artifacts/config/pipeline.default.json
 日志、索引性能和发布参数不改变数据 contract；但更换 `output_root` 会切换工作区，
 因此系统无法在新目录中自动找到原 run。
 
+### 2.4 启动预检与故障定位
+
+输入文件、风险词表、LLM 配置及依赖加载后，正式候选索引和批跑前执行启动预检，无需增加配置字段：
+
+1. 三个 Prompt 均须恰好包含一个 `{CANDIDATE_JSON}`。
+2. 对输出根目录、`runs/`、索引缓存目录，以及启用发布时的根目录和三个集合子目录，创建独立临时文件，验证写入、原子替换和删除，再清理探测文件。
+3. 检查发布目标的文件类型和已有文件读权限。同名文件只提示，内容冲突在最终导出后比较哈希；相同内容仍允许重复发布，不同内容须 `--replace` 才能事务替换。
+4. 按当前模型和请求参数发送一次固定短文本请求，验证能取得非空文本响应。预检不重试，失败退出码为 `1`，不启动索引或采样。
+
+每次启动都包含这一请求，包括续跑或已完成 run 的复用；它不作为 Stage1、Challenge 或 Stage2 标注任务进入质量账本，不验证 Prompt 标注质量。成功摘要保存为 manifest 的 `preflight`，其中 `llm.requests=1`；该运行诊断不参与数据 contract，不要求新建 run。预检通过只表示当前条件可用，不保证后续服务状态、目录权限和文件锁不发生变化。
+
+定位日志中的 `preflight` JSON 字段：
+
+| check / 状态 | 关键字段与排查方向 |
+| --- | --- |
+| `prompt / failed` | `hint` 指出缺少或重复占位符的阶段 |
+| `directory / failed` | `path`、`operation`、`error_type`、`errno` 指出创建、写入、替换或删除失败；检查权限、空间和文件锁 |
+| `publication_targets / exists_unverified` | `set`、`path`、`replace`；已有文件保持原状，导出后比较哈希 |
+| `llm / failed` | `error_type`、`http_status`、`hint`；401 检查密钥，403 检查授权，404 检查地址和模型，429 检查配额或限流 |
+| `llm / passed` | `requests`、`elapsed_ms`、首 token 与完整响应耗时；地址仅记录 SHA-256 |
+| `startup / passed` | 预检总耗时，随后才进入索引准备 |
+
+预检日志及失败输出不包含 API Key、服务地址、服务响应正文或原始 Query。最终发布内容冲突使用 `publication` 日志，记录集合、目标路径及 `stop_without_replace` 或 `transactional_replace`，便于关联启动时的文件存在提示。
+
 ## 3. 完整配置结构
 
 当前默认结构如下：
@@ -139,9 +163,31 @@ cluster ID 类型、L1/L2 映射和 population 已冻结。
 
 ### 4.4 `inputs.risk_keywords`
 
-`inputs.risk_keywords` 为必填的 `.xlsx` 路径。工作簿必须含 `Sheet1`，仅有
-`关键词`、`风险级别`，且至少有一条有效词条。文件 SHA-256 与规范化规则快照进入 run
-契约；更换词表会创建新 run。CLI 可用 `--risk-keywords` 临时覆盖。
+`inputs.risk_keywords` 为正式运行必填的 `.xlsx` 路径；模板中的空字符串须在启动前填写。配置文件和 CLI 覆盖值中的相对路径均以所选 pipeline 配置文件所在目录解析；CLI 可用 `--risk-keywords` 临时覆盖。使用绝对路径可避免歧义。
+
+```json
+"risk_keywords": "D:/data/risk_keywords.xlsx"
+```
+
+Excel 格式要求：
+
+- 工作簿包含 `Sheet1`，首行严格按顺序为 `关键词`、`风险级别` 两列。
+- 两列的词条值均为非空字符串，读取时去除首尾空白；风险级别不能使用数字。
+- 至少有一条有效词条；完全空白的行跳过，额外非空列或不完整词条会报错。
+- 风险级别没有固定枚举，例如 `高`、`中`、`低` 均可作为文本元数据；当前匹配不按级别分层。
+
+格式示例（正式词条由项目维护）：
+
+| 关键词 | 风险级别 |
+| --- | --- |
+| 定时开关机 | 高 |
+| 显示重绘刷新区域 | 低 |
+
+词表在 Stage2 之后用于确定性计算 `executable`。程序按 `shared/risk_keywords.py` 的前后缀规则和特殊映射提取核心词，同时保留原词，对最后一轮 `target_query` 作子串匹配。例如“定时开关机”生成“开关机”“关机”和原词，“请关机”即可命中。匹配不做语义推断、否定识别、词边界检查或大小写转换；维护词条时须考虑核心词过宽可能带来的命中。
+
+任一风险级别的词条命中均令 `executable=0`，样本仍保留和导出。词表不参与 Stage1 准入或 Stage2 模型标注，也不改变 P0/P1/P2 成员。`executable=0` 还可能来自多轮、短目标轮或 Stage2 语义问题；未命中词表不保证该字段为 `1`，完整口径见 [字段字典](screening_labeled_v5_field_dictionary.md#executable-口径)。
+
+文件缺失或格式错误在启动阶段报错。run 根目录的 `risk_keywords.json` 保存词条、核心词、规则版本、`source_sha256` 和 `rules_sha256`；这些哈希进入 manifest 的冻结契约。续跑时须保持词表内容一致，修改原 Excel 内容需要新 run。发布复验校验快照和哈希，并从冻结快照重算 `executable`。
 
 ### 4.5 `outputs.output_root`
 

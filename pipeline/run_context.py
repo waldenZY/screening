@@ -303,6 +303,7 @@ def update_manifest(
     artifacts: Mapping[str, Any] | None = None,
     publication: Mapping[str, Any] | None = None,
     effective_config: Mapping[str, Any] | None = None,
+    preflight: Mapping[str, Any] | None = None,
 ) -> JsonObject:
     with _LOCK:
         path = run_root / "manifest.json"
@@ -319,6 +320,8 @@ def update_manifest(
             manifest["publication"] = dict(publication)
         if effective_config is not None:
             manifest["effective_config"] = dict(effective_config)
+        if preflight is not None:
+            manifest["preflight"] = dict(preflight)
         manifest["updated_at"] = utc_now()
         write_json(path, manifest)
         return manifest

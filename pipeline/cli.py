@@ -20,6 +20,7 @@ from ..delivery.legacy import LEGACY_MAPPING_VERSION
 from ..delivery.report import RUN_REPORT_SCHEMA_VERSION
 from ..shared.llm import LlmConfig, load_llm_config, validate_llm_dependency
 from .orchestrator import BuildConfig, run_build
+from .preflight import run_preflight
 from ..delivery.screened import SCREENED_CANONICAL_SCHEMA_VERSION
 from ..quality.two_stage import (
     QualityStageIncomplete,
@@ -423,6 +424,12 @@ def main(
         llm_config = llm_config_override or load_llm_config()
         validate_llm_dependency()
         taxonomy = load_taxonomy_mappings(effective.taxonomy)
+        llm_call = llm_call_override or llm_config.bind()
+        preflight = run_preflight(
+            effective,
+            prompts={"stage1": stage1_prompt, "challenge": challenge_prompt, "stage2": stage2_prompt},
+            llm_config=llm_config, llm_call=llm_call, replace=args.replace, logger=logger,
+        )
         taxonomy_sha256 = sha256_file(effective.taxonomy)
         logger.info("canonical index open source_bytes=%d", effective.source.stat().st_size)
         index = ensure_canonical_candidate_index(
@@ -466,6 +473,7 @@ def main(
         )
         update_manifest(
             context.run_root,
+            preflight=preflight,
             effective_config=effective.manifest_value(
                 run_id=args.run_id,
                 new_run=args.new_run,
@@ -479,7 +487,7 @@ def main(
             stage2_prompt=stage2_prompt,
             model=llm_config.model,
             llm_options=llm_config.options(),
-            llm_call=llm_call_override or llm_config.bind(),
+            llm_call=llm_call,
             config=quality_config,
             logger=logger,
         )
