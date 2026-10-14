@@ -2,15 +2,21 @@
 
 本文件描述当前链路契约。历史 30 字段设计已归档于 [旧版设计](../archive/v3_history/docs/screening_pipeline_technical_design_30_field.md)。启动命令与配置方式见 [README](../../README.md) 和 [配置说明](screening_pipeline_configuration_v3.md)。
 
+核对日期：2026-10-14；当前契约版本见 [文档索引](README.md)。默认 P1 目标 6,000、P2 目标 1,000；总 LLM 并发 10、最大尝试轮数 20；P2 实际抽样总预算 20,000。默认值以 [配置模板](../config/pipeline.default.json) 为准。
+
 ## 1. 数据流与成员决定
 
 源 JSONL 与分类映射构成固定候选索引。索引解析会话、校验分类和源信号，计算采样所需的概率档、频次档、归一化频次、相关度、长度档和复杂度。`formality` 不再计算或进入索引。源索引、特征规则和去重规则有独立版本及哈希；旧规则 run 不能按当前契约续跑。
 
-公共索引和冻结输入完成后，P0 冒烟、P1 基准和 P2 对抗集合由三个 branch runner 并发构建。P0 经 Stage1 后立即冻结成员并进入 Stage2；P1 在冻结 L2 配额下补采后进入 Stage2；P2 自适应取候选，经 Stage1 与 Challenge 判定并在预算内补采后进入 Stage2。三个分支拥有独立检查点、账本、产物和发布事务。一个分支变慢或失败不会取消、回滚或阻塞其他分支。具体采样配额、波次及停止条件见 [P2 自适应说明](screening_v3_p2_adaptive.md) 与配置。
+公共索引和冻结输入完成后，P0 冒烟、P1 基准和 P2 对抗集合由三个 branch runner 并发构建。P0 经 Stage1 后立即冻结成员并进入 Stage2；P1 在冻结 L2 配额下补采后进入 Stage2；P2 自适应取候选，经 Stage1 与 Challenge 判定并在预算内补采后进入 Stage2。三个分支拥有独立检查点、成员与任务引用、产物和发布事务；质量任务及结果账本由共享调度器加锁提交。一个分支失败不会取消或回滚其他分支。具体采样配额、波次及停止条件见 [P2 自适应说明](screening_v3_p2_adaptive.md) 与配置。
 
-集合内文本去重统一在候选阶段、Stage1 调用前完成，覆盖初采和补采。规范化仅去空白与标点；规范化相同的文本直接去重。近重复先以双字 Jaccard ≥ 0.45 找到待比较对，再要求 L2 相同、源索引冻结的字符 2/3-gram IDF 加权 Jaccard ≥ 0.80、规范化编辑相似度 ≥ 0.90 才自动剔除。边界对保留并审计。不同集合允许成员重叠，跨集合 overlap 只进入总报告。最终发布再检查每集合规范化文本唯一。
+集合内文本去重统一在候选阶段、Stage1 调用前完成，覆盖初采和补采。规范化仅去空白与标点；规范化相同的文本直接去重。近重复先以双字 Jaccard ≥ 0.45 找到待比较对，再要求 L2 相同、源索引冻结的字符 2/3-gram IDF 加权 Jaccard ≥ 0.80、规范化编辑相似度 ≥ 0.90 才自动剔除。边界对保留并审计。不同集合允许成员重叠，跨集合 overlap 只进入总报告。最终全量复验再检查每集合规范化文本唯一。
+
+加权交集与并集使用 `math.fsum`；仅对 0/1 边界外不超过 `1e-12` 的误差裁回边界。审计复验在内存副本上应用同一容差，保留原文件和哈希；0.45/0.80/0.90 确认阈值不增加容差。该数值修复不升级契约版本，可复验兼容 run 的旧浮点值。
 
 三个分支共享一个公平 LLM 请求门。总在途请求不超过 `quality.workers`，等待分支按轮转取得请求位，空闲额度可由其他分支使用。同一缓存键并发出现时只发送一次请求；缓存、任务账本和结果账本的写入加锁提交。
+
+默认工作区分为 `_canonical_cache/<cache-id>/` 与 `runs/<run-id>/`：前者保存源索引，后者保存冻结契约、分支检查点、质量账本及交付产物。三个阶段共享本 run 的 `quality/llm_result_cache.sqlite`；新 run 不自动读取旧 run 的 LLM 缓存。目录保留不会覆盖旧数据，系统不自动清理，详见 [输出目录与复用](screening_pipeline_configuration_v3.md#45-outputsoutput_root)。
 
 输入加载后、正式索引和三个分支启动前，执行 [启动预检](screening_pipeline_configuration_v3.md#24-启动预检与故障定位)：提前检查 Prompt 占位符、目录临时文件的写入/原子替换/删除、发布目标类型和读权限，然后发送一次固定短文本 LLM 请求。失败立即结束；成功诊断记录在 manifest 的 `preflight`，不改变数据契约或质量阶段账本。已有同名发布文件只提前提示，内容冲突仍在导出后按哈希确认。所有预检日志隐藏凭证、服务地址和响应正文。
 
@@ -40,7 +46,7 @@ Stage1 严格 JSON 输出五项：`category_fit`、`semantic_completeness`、`in
 
 Stage2 不筛掉成员。其结果进入 `quality/stage2_results.jsonl` 账本及内部逐条记录。Stage1 和 Stage2 任务/缓存键均由阶段、Prompt 哈希、模型参数哈希和实际 payload 哈希决定；账本保存 `input_sha256` 而非代表样本完整 taxonomy 摘要。Stage1 的 `candidate_category_sha256` 仅计算实际输入类别，簇等非输入元数据不造成合并冲突。来源身份与行号按相同输入合并；Stage1 同类别同文本可跨分支复用，Stage2 不含类别或 Stage1 结果，可进一步跨分类复用。Challenge 的键保持现状。旧跨阶段一致率及 `stage2_consistency.jsonl` 已移除。
 
-接口为 `run_stage2(candidates, *, branch=...)`、`task_id(stage, candidate)` 和 `validate_stage2_result(value)`，不要求 Stage1 结果参数。当前质量契约从 8 升为 9，新语义创建新 run，不迁移或续跑旧检查点。Stage2 输入及标注语义保持现状。
+接口为 `run_stage2(candidates, *, branch=...)`、`task_id(stage, candidate)` 和 `validate_stage2_result(value)`，不要求 Stage1 结果参数。当前质量契约为 9，不迁移或续跑不兼容质量契约的检查点。调整默认参数不改变标注语义或升级契约；续跑必须保留原有效参数。
 
 ## 3. 下游标签
 
@@ -58,10 +64,14 @@ Stage2 不筛掉成员。其结果进入 `quality/stage2_results.jsonl` 账本�
 
 ## 5. 发布复验与兼容性
 
-发布前独立核对当前 run 契约、源和索引、Stage1/Challenge/Stage2 结果账本、最终成员任务、内部记录、每集合文本唯一、14 字段顺序/类型/会话关系、内部与导出逐条一致性、报告统计及产物哈希。`executable` 从冻结词表、会话和 `execution_issues` 重新计算，不能只信任内部存值。交付记录数必须等于最终成员数。
+启用发布后，每个分支在导出完成时先做单分支复验：核对当前契约、源和索引、该分支 Stage1/Stage2 任务与结果、内部记录（含 P2 Challenge 结构）、14 字段映射、provenance、分支报告和产物哈希。`executable` 从冻结词表、会话和 `execution_issues` 重新计算，交付数量等于最终成员数。
+
+全部分支成功后再做全量复验：额外核对 Challenge 任务/结果账本、去重审计与每集合规范化文本唯一、采样及导出汇总、总报告与全量产物哈希，再核对三个发布文件。单分支发布完成不等于全量复验已经通过；全量失败不撤销先前独立发布的文件。
 
 全量与单分支发布均从最终成员重算 Stage1/Stage2 输入哈希和任务键，核对任务来源、结果及 Stage1 无阻断准入条件。分支审计按其候选身份核对 Stage1 结果，Stage2 统计按最终成员核对。单分支不要求其他分支账本全部进入终态。
 
-固定的 [Stage1 离线样例](../evals/stage1_cases.json) 和 [28 条 Stage2 离线样例](../evals/stage2_cases.json) 覆盖标注边界，供人工核对规则和期望标签。Stage2 样例仅同步公共质量契约版本。请求捕获、缓存复用、输出约束和发布复验通过模拟 LLM 验证；这些测试不测量真实模型准确率，本轮不调用真实模型。
+固定的 [Stage1 离线样例](../evals/stage1_cases.json) 和 [Stage2 离线样例](../evals/stage2_cases.json) 覆盖标注边界，供人工核对规则和期望标签。工程验收采用请求捕获、缓存复用、输出约束和发布复验的模拟 LLM 检查，不测量真实模型准确率，也不调用真实模型。
 
-manifest 分别记录 P0/P1/P2 的阶段、耗时、错误、产物和发布状态。全部成功时总状态为 `completed` 或 `published`；部分失败为 `partial_failed`；全部失败为 `failed`。当前并发契约不续跑旧 pipeline/build/manifest/report 版本。发布目标若已有同名不同内容，默认停止；使用新目录或显式替换。当前工作区未保留 `tests/`。工程验收使用 `moto` 环境和模拟 LLM；本轮数值修复在项目外临时目录验证浮点边界、历史审计复验、指定 run 续跑、独立发布及文件哈希不变，不新增常驻测试或诊断脚本。
+manifest 分别记录 P0/P1/P2 的阶段、耗时、错误、产物和发布状态。全部成功时总状态为 `completed` 或 `published`；部分分支失败为 `partial_failed`，全部分支失败为 `failed`，分支失败返回 `2`。启动或全量复验错误返回 `1`；最终整组发布失败为 `publish_failed`。发布目标不存在则复制、同哈希则复用、不同内容默认拒绝，显式 `--replace` 才替换。事务回滚限于捕获异常后的本次发布，不保证强制终止或断电恢复。
+
+自动恢复优先选择同契约的可续跑 run，再选择已完成 run；总状态为 `failed` 时须显式指定原 `--run-id`。不兼容的 pipeline/build/manifest/report 版本仍须新建 run。当前工作区未保留 `tests/`，一次性验收代码与数据放在项目外临时目录，不新增常驻测试或诊断脚本。

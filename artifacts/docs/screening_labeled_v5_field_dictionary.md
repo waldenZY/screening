@@ -2,6 +2,8 @@
 
 当前 `labeled_v5` 每条记录恰好 14 个字段，顺序如下。文件名延续 v5；映射契约为 `legacy_mapping_version=4`，与历史 30 字段 v5 run 不兼容。历史说明见 [30 字段字典](../archive/v3_history/docs/screening_labeled_v5_30_field_dictionary.md)。
 
+核对日期：2026-10-14；各契约版本见 [文档索引](README.md)，完整标注规则见 [Stage1 / Stage2 评判标准](screening_quality_judgment_standards.md)。P1 目标 6,000、P2 目标 1,000 等默认采样数量不改变这 14 个交付字段。
+
 | 序号 | 字段 | 类型 | 含义 |
 | ---: | --- | --- | --- |
 | 1 | `text` | string | 实际测试输入。单轮等于 `target_query`；多轮为前序轮次与目标轮以 ` | ` 连接。 |
@@ -20,6 +22,8 @@
 | 14 | `executable` | integer enum | `1` 表示未命中下游筛选条件；`0` 表示至少命中一个。正常问答也可以是 `1`。 |
 
 全部字段必须存在且不得为 `null`；只有 `context_text` 可以为空字符串。会话四字段必须满足上表关系。导出按内部记录顺序逐条映射，不改变 P0/P1/P2 成员数。
+
+交付 `target_query` 使用候选解析后的清洗值；前序来自规范化文本。Stage1/Stage2 的 `conversation_turns` 从 `conversation.full_text` 生成，不能根据交付的目标轮重建模型实际输入。
 
 ## `executable` 口径
 

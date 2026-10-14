@@ -59,7 +59,7 @@ class P0SamplingConfig:
 
 @dataclass(frozen=True)
 class P1SamplingConfig:
-    target_n: int = 10_000
+    target_n: int = 6_000
     probability_weights: Mapping[str, int] = field(
         default_factory=lambda: {"high": 3, "mid": 2, "boundary": 1}
     )

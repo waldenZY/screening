@@ -88,7 +88,7 @@ class P2SupplementConfig:
     minimum_yield: float = 0.005
     safety_factor: float = 1.1
     exploration_share: float = 0.20
-    max_sampled: int = 15000
+    max_sampled: int = 20000
     max_tail_sampled: int = 1000
     tail_batch_size: int = 250
     max_stalled_batches: int = 2

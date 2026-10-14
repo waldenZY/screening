@@ -3,13 +3,13 @@
 > 所属产品版本：Screening V3
 > Pipeline 配置版本：`config_version=7`
 > P2 算法标识：`adaptive_challenge_batches_2`
-> 文档状态：当前已实施口径，更新于 2026-10-13
+> 文档状态：当前已实施口径，核对于 2026-10-14；默认值以 [pipeline.default.json](../config/pipeline.default.json) 为准
 
 ## 1. 目标
 
 P2 正式目标为 1,000 条同时通过 Stage1 和 Challenge Judge 的样本。八类 `primary_challenge` 的软下限依次为 50、50、50、50、50、20、5、1，任一类型最多 350。候选不足或覆盖预算耗尽时允许带缺口交付。
 
-P0 不受 P2 采样算法影响。当前 Stage1、Stage2 契约以
+P0/P1 与 P2 独立并发构建，各自完成 Stage2、导出和分支校验后即可按配置发布，不等待 P2。当前 Stage1、Stage2 契约以
 [技术方案](screening_pipeline_technical_design_v3.md) 和实际 Prompt 为准；Stage2 只处理最终成员。
 
 ## 2. 数据流
@@ -27,7 +27,7 @@ P0 不受 P2 采样算法影响。当前 Stage1、Stage2 契约以
 → screened canonical、legacy、报告
 ```
 
-总量已满但某类未达到自身软下限时会在有限尾部预算内补采。新增稀缺类型会在重新选择时替换超过软下限的头部类型，最终总量保持 1,000。
+总量已满但某类未达到自身软下限时会在有限尾部预算内补采。新增稀缺类型会在重新选择时替换超过软下限的头部类型，最终总量不超过 1,000；预算结束时可少于目标或带覆盖缺口交付。
 
 ## 3. 候选来源
 
@@ -43,7 +43,7 @@ P0 不受 P2 采样算法影响。当前 Stage1、Stage2 契约以
 报告中的四个 `candidate_capacity` 是各来源池独立容量，重叠样本会同时计入多个池，
 因此四项不能相加当作候选并集大小；抽取后的漏斗只按唯一 `sampled_from` 归因。
 
-抽样按 L2、Cluster 两级平方根容量分配，层内用稳定身份哈希排序；相同输入和配置可复现。文本去重继续使用 P2 Jaccard 规则。
+抽样按 L2、Cluster 两级平方根容量分配，层内用稳定身份哈希排序；候选规划在相同输入和配置下可复现，LLM 判定仍取决于模型响应。文本去重采用三个集合共用的规范化精确去重及近重复确认：同 L2、双字 Jaccard ≥ 0.45、IDF 加权 2/3-gram Jaccard ≥ 0.80、编辑相似度 ≥ 0.90。去重在 Stage1 前完成；仅召回达标、确认未达标的对保留并审计。
 
 ## 4. Challenge Judge
 
@@ -99,11 +99,24 @@ long_tail_expr
 
 ## 5. 配额与最终选择
 
-1. 每个 primary 先按 `50/50/50/50/50/20/5/1` 的独立软下限预留；不足时保留实际数量并记录缺口。
+1. 每个 primary 先按下表的独立软下限预留；不足时保留实际数量并记录缺口。按 primary 统计，次要 `challenge_types` 不补足配额。
 2. 剩余名额按各 primary 可用量平方根分配。
 3. 任一 primary 不超过 350 条。
 4. 类型内部再次按 L2、Cluster 分层，并使用稳定文本哈希选择。
 5. 每批后从全部 Judge PASS 池重算，支持稀缺类型替换头部类型。
+
+| primary | 默认软下限 |
+| --- | ---: |
+| `implicit_goal` | 50 |
+| `multi_constraint` | 50 |
+| `multi_turn_context` | 50 |
+| `long_tail_expr` | 50 |
+| `ambiguity` | 50 |
+| `multi_intent` | 20 |
+| `boundary` | 5 |
+| `cross_app` | 1 |
+
+合计 276；各类下限满足时，剩余 724 个名额按平方根可用量和多样性规则分配。键须完整、下限为非负整数、总和不超过目标、单项不超过统一上限。
 
 ## 6. 自适应补采
 
@@ -116,7 +129,7 @@ long_tail_expr
 单批最大请求       1,000
 补采探索保留       20%
 补采轮数           3
-实际抽样总预算     15,000
+实际抽样总预算     20,000
 目标达成后尾部预算 1,000
 尾部单批上限       250
 无进展批次上限     2
@@ -126,17 +139,35 @@ long_tail_expr
 
 每批输出可解析的 `P2 batch_progress` JSON，包含 `target_fill` 或 `coverage_tail` 模式、八类最终数量与缺口、三项预算状态和 `next_action`；结束时输出 `P2 adaptive_complete` JSON 及明确停止原因。
 
-停止条件为目标和软下限均满足、完成三轮、相关候选耗尽、实际抽样达到 15,000、目标达成后的尾部抽样达到 1,000，或连续两个尾部批次没有缩小八类总缺口。任一尾部批次缩小总缺口会把连续计数归零。预算或早停触发时允许 P2 带类型缺口交付，报告明确记录缺口、预算使用和停止原因。
+初始轮为 `wave=0`，之后最多三轮补采，即 `wave=1..3`；轮数不是批数。`max_sampled` 统计实际抽中的唯一候选，包含随后被去重、Stage1 或 Challenge 拒绝者，不是 LLM 请求次数上限。尾部候选也占总预算，两个预算不相加。批前总量已满才进入 `coverage_tail`；刚填满目标的批次仍属于 `target_fill`。
+
+停止条件为目标和软下限均满足、初始轮及最多三轮补采结束、相关候选耗尽、实际抽样达到 20,000、尾部抽样达到 1,000，或连续两个尾部批次没有缩小八类总缺口。任一尾部批次缩小总缺口会把连续计数归零；Challenge PASS 数量增长但最终类型总缺口不降，仍算无进展。预算或早停触发时允许 P2 带数量或类型缺口交付，继续 Stage2、导出和发布。
+
+日志中的动作码：
+
+| `next_action` / `stop_reason` | 含义 |
+| --- | --- |
+| `continue_target_fill` | 继续补总量，仅用于批次日志 |
+| `continue_coverage_tail` | 继续追补类型覆盖，仅用于批次日志 |
+| `target_and_soft_mins_met` | 总量及八类软下限均满足 |
+| `max_sampled` | 总抽样预算耗尽 |
+| `max_tail_sampled` | 尾部预算耗尽 |
+| `stalled_batches` | 连续无进展达到上限 |
+| `candidate_exhausted` | 当前可抽取候选耗尽 |
+| `max_rounds` | 补采轮数结束 |
+
+最终 `P2 adaptive_complete` 重复给出最终数量、类型缺口、预算用量及停止原因，详细批次记录保存在 `adaptive_summary.json`。
 
 ## 7. 产物与恢复
 
-- Challenge 具有独立 Prompt SHA、任务账本、attempts、缓存命中账本、结果账本、SQLite 缓存和批级 checkpoint。
+- Challenge 有独立 Prompt 哈希及 `quality/challenge_*` 任务、attempts、缓存命中和结果账本；三个质量阶段共用本 run 的 `quality/llm_result_cache.sqlite`，P2 批级检查点位于 `P2/checkpoints/`。各分支保存自身任务引用，新 run 不自动共享旧 run 的 LLM 缓存。
 - `adaptive_challenge_batches_2` 同时进入总 run contract 和 P012 构建契约，旧配置和旧检查点不会按新配额语义续跑。
-- 中断恢复复用已完成结果，不重复调用。
+- 中断恢复复用已完成结果，不重复标注调用；启动仍有一次 LLM 预检。总状态为 `failed` 时须显式指定兼容的原 `--run-id`，其他状态的自动选择规则见 [配置手册](screening_pipeline_configuration_v3.md#23-严格续跑条件)。
 - 总预算、尾部预算和连续无进展批次数进入检查点，续跑不会重置。
-- screened canonical schema v4：P2 保存三个 Challenge 字段和 `challenge_task_id`；P0/P1 的 `challenge` 为 `null`。
+- `screened_schema_version=7`：P2 保存三个 Challenge 字段和 `selection.challenge_task_id`；P0/P1 的 `challenge` 为 `null`。质量契约为 9，报告契约为 10，labeled v5 仍为 14 字段；其他版本见 [文档索引](README.md)。
 - P2 允许 `supplement_wave`；采样与 Challenge 算法不因 labeled v5 新增的两个下游标签改变。
 - P2 汇总写入 `P2/adaptive_summary.json`，总报告写入 `p2_diagnostics`。
+- 去重数值复验兼容 `1e-12` 以内的 0/1 边界误差，不放宽确认阈值、不改写旧审计或检查点；不升级规则或数据契约。
 
 ## 8. 报告指标
 

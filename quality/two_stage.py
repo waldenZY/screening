@@ -110,9 +110,9 @@ def _sanitized_error(exc: Exception) -> str:
 
 @dataclass(frozen=True)
 class QualityRunConfig:
-    workers: int = 2
+    workers: int = 10
     sleep_seconds: float = 1.0
-    max_retries: int = 3
+    max_retries: int = 20
 
     def __post_init__(self) -> None:
         if self.workers < 1 or self.max_retries < 1:

@@ -44,7 +44,7 @@
       "mmr_lambda": 0.7
     },
     "p1": {
-      "target_n": 10000,
+      "target_n": 6000,
       "probability_weights": {"high": 3, "mid": 2, "boundary": 1},
       "frequency_weights": {"hot": 2, "warm": 2, "cold": 1},
       "cold_boundary_floor": 1,

@@ -2,7 +2,7 @@
 
 > 适用入口：`python -m screening.run_pipeline`
 > Pipeline 配置版本：`config_version=7`
-> 更新日期：2026-10-13
+> 核对日期：2026-10-14；默认值以 [pipeline.default.json](../config/pipeline.default.json) 为准
 
 ## 1. 文档用途
 
@@ -11,7 +11,7 @@ Screening v3 使用两份配置：
 - `artifacts/config/pipeline.default.json`：输入、输出、采样、质量调用、索引和发布配置；
 - `artifacts/config/llm_config.local.json`：LLM 地址、密钥、模型和请求参数。
 
-配置好这两份文件后，可以直接一键运行：
+配置好这两份文件后，在 `screening` 包所在目录的上一级运行（Python 环境使用 `moto`）：
 
 ```bash
 python -m screening.run_pipeline
@@ -62,10 +62,12 @@ screening/artifacts/config/pipeline.default.json
 
 要恢复同一个未完成 run，必须保持所有影响数据或 LLM 任务的配置不变，并再次执行同一
 命令。修改输入（包括风险关键词 Excel 内容）、Prompt、模型、质量运行参数或采样
-参数后，系统会创建新 run。旧质量契约 run 不能按当前 Stage2 规则续跑或发布。
+参数后，默认会选择兼容 run 或创建新 run；显式指定不兼容的 `--run-id` 会报错。旧质量契约 run 不能按当前 Stage1/Stage2 规则续跑或发布。只更新默认值不升级契约版本；续跑之前的 run 仍须使用其原参数，不能直接套用已变化的新默认配置。
 
 日志、索引性能和发布参数不改变数据 contract；但更换 `output_root` 会切换工作区，
 因此系统无法在新目录中自动找到原 run。
+
+自动选择优先恢复同契约的 `created/running/incomplete/partial_failed/publish_failed` run，再复用 `completed/published` run。总状态为 `failed` 的 run 不自动选中，必须显式使用 `--run-id`；恢复时仍会校验契约与检查点。
 
 ### 2.4 启动预检与故障定位
 
@@ -91,9 +93,9 @@ screening/artifacts/config/pipeline.default.json
 
 预检日志及失败输出不包含 API Key、服务地址、服务响应正文或原始 Query。最终发布内容冲突使用 `publication` 日志，记录集合、目标路径及 `stop_without_replace` 或 `transactional_replace`，便于关联启动时的文件存在提示。
 
-## 3. 完整配置结构
+## 3. 配置结构与当前默认值
 
-当前默认结构如下：
+以下仅展示对象层级，空对象不是可运行配置。完整模板见 [默认配置](../config/pipeline.default.json)，参数字段必须全部保留。
 
 ```json
 {
@@ -116,7 +118,7 @@ screening/artifacts/config/pipeline.default.json
 }
 ```
 
-以下章节逐项解释全部参数。
+当前默认：P1 目标 6,000，P2 目标 1,000；LLM 总并发 10，最大尝试轮数 20，请求前等待 1 秒；P2 总抽样预算 20,000、尾部预算 1,000、尾部单批 250、连续无进展上限 2。以下章节逐项解释全部参数。
 
 ## 4. 基础运行参数
 
@@ -125,11 +127,11 @@ screening/artifacts/config/pipeline.default.json
 | 属性 | 内容 |
 | --- | --- |
 | 类型 | 整数 |
-| 当前值 | `4` |
+| 当前值 | `7` |
 | 是否可自行调整 | 否 |
 | 作用 | 标识 pipeline 配置 Schema |
 
-必须保持为 `4`。它不是产品大版本开关；旧配置缺少风险词表输入时程序会明确拒绝。
+必须保持为 `7`。它不是产品大版本开关，也不同于内部构建契约版本；所有当前版本见 [文档索引](README.md)。旧配置版本或缺失必需字段会被拒绝。
 
 ### 4.2 `inputs.source`
 
@@ -201,12 +203,24 @@ Excel 格式要求：
 更换目录不会改变算法结果，但会切换缓存和 run 搜索位置。要续跑必须继续指向原来的
 `output_root`。
 
+默认 `index.cache_root=null` 时，工作区包含两类目录：
+
+```text
+<output_root>/
+├── _canonical_cache/<cache-id>/   # 候选 SQLite 索引、输入审计、去重 IDF
+└── runs/<run-id>/                 # 状态、冻结输入、质量账本、检查点、报告与导出
+```
+
+索引 ID 依据源文件路径、大小、修改时间、文件身份、taxonomy 哈希和索引/特征规则生成；同条件复用，条件变化新增缓存子目录。它不是 LLM 缓存。LLM 缓存在各 run 的 `quality/llm_result_cache.sqlite` 内，P0/P1/P2 共享同一 run 的缓存；新 run 不自动共享旧 run 的 LLM 结果。
+
+同输入和兼容配置重跑会恢复或复用 run；更换数据、改变影响契约的参数或使用 `--new-run` 时创建新 run，旧目录保留。缓存和 run 都不自动清理。仍需恢复、复验或发布的 run，应保留其引用的索引缓存及冻结输入；删除 run 会丢失其检查点和标注缓存。不同 run 共用发布目录时仍使用固定文件名，可能发生内容冲突。
+
 ### 4.6 `prompts.stage1` / `prompts.challenge` / `prompts.stage2`
 
 | 属性 | Stage1 | Challenge | Stage2 |
 | --- | --- | --- | --- |
 | 默认值 | `../prompts/quality_stage1.md` | `../prompts/quality_challenge.md` | `../prompts/quality_stage2.md` |
-| 作用 | 有效性、基础质量及类别检测 | P2 Challenge 判定与类型 | 难度、综合质量、任务/问答及评测障碍标签 |
+| 作用 | 目标轮可用性与类别核验 | P2 Challenge 判定与类型 | 完整有效任务的难度、任务/问答及语义障碍标签 |
 | 是否改变 run | 内容变化时是 | 内容变化时是 | 内容变化时是 |
 
 Prompt 文件必须恰好包含一个 `{CANDIDATE_JSON}`。修改空格或文字也会改变 Prompt 哈希，
@@ -219,7 +233,7 @@ Prompt 文件必须恰好包含一个 `{CANDIDATE_JSON}`。修改空格或文字
 | 属性 | 内容 |
 | --- | --- |
 | 类型/范围 | 正整数，至少 `1` |
-| 默认值 | `8` |
+| 默认值 | `10` |
 | 作用 | P0/P1/P2 共享的全局在途 LLM 请求上限 |
 | 是否改变 run | 是，当前版本将它纳入质量运行 contract |
 
@@ -234,12 +248,11 @@ Prompt 文件必须恰好包含一个 `{CANDIDATE_JSON}`。修改空格或文字
 | 属性 | 内容 |
 | --- | --- |
 | 类型/范围 | 正整数，至少 `1` |
-| 默认值 | `10` |
-| 作用 | 每个阶段对失败任务的最大尝试轮数 |
+| 默认值 | `20` |
+| 作用 | 每次阶段批次调用的最大尝试轮数，包含首次尝试 |
 | 是否改变 run | 是 |
 
-成功任务会立即进入缓存，下一轮只重试失败任务。达到上限仍失败时程序返回退出码 `2`；
-保持配置不变重新启动即可继续。
+成功任务会立即进入缓存，下一轮只重试失败任务；它不是“首次调用加 20 次重试”。某分支达到上限仍失败时，其他分支继续；分支失败会使 CLI 返回 `2`。续跑保持参数不变，并显式指定原 `--run-id`，成功任务使用缓存。这不是跨续跑累计的总调用次数硬上限。
 
 注意：不要为了续跑临时修改 `max_retries`，否则会生成新 run。
 
@@ -249,10 +262,11 @@ Prompt 文件必须恰好包含一个 `{CANDIDATE_JSON}`。修改空格或文字
 | --- | --- |
 | 类型/范围 | 大于等于 `0` 的数值 |
 | 默认值 | `1.0` |
-| 作用 | 每次实际 LLM 请求前的等待时间 |
+| 作用 | 每次 Stage1/Challenge/Stage2 实际 LLM 请求前的等待时间 |
 | 是否改变 run | 是 |
 
 调大可降低服务压力但会增加耗时；设为 `0` 吞吐最高，但只适合稳定且容量充足的本地服务。
+此等待不适用于启动预检请求，也不是全局每秒请求数限制；多个工作线程可以同时等待。
 
 ## 6. `index`：大文件索引与缓存参数
 
@@ -362,9 +376,9 @@ DEBUG
 
 | 类型 | 默认值 | 作用 |
 | --- | --- | --- |
-| 布尔值 | `false` | 是否在构建和全量校验成功后自动发布 |
+| 布尔值 | `false` | 是否在各分支完成导出与分支校验后自动独立发布 |
 
-推荐保持 `false`，先人工检查批跑报告和成品，再决定是否复制或发布。
+`false` 时仍构建、导出和生成报告，只是不复制到下游目录。设为 `true` 后，P0/P1/P2 谁先完成谁先发布；全部成功后再进行全量复验和发布文件核对，不要求各分支同时完成。
 
 ### 8.2 `publication.publish_root`
 
@@ -375,6 +389,18 @@ DEBUG
 只有 `enabled=true` 时生效，此时不得为 `null`。发布参数不改变数据 run identity。
 
 目标存在不同内容时默认拒绝。需要覆盖时只能在命令行显式增加 `--replace`。
+
+发布路径固定为：
+
+```text
+<publish_root>/P0-冒烟集/P0_smoke_set_v5_labeled.jsonl
+<publish_root>/P1-基准集/P1_benchmark_set_v5_labeled.jsonl
+<publish_root>/P2-对抗集/P2_adversarial_set_v5_labeled.jsonl
+```
+
+不存在则复制；同名同哈希则复用；同名不同内容则该分支发布失败，其他分支继续。发布使用临时文件、哈希核对、原子替换，并在捕获写入异常时尝试回滚本次事务。已成功发布的其他分支不回滚；最终全量复验失败也不撤销之前的独立发布文件。该机制不保证进程被强制终止或机器断电后的事务恢复。
+
+manifest 按分支记录发布状态、目标路径、哈希及数量。全部构建、复验和发布成功时总状态为 `published`；部分分支失败时为 `partial_failed`、退出码 `2`；全部分支失败为 `failed`、退出码 `2`。启动预检、全量复验等整体错误返回 `1`，最终整组发布失败记为 `publish_failed`。运行时 `--no-publish` 可临时关闭发布，`--publish-root` 可启用并覆盖路径。
 
 ## 9. `sampling.p0`：P0 冒烟集参数
 
@@ -402,7 +428,7 @@ probability×frequency 九宫格抽样。P1 按 Stage1 通过后的 L2 缺口补
 
 | 参数 | 默认值 | 含义与调整影响 |
 | --- | ---: | --- |
-| `target_n` | `10000` | P1 最终数量目标。初采通过者按冻结 L2 配额限制；补采按剩余缺口逐批准入。候选不足时允许低于目标。 |
+| `target_n` | `6000` | P1 最终数量目标。初采通过者按冻结 L2 配额限制；补采按剩余缺口逐批准入。候选不足时允许低于目标。 |
 | `cold_boundary_floor` | `1` | 每个 cluster 的 boundary+cold 网格有候选时的最低配额。建议保持 `1`；过大会显著提高低置信度冷样本占比，甚至挤占其他网格。 |
 | `mmr_lambda` | `0.7` | 网格内 MMR 的 P0 relevance 权重；越大越偏高概率/高频，越小越偏表面多样性。 |
 
@@ -463,8 +489,10 @@ P2 的 `target_n` 是最终 Challenge 样本目标。只有 Stage1 PASS 且 Chal
 
 先从同一套完整会话文本中移除 Unicode 空白与标点，不改写正文。规范化文本完全相同的候选直接去重，包含单字 query。近似剔除同时要求同一 L2、加权 Jaccard 和编辑相似度达标。保留原有代表样本优先级；临界保留对与被剔除对及分数写入各集合的 `dedup_audit.jsonl`。IDF 从完整 canonical 源索引计算一次并冻结，规则与内容哈希写入 run 契约。上述阈值是保守初值，需按真实 run 审计再校准；调整配置会启动新 run。
 
+加权交集/并集使用 `math.fsum`。计算及审计复验仅对超出 `[0,1]` 不超过 `1e-12` 的浮点误差裁回边界；非有限、非数值或明显越界仍报错，确认阈值不增加容差。旧审计在内存副本上复验，不改写文件、检查点或哈希。错误包含集合、审计路径、物理行号和异常字段/数值，不包含 Query。
+
 旧字段 `multi_turn_ratio`、`probability_cap`、`frequency_quantile` 和各集合的 `dedup_threshold` 已删除，配置出现这些
-字段会直接报错。`frequency` 只保留为诊断字段，不再决定候选准入。
+字段会直接报错。P2 的 `frequency` 不作硬过滤；P0/P1 仍按各自规则使用频次和相关度。
 
 ## 12. `p1_supplement`：P1 补采参数
 
@@ -504,15 +532,16 @@ ceil(L2 当前缺口 / 估计通过率 × safety_factor)
 | `minimum_yield` | `0.005` | 产出率估计下限。 |
 | `safety_factor` | `1.1` | 按缺口反推请求量时的安全系数。 |
 | `exploration_share` | `0.20` | 补采请求固定保留给 exploration 的份额。 |
-| `max_sampled` | `15000` | 初采和补采实际抽中候选的总上限。 |
+| `max_sampled` | `20000` | 初采和补采实际抽中候选的总上限，包括随后被去重或拒绝的候选；不是 LLM 调用数上限。 |
 | `max_tail_sampled` | `1000` | 总量达到目标后，为追补类型软下限允许增加的候选上限。 |
 | `tail_batch_size` | `250` | 尾部补采单批最大候选数。 |
 | `max_stalled_batches` | `2` | 连续未缩小八类总缺口的尾部批次数上限；任一批缩小总缺口即归零。 |
 
 每批完成后更新来源总产出率和来源到 primary 的产出率；总量已满但软下限未满足时进入
-最多 250 条一批的尾部补采并重新选择最终成员。总抽样达到 15,000、尾部达到 1,000，
+最多 250 条一批的尾部补采并重新选择最终成员。总抽样达到 20,000、尾部达到 1,000，
 或连续两个尾部批次没有缩小类型总缺口时停止，允许带缺口交付。预算计数写入 P2 检查点，
 续跑不会重置。
+尾部候选同时计入总预算，不是额外增加 1,000 的总额度；达到目标的那一批仍按批前的 `target_fill` 模式计数，后续批次才进入 `coverage_tail`。全部配额满足、补采轮数上限或候选耗尽也会停止，具体 `next_action` / `stop_reason` 见 [P2 手册](screening_v3_p2_adaptive.md#6-自适应补采)。
 
 每批日志以 `P2 batch_progress` 开头并附带 JSON，包含运行模式、计划与实际抽样数、
 Stage1/Challenge 通过数、最终数量与目标缺口、八类数量与缺口、总预算、尾部预算、
@@ -524,13 +553,13 @@ Stage1/Challenge 通过数、最终数量与目标缺口、八类数量与缺口
 先复制模板：
 
 ```bash
-cp artifacts/config/llm_config.example.json artifacts/config/llm_config.local.json
+cp screening/artifacts/config/llm_config.example.json screening/artifacts/config/llm_config.local.json
 ```
 
 Windows PowerShell：
 
 ```powershell
-Copy-Item artifacts/config/llm_config.example.json artifacts/config/llm_config.local.json
+Copy-Item screening/artifacts/config/llm_config.example.json screening/artifacts/config/llm_config.local.json
 ```
 
 `llm_config.local.json` 包含密钥，不应提交 Git。
@@ -640,7 +669,7 @@ quality/stage2_results.jsonl
 
 ### 17.2 小规模试跑
 
-为了先验证 LLM、Prompt 和输出格式，可以在完整配置对象中只修改以下两个值：
+为了先验证 LLM、Prompt 和输出格式，可以在完整配置对象中修改以下目标、类型下限和批次参数：
 
 ```json
 "sampling": {
@@ -674,8 +703,13 @@ P2 调整总目标时必须同时保证分类型软下限之和不超过 `target
 python -m screening.run_pipeline
 ```
 
-系统会恢复同 contract 的未完成 run，验证已完成检查点，并只执行尚未完成的阶段或
-LLM 任务。退出码 `2` 表示存在可以继续重试的 LLM 工程失败。
+系统会按第 2.3 节选择同 contract 的可续跑或已完成 run，验证已完成检查点，并只执行尚未完成的分支或 LLM 任务。`failed` 必须显式指定原 run；自定义配置也要继续使用原 `--config`：
+
+```bash
+python -m screening.run_pipeline --config /原路径/pipeline.json --run-id 原run-id
+```
+
+退出码 `0` 表示本次成功；`2` 表示分支构建或发布失败，不限于 LLM 错误；`1` 表示整体错误。重启并不自动解决配置不兼容、文件冲突或权限问题。已完成标注可复用，但每次启动仍会执行一次 LLM 连通性预检。
 
 ### 17.4 Linux 后台运行
 
@@ -693,7 +727,7 @@ tail -f screening.log
 
 ## 18. 常见误区
 
-- P1 `target_n=10000` 是最终目标，但候选耗尽或三轮补采后仍可能不足。
+- P1 `target_n=6000` 是最终目标，但候选耗尽或三轮补采后仍可能不足。
 - P2 `target_n=1000` 是最终 Challenge 目标；候选不足、三轮结束或类型稀缺时可能不足。
 - P0 没有全局 target；调大 `max_per_cluster` 不等于固定 P0 总量。
 - 去重阈值越低，去重越严格；不是越高越严格。
@@ -701,7 +735,7 @@ tail -f screening.log
 - `boundary_probability_cap=0.5` 使用严格小于，不包含恰好 `0.5`。
 - `minimum_complexity` 是固定文本规则，不是 Stage2 的 `task_difficulty`。
 - Stage2 不参与准入；低分或跨阶段分歧不会自动删除样本。
-- 发布只是复制经过复验的三份 legacy 文件，不是上传到远程系统。
+- 发布按分支复制经过分支复验的 labeled 文件；全部成功后另做全量复验，不上传远程系统。
 - 改变 `workers` 或 `max_retries` 目前也会生成新 run；续跑时不要修改。
 
 ## 19. 配置检查清单
@@ -724,4 +758,5 @@ tail -f screening.log
 - [ ] 没有修改影响 run identity 的参数；
 - [ ] 使用原来的 `output_root`；
 - [ ] 直接执行相同命令，不增加 `--new-run`；
+- [ ] 总状态为 `failed` 时显式指定原 `--run-id`；
 - [ ] 日志中的 run ID 与原 run 一致。

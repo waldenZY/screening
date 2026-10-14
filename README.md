@@ -11,7 +11,7 @@
 5. 用冻结风险词表、会话和 Stage2 语义原因计算 `executable`，映射为 14 字段交付文件。
 6. 各分支独立生成报告、复验并按需事务发布；某分支失败不撤销或阻塞其他分支。所有分支终态后再生成总报告。
 
-Stage1 只接收完整轮次、样本类型和独立的候选类别，按需求可还原、关键输入可恢复及评价边界明确判断；新增 `blocking_issues`，四标签通过且无阻断原因才准入。当前质量契约为 9，旧 run 不迁移或续跑。Stage2、Challenge 与 P0/P1/P2 数量规则保持现状。详情见 [技术设计](artifacts/docs/screening_pipeline_technical_design_v3.md)。
+Stage1 只接收完整轮次、样本类型和独立的候选类别，按需求可还原、关键输入可恢复及评价边界明确判断；输出 `blocking_issues`，四标签通过且无阻断原因才准入。当前质量契约为 9，不兼容的旧契约 run 不迁移或续跑；当前契约版本见 [文档索引](artifacts/docs/README.md)。详情见 [技术设计](artifacts/docs/screening_pipeline_technical_design_v3.md)。
 
 首次了解标注规则，可先读 [Stage1 / Stage2 评判标准](artifacts/docs/screening_quality_judgment_standards.md)：两阶段分工、各标签的衡量依据、程序准入条件及八组边界例。
 
@@ -25,6 +25,8 @@ Copy-Item screening/artifacts/config/llm_config.example.json `
 ```
 
 在 `screening/artifacts/config/pipeline.default.json` 填写 `inputs.source`、`inputs.taxonomy`、`inputs.risk_keywords`。风险词表为必填 Excel，格式与作用见下文。默认 `publication.enabled=false`。
+
+核对日期：2026-10-14。默认 P1 目标 **6,000**、P2 目标 **1,000**；LLM 全局并发 **10**、最大尝试轮数 **20**、请求前等待 **1 秒**；P2 总抽样预算 **20,000**、尾部预算 **1,000**、尾部单批 **250**、连续无进展上限 **2**。完整默认值见 [配置模板](artifacts/config/pipeline.default.json)，续跑已有 run 时仍须保留其原参数。
 
 从项目根目录运行：
 
@@ -43,7 +45,7 @@ python -m screening.run_pipeline `
   --publish-root D:/data/delivery
 ```
 
-相同配置重跑会恢复未完成或失败的分支，已完成分支不会重复标注请求或发布；启动预检仍会单独发送一次连通性请求。部分失败时 CLI 返回状态码 `2`，成功分支的产物仍有效。输入、Prompt、模型、索引或映射契约变化需要新 run。`--new-run` 显式新建；`--run-id` 指定兼容的已有 run；`--no-publish` 临时关闭发布。发布目标存在同名不同内容时默认停止；可换发布目录或显式加 `--replace`。参数说明见 [配置文档](artifacts/docs/screening_pipeline_configuration_v3.md)。
+相同输入和兼容配置重跑，优先恢复可续跑 run，再复用已完成 run；总状态为 `failed` 的 run 必须显式指定原 `--run-id`，否则不会自动恢复。已完成分支不重复标注；同一发布目标内容未变时不重复复制；启动预检仍会单独发送一次连通性请求。分支构建或发布失败返回 `2`，成功分支的产物仍有效；启动、全量复验等整体错误返回 `1`。输入、Prompt、模型、质量/采样参数或数据契约变化需要兼容 run 或新 run。`--new-run` 显式新建；`--run-id` 指定兼容的已有 run；`--no-publish` 临时关闭发布。发布目标存在同名不同内容时默认拒绝；可换发布目录或显式加 `--replace`。参数说明见 [配置文档](artifacts/docs/screening_pipeline_configuration_v3.md)。
 
 ### 启动预检
 
@@ -99,6 +101,8 @@ python -m screening.run_pipeline --config "/原路径/pipeline.json" --run-id "�
 
 `<output-root>/_canonical_cache/` 保存候选索引；`<output-root>/runs/<run-id>/` 保存 manifest、冻结风险快照、质量任务与结果账本、P0/P1/P2 分支及 `screening_run_report.json` / `.md`。
 
+`../../outputs_v3` 相对于配置文件所在目录解析；默认模板对应 `screening/outputs_v3/`。相同源和索引规则可复用缓存，换数据或配置则按身份新增目录，旧目录不自动删除。LLM 缓存位于每个 run 的 `quality/llm_result_cache.sqlite`，同 run 跨分支共享，新 run 不自动共享旧结果。仍需恢复、复验或发布时应保留 run 及其引用的索引缓存。详见 [输出目录说明](artifacts/docs/screening_pipeline_configuration_v3.md#45-outputsoutput_root)。
+
 各分支的 `checkpoints/`、`branch_report.json`、`screened.canonical.jsonl` 和发布事务彼此独立；`*_labeled.jsonl` 是 14 字段交付视图。`export_provenance.jsonl` 将源、内部和交付逐条哈希关联。正式发布沿用以下 v5 文件名：
 
 ```text
@@ -107,4 +111,6 @@ P1-基准集/P1_benchmark_set_v5_labeled.jsonl
 P2-对抗集/P2_adversarial_set_v5_labeled.jsonl
 ```
 
-完整文档入口见 [文档索引](artifacts/docs/README.md)。当前工作区未保留 `tests/`；本轮使用 `moto` 环境、项目外临时数据和模拟 LLM 验证，不调用真实模型。
+启用发布后，各分支完成导出和分支复验即可复制到 `publish_root`；全部成功后另做全量复验。不存在则发布，同哈希则复用，不同内容默认拒绝。其他分支失败或最终全量复验失败不会撤销已独立发布的文件；具体状态与事务范围见 [发布说明](artifacts/docs/screening_pipeline_configuration_v3.md#8-publication发布参数)。
+
+完整文档入口见 [文档索引](artifacts/docs/README.md)。当前工作区未保留 `tests/`；工程验收使用 `moto` 环境、项目外临时数据和模拟 LLM，不调用真实模型。
