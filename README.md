@@ -15,6 +15,8 @@ Stage1 只接收完整轮次、样本类型和独立的候选类别，按需求�
 
 首次了解标注规则，可先读 [Stage1 / Stage2 评判标准](artifacts/docs/screening_quality_judgment_standards.md)：两阶段分工、各标签的衡量依据、程序准入条件及八组边界例。
 
+独立检查模块的实际输出，见 [模块测试使用说明](module_tests/README.md)。
+
 ## 配置与运行
 
 若用 Python 操作本项目，使用 `moto` 环境。先复制并填写 LLM 配置：

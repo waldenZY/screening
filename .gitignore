@@ -5,3 +5,4 @@ outputs_v3/
 __pycache__/
 *.py[cod]
 artifacts/config/llm_config.local.json
+module_tests/outputs/
