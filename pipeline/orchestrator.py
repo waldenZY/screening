@@ -34,25 +34,19 @@ from ..candidate.p2_adaptive import (
     select_final_p2,
     source_yield_rates,
 )
-from ..delivery.legacy import LEGACY_MAPPING_VERSION, export_legacy_branch
+from ..delivery.labeled import LABELED_MAPPING_VERSION, export_labeled_branch
 from ..delivery.eligibility import delivery_labels
 from ..delivery.report import RUN_REPORT_SCHEMA_VERSION, write_run_report
 from ..delivery.screened import (
     build_screened_canonical_record,
     validate_screened_canonical_records,
 )
-from ..quality.two_stage import (
-    CHALLENGE_TYPES,
-    TwoStageQualityRunner,
-    challenge_passes,
-    stage1_passes,
-    stage1_issue_summary,
-    stage2_semantic_review,
-)
+from ..quality.runner import (CHALLENGE_TYPES, QualityRunner, challenge_passes, stage2_semantic_review)
+from ..quality.stage1 import (stage1_passes, stage1_issue_summary)
 from .checkpoints import CheckpointStore
 
 
-BUILD_CONFIG_VERSION = 5
+BUILD_CONFIG_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -487,7 +481,7 @@ def _run_adaptive_p2(
     source_path: Path,
     taxonomy: TaxonomyMappings,
     run_root: Path,
-    quality_runner: TwoStageQualityRunner,
+    quality_runner: QualityRunner,
     checkpoints: CheckpointStore,
     materialized: dict[str, JsonObject],
     logger: logging.Logger,
@@ -694,7 +688,7 @@ def _run_adaptive_p2(
                     if saved_challenge is None:
                         challenge_started = time.monotonic()
                         batch_challenge = (
-                            _run_quality(quality_runner, "run_challenge", stage1_passed, "P2")
+                            _run_quality(quality_runner, "run_challenge", stage1_passed, "P2", batch_stage1)
                             if stage1_passed else {}
                         )
                         challenge_duration_ms = round(
@@ -1125,7 +1119,7 @@ def _finalize_branch(
     *,
     run_root: Path,
     checkpoints: CheckpointStore,
-    quality_runner: TwoStageQualityRunner,
+    quality_runner: QualityRunner,
     selected: Sequence[JsonObject],
     evaluated: Sequence[JsonObject],
     stage1: Mapping[str, JsonObject],
@@ -1137,6 +1131,8 @@ def _finalize_branch(
     p2_metadata: Mapping[str, JsonObject] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> JsonObject:
+    if hasattr(quality_runner, "bind_stage1"):
+        quality_runner.bind_stage1(stage1)
     branch_root = run_root / set_name
     complete = _restore_completed_branch(set_name, branch_root, checkpoints, run_root)
     if complete is not None:
@@ -1173,7 +1169,7 @@ def _finalize_branch(
             candidate,
             stage1[candidate["source_identity_sha256"]],
             stage2[candidate["source_identity_sha256"]],
-            delivery_labels(candidate, stage2[candidate["source_identity_sha256"]], risk_snapshot),
+            delivery_labels(candidate, stage2[candidate["source_identity_sha256"]], risk_snapshot, stage1[candidate["source_identity_sha256"]]),
             challenge_result=(challenge_results[candidate["source_identity_sha256"]] if set_name == "P2" else None),
             challenge_task_id=(
                 _quality_task_id(quality_runner, "challenge", candidate)
@@ -1204,7 +1200,7 @@ def _finalize_branch(
         set_name, records, expected_candidate_tasks=tasks, expected_final_count=len(selected)
     )
     _set_branch_status(run_root, set_name, "running", stage="export")
-    export_report = export_legacy_branch(set_name, records, branch_root)
+    export_report = export_labeled_branch(set_name, records, branch_root)
     final_audit = {
         **audit, "final": len(records),
         "stage2_semantic_review": stage2_semantic_review([
@@ -1226,9 +1222,9 @@ def _finalize_branch(
     )
     artifact_paths = (
         "screened.canonical.jsonl",
-        export_report["files"]["legacy"],
+        export_report["files"]["labeled"],
         "export_provenance.jsonl",
-        "legacy_export_report.json",
+        "labeled_export_report.json",
         "branch_audit.json",
         "branch_report.json",
     )
@@ -1267,7 +1263,7 @@ def _run_p0_branch(
     source_path: Path,
     taxonomy: TaxonomyMappings,
     run_root: Path,
-    quality_runner: TwoStageQualityRunner,
+    quality_runner: QualityRunner,
     idf_snapshot: Mapping[str, Any],
 ) -> JsonObject:
     set_name = "P0"
@@ -1357,7 +1353,7 @@ def _run_p1_branch(
     source_path: Path,
     taxonomy: TaxonomyMappings,
     run_root: Path,
-    quality_runner: TwoStageQualityRunner,
+    quality_runner: QualityRunner,
     idf_snapshot: Mapping[str, Any],
 ) -> JsonObject:
     set_name = "P1"
@@ -1630,7 +1626,7 @@ def _run_p2_branch(
     source_path: Path,
     taxonomy: TaxonomyMappings,
     run_root: Path,
-    quality_runner: TwoStageQualityRunner,
+    quality_runner: QualityRunner,
     idf_snapshot: Mapping[str, Any],
 ) -> JsonObject:
     set_name = "P2"
@@ -1644,7 +1640,7 @@ def _run_p2_branch(
     state = _run_adaptive_p2(
         index, config, source_path=source_path, taxonomy=taxonomy,
         run_root=run_root, quality_runner=quality_runner, checkpoints=checkpoints,
-        materialized={}, logger=logging.getLogger("screening.v3.P2"),
+        materialized={}, logger=logging.getLogger("screening.v4.P2"),
         idf_snapshot=idf_snapshot,
     )
     diagnostics = dict(state["diagnostics"])
@@ -1738,7 +1734,7 @@ def run_build(
     source_path: Path,
     taxonomy: TaxonomyMappings,
     run_root: Path,
-    quality_runner: TwoStageQualityRunner,
+    quality_runner: QualityRunner,
     logger: logging.Logger | None = None,
     idf_snapshot: Mapping[str, Any] | None = None,
     on_branch_complete: Callable[[str, JsonObject], None] | None = None,
@@ -1824,10 +1820,10 @@ def run_build(
     summary["failed_sets"] = dict(errors)
     write_json(run_root / "p012_build_summary.json", summary)
     write_json(
-        run_root / "legacy_export_report.json",
+        run_root / "labeled_export_report.json",
         {
-            "legacy_schema": "labeled_v5",
-            "legacy_mapping_version": LEGACY_MAPPING_VERSION,
+            "labeled_schema": "labeled_v6",
+            "labeled_mapping_version": LABELED_MAPPING_VERSION,
             "sets": {name: value["export_report"] for name, value in results.items()},
             "total_records": sum(len(value["records"]) for value in results.values()),
             "lossy_enum_mappings": 0,

@@ -1,0 +1,110 @@
+{
+  "product": "Screening v3",
+  "source_ref": "baseline/pre-stage1-redesign-2026-10-26",
+  "commit": "42ca4af24050f899356691289910d222e83d009e",
+  "snapshot_files": [
+    {
+      "source": "README.md",
+      "archive_path": "README.snapshot.md",
+      "sha256": "6460aad04ba43db5f9d4256f9a0828d06d4e5da9f08d48718a750a6f67b9034a"
+    },
+    {
+      "source": "artifacts/config/llm_config.example.json",
+      "archive_path": "configs/llm_config.example.json",
+      "sha256": "9729951c1214b72ddc09fd9c6a58bf508de4fc5ebc1d98452e57cabefc64a1dd"
+    },
+    {
+      "source": "artifacts/config/pipeline.default.json",
+      "archive_path": "configs/pipeline.default.json",
+      "sha256": "c16f06b216ce679d77028d089c34a7939d2ed734754df5108f57e23bb50917c8"
+    },
+    {
+      "source": "artifacts/docs/README.md",
+      "archive_path": "docs/README.md",
+      "sha256": "8d4dbd6444dc0860c4f8aef838b514d8053707a240111a4b597e9eb58701df77"
+    },
+    {
+      "source": "artifacts/docs/screening_labeled_v5_field_dictionary.md",
+      "archive_path": "docs/screening_labeled_v5_field_dictionary.md",
+      "sha256": "37fc87fa65c8e89c0145a458a5ac4fde1a1f9cb924b71b9e10ed261ca0bb6dbe"
+    },
+    {
+      "source": "artifacts/docs/screening_pipeline_configuration_v3.md",
+      "archive_path": "docs/screening_pipeline_configuration_v3.md",
+      "sha256": "08b3500d8c137226b1e7fedf69d378f15d5242ad772caa1bfe8f38ba18d794a0"
+    },
+    {
+      "source": "artifacts/docs/screening_pipeline_technical_design_v3.md",
+      "archive_path": "docs/screening_pipeline_technical_design_v3.md",
+      "sha256": "d4577023d1e3ef96ca537e8a9db71ea9605c0043cd7628bca6836cfa2ef651ca"
+    },
+    {
+      "source": "artifacts/docs/screening_quality_judgment_standards.md",
+      "archive_path": "docs/screening_quality_judgment_standards.md",
+      "sha256": "d8a3ab06e2b17b97417d0c78a27189aab44677f2604378d70148a1a1fa021139"
+    },
+    {
+      "source": "artifacts/docs/screening_v3_p2_adaptive.md",
+      "archive_path": "docs/screening_v3_p2_adaptive.md",
+      "sha256": "007c0724801326616eb7a62ec060f9a967a7f2f1d92c3350ba9f3be515fe47ee"
+    },
+    {
+      "source": "artifacts/evals/stage1_cases.json",
+      "archive_path": "evals/stage1_cases.json",
+      "sha256": "aafbba2f79d605cbe7d0f53df9f488f3b6397ebc2204629b41dc34f8bed82e83"
+    },
+    {
+      "source": "artifacts/evals/stage2_cases.json",
+      "archive_path": "evals/stage2_cases.json",
+      "sha256": "ac02162253c928f914b55dfff7d14f5ab580a0ed2290b168526cbf67db2d67db"
+    },
+    {
+      "source": "artifacts/prompts/quality_challenge.md",
+      "archive_path": "prompts/quality_challenge.md",
+      "sha256": "acf276b34cc5941e8ef366ba4062faf84febe87f5e801a19f06d0b6372902e00"
+    },
+    {
+      "source": "artifacts/prompts/quality_stage1.2026-10-21.bak.md",
+      "archive_path": "prompts/history/quality_stage1.2026-10-21.bak.md",
+      "sha256": "ab3c067d9b28f5aac190b1ec157d79542246dd162798b9593dcec89044d83919"
+    },
+    {
+      "source": "artifacts/prompts/quality_stage1.bak.md",
+      "archive_path": "prompts/history/quality_stage1.bak.md",
+      "sha256": "ae099f367432717c8e24d121b011ef207db5948ec6655f9489957f9a4a65783c"
+    },
+    {
+      "source": "artifacts/prompts/quality_stage1.diff.html",
+      "archive_path": "prompts/history/quality_stage1.diff.html",
+      "sha256": "8c26c0e03dc41262022bc1144c307b8f56a394e8984d941b5362c98540168bc2"
+    },
+    {
+      "source": "artifacts/prompts/quality_stage1.md",
+      "archive_path": "prompts/quality_stage1.md",
+      "sha256": "2c572a665aacceed58558f48ef1242177b5fca202285b8d6afd6bf1f4e1d621c"
+    },
+    {
+      "source": "artifacts/prompts/quality_stage1.standards_comparison.html",
+      "archive_path": "prompts/history/quality_stage1.standards_comparison.html",
+      "sha256": "ae1bed352a6f2c222c6aed2cab9d0bc1066ac5de56835ca1b3eb5c40d7640a0d"
+    },
+    {
+      "source": "artifacts/prompts/quality_stage2.md",
+      "archive_path": "prompts/quality_stage2.md",
+      "sha256": "89327741db0b556ba2c69335db714ac97d17fc17455272d49f1a9ac6daa98fd6"
+    },
+    {
+      "source": "module_tests/README.md",
+      "archive_path": "module_tests/README.md",
+      "sha256": "6a182b1c65b7f783e834041964bb3e33019a580c71b3c1cca678c37c0d324566"
+    }
+  ],
+  "note": "Snapshot files are exact Git blobs. Complete V3 Python source remains in the baseline tag. Older drafts and contracts were moved into history/ and drafts/.",
+  "workspace_files": [
+    {
+      "source": "../run_screening_batch.sh",
+      "archive_path": "tools/run_screening_batch.sh",
+      "sha256": "ec16218cb21286e8be869e91731d6a0000cdec8dfd8b09676dca870eedd27718"
+    }
+  ]
+}

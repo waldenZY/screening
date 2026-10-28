@@ -10,18 +10,11 @@ from typing import Any
 
 from ..candidate.contract import validate_canonical_candidate
 from ..shared.json_io import JsonObject
-from ..quality.two_stage import (
-    CHALLENGE_FIELDS,
-    STAGE1_FIELDS,
-    STAGE2_FIELDS,
-    stage1_passes,
-    validate_challenge_result,
-    validate_stage1_result,
-    validate_stage2_result,
-)
+from ..quality.runner import (CHALLENGE_FIELDS, STAGE2_FIELDS, validate_challenge_result, validate_stage2_result)
+from ..quality.stage1 import (STAGE1_FIELDS, stage1_passes, validate_stage1_result)
 
 
-SCREENED_CANONICAL_SCHEMA_VERSION = 7
+SCREENED_CANONICAL_SCHEMA_VERSION = 9
 SET_NAMES = frozenset({"P0", "P1", "P2"})
 SELECTION_ORIGINS = frozenset({"initial_wave", "supplement_wave"})
 _HASH = re.compile(r"[0-9a-f]{64}")
@@ -130,18 +123,26 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
     quality = record.get("quality")
     if not isinstance(quality, Mapping) or set(quality) != STAGE1_FIELDS | STAGE2_FIELDS:
         raise ScreenedCanonicalError("screened canonical quality 字段不一致")
-    stage1 = validate_stage1_result({key: quality[key] for key in STAGE1_FIELDS})
-    if not stage1_passes(stage1):
+    from ..quality.runner import stage2_quality_input
+    stage1 = validate_stage1_result({key: quality[key] for key in STAGE1_FIELDS}, stage2_quality_input(candidate)["conversation_turns"])
+    if (not stage1["stage1"]["policy"]["require_category_exact"]
+            or stage1["stage1"]["category"] != {"status": "reviewed", "fit": "exact"}
+            or not stage1_passes(stage1)):
         raise ScreenedCanonicalError("screened canonical 包含未通过第一阶段的样本")
     stage2 = validate_stage2_result({key: quality[key] for key in STAGE2_FIELDS})
     labels = record.get("delivery_labels")
     if (not isinstance(labels, Mapping)
-            or set(labels) != {"intent_label", "executable"}
+            or set(labels) != {"intent_label", "executable", "executable_reasons"}
             or labels.get("intent_label") != stage2["intent_label"]
             or type(labels.get("executable")) is not int
             or labels["executable"] not in (0, 1)):
         raise ScreenedCanonicalError("screened canonical 下游标签非法")
 
+    reasons = labels["executable_reasons"]
+    from .eligibility import REASON_ORDER
+    if (not isinstance(reasons, list) or any(not isinstance(x, str) or x not in REASON_ORDER for x in reasons)
+            or reasons != [x for x in REASON_ORDER if x in reasons] or labels["executable"] != int(not reasons)):
+        raise ScreenedCanonicalError("executable 原因不一致")
     selection = record.get("selection")
     selection_fields = {
         "origin", "round_id", "candidate_task_id", "stage1_task_id", "stage2_task_id"

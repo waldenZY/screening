@@ -1,4 +1,4 @@
-"""Strict, path-stable configuration profile for the screening v3 entrypoint."""
+"""Strict, path-stable configuration profile for the screening v4 entrypoint."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..quality.two_stage import QualityRunConfig
+from ..quality.runner import QualityRunConfig
 from ..shared.json_io import JsonObject
 from .orchestrator import BUILD_CONFIG_VERSION, BuildConfig, parse_build_config
 
 
-PIPELINE_CONFIG_VERSION = 7
+PIPELINE_CONFIG_VERSION = 8
 LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 _TOP_LEVEL_FIELDS = {
@@ -23,6 +23,7 @@ _TOP_LEVEL_FIELDS = {
     "outputs",
     "prompts",
     "quality",
+    "screening_policy",
     "index",
     "logging",
     "publication",
@@ -81,6 +82,7 @@ _OVERRIDE_FIELDS = {
     "risk_keywords",
     "output_root",
     "stage1_prompt",
+    "category_prompt",
     "challenge_prompt",
     "stage2_prompt",
     "workers",
@@ -192,6 +194,8 @@ class PipelineConfig:
     risk_keywords: Path | None
     output_root: Path
     stage1_prompt: Path
+    category_prompt: Path
+    screening_policy: dict[str, Any]
     challenge_prompt: Path
     stage2_prompt: Path
     quality: QualityRunConfig
@@ -218,6 +222,7 @@ class PipelineConfig:
             ("inputs.taxonomy", self.taxonomy),
             ("inputs.risk_keywords", self.risk_keywords),
             ("prompts.stage1", self.stage1_prompt),
+            ("prompts.category", self.category_prompt),
             ("prompts.challenge", self.challenge_prompt),
             ("prompts.stage2", self.stage2_prompt),
         ):
@@ -225,6 +230,8 @@ class PipelineConfig:
                 raise ValueError(f"{label} 不能为空；请在配置文件中填写或使用 CLI 覆盖")
             if not path.is_file():
                 raise FileNotFoundError(f"{label} 文件不存在: {path}")
+        if not self.screening_policy["require_category_exact"]:
+            raise ValueError("生产链路必须要求类别 exact")
         if self.publication.enabled and self.publication.publish_root is None:
             raise ValueError("publication.enabled=true 时 publish_root 不能为空")
 
@@ -241,10 +248,12 @@ class PipelineConfig:
             "outputs": {"output_root": str(self.output_root)},
             "prompts": {
                 "stage1": str(self.stage1_prompt),
+                "category": str(self.category_prompt),
                 "challenge": str(self.challenge_prompt),
                 "stage2": str(self.stage2_prompt),
             },
             "quality": asdict(self.quality),
+            "screening_policy": self.screening_policy,
             "index": {
                 "cache_root": str(self.cache_root),
                 "batch_size": self.index.batch_size,
@@ -306,7 +315,7 @@ def _parse_build(value: Mapping[str, Any]) -> BuildConfig:
 
 
 def load_pipeline_config(path: Path) -> PipelineConfig:
-    """Load and strictly validate one complete v3 execution profile."""
+    """Load and strictly validate one complete v4 execution profile."""
     config_path = path.expanduser().resolve()
     try:
         value = json.loads(config_path.read_text(encoding="utf-8"))
@@ -329,7 +338,7 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
     publication = _object(value["publication"], "publication")
     _exact_fields(inputs, {"source", "taxonomy", "risk_keywords"}, "inputs")
     _exact_fields(outputs, {"output_root"}, "outputs")
-    _exact_fields(prompts, {"stage1", "challenge", "stage2"}, "prompts")
+    _exact_fields(prompts, {"stage1", "category", "challenge", "stage2"}, "prompts")
     _exact_fields(quality, {"workers", "max_retries", "sleep_seconds"}, "quality")
     _exact_fields(
         index,
@@ -358,6 +367,8 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
     if type(index["verify_full_source_hash"]) is not bool:
         raise ValueError("index.verify_full_source_hash 必须是布尔值")
 
+    from ..quality.stage1 import validate_policy
+    screening_policy = validate_policy(value["screening_policy"])
     base_dir = config_path.parent
     return PipelineConfig(
         config_version=PIPELINE_CONFIG_VERSION,
@@ -366,6 +377,8 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
         taxonomy=_path(inputs["taxonomy"], "inputs.taxonomy", base_dir, optional=True),
         risk_keywords=_path(inputs["risk_keywords"], "inputs.risk_keywords", base_dir, optional=True),
         output_root=_path(outputs["output_root"], "outputs.output_root", base_dir),  # type: ignore[arg-type]
+        category_prompt=_path(prompts["category"], "prompts.category", base_dir),
+        screening_policy=screening_policy,
         stage1_prompt=_path(prompts["stage1"], "prompts.stage1", base_dir),  # type: ignore[arg-type]
         challenge_prompt=_path(prompts["challenge"], "prompts.challenge", base_dir),  # type: ignore[arg-type]
         stage2_prompt=_path(prompts["stage2"], "prompts.stage2", base_dir),  # type: ignore[arg-type]
@@ -475,6 +488,7 @@ def apply_pipeline_overrides(
             if "stage1_prompt" in values
             else config.stage1_prompt
         ),
+        category_prompt=(_path(values["category_prompt"], "--category-prompt", base_dir) if "category_prompt" in values else config.category_prompt),
         challenge_prompt=(
             _path(values["challenge_prompt"], "--challenge-prompt", base_dir)  # type: ignore[arg-type]
             if "challenge_prompt" in values

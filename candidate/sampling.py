@@ -1,7 +1,7 @@
 """Deterministic P0/P1/P2 sampling over the canonical index.
 
 The implementation intentionally has no dependency on either LLM stage.  It
-materializes source text only when the legacy MMR/Jaccard rules require it and
+materializes source text only when the labeled MMR/Jaccard rules require it and
 returns canonical locators to the orchestration layer.
 """
 
@@ -309,7 +309,7 @@ def _weighted_grid_quotas(
 
 
 class CandidateSampler:
-    """Legacy-compatible branch sampler backed by :class:`CanonicalCandidateIndex`."""
+    """Labeled-compatible branch sampler backed by :class:`CanonicalCandidateIndex`."""
 
     def __init__(
         self,

@@ -34,7 +34,7 @@ TRACE_FIELDS = (
     "topic_hint",
 )
 
-# These are complete legacy markers.  The old builder accidentally used character
+# These are complete labeled markers.  The old builder accidentally used character
 # classes, causing ordinary characters such as A/S/R to be removed or matched.
 MULTIMODAL_MARKER_PATTERN = (
     r"\[\(\(多模态\)输入\)\]|\[\(多模态\)\]|\[ASR\]|\[\(图片\)\]|\[\(语音\)\]"
@@ -117,7 +117,7 @@ def _normalize_turn(value: str) -> str:
 
 
 def clean_text(value: str) -> str:
-    """Apply the legacy text cleaning intent with exact marker matching."""
+    """Normalize text for the sampling length and complexity features."""
     normalized = _normalize_turn(value)
     return _MULTIMODAL_MARKERS.sub("", normalized).strip()
 

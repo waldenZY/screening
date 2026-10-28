@@ -1,17 +1,18 @@
 {
-  "config_version": 7,
+  "config_version": 8,
   "inputs": {
     "source": "",
     "taxonomy": "",
     "risk_keywords": ""
   },
   "outputs": {
-    "output_root": "../../outputs_v3"
+    "output_root": "../../outputs_v4"
   },
   "prompts": {
     "stage1": "../prompts/quality_stage1.md",
     "challenge": "../prompts/quality_challenge.md",
-    "stage2": "../prompts/quality_stage2.md"
+    "stage2": "../prompts/quality_stage2.md",
+    "category": "../prompts/quality_stage1_category.md"
   },
   "quality": {
     "workers": 10,
@@ -45,8 +46,16 @@
     },
     "p1": {
       "target_n": 6000,
-      "probability_weights": {"high": 3, "mid": 2, "boundary": 1},
-      "frequency_weights": {"hot": 2, "warm": 2, "cold": 1},
+      "probability_weights": {
+        "high": 3,
+        "mid": 2,
+        "boundary": 1
+      },
+      "frequency_weights": {
+        "hot": 2,
+        "warm": 2,
+        "cold": 1
+      },
       "cold_boundary_floor": 1,
       "mmr_lambda": 0.7
     },
@@ -102,5 +111,19 @@
     "max_tail_sampled": 1000,
     "tail_batch_size": 250,
     "max_stalled_batches": 2
+  },
+  "screening_policy": {
+    "version": 1,
+    "allowed_routes": [
+      "direct",
+      "clarification"
+    ],
+    "require_category_exact": true,
+    "runtime_capabilities": [
+      "public_information",
+      "system_app_state",
+      "current_screen_media",
+      "identified_device_resource"
+    ]
   }
 }

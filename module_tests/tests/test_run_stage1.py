@@ -1,410 +1,326 @@
-"""Offline checks of the standalone runner; no real model requests."""
-
+"""Admission semantics, isolated requests, replay and production round trips."""
 from __future__ import annotations
-
 import contextlib
+import copy
 import io
 import json
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from openpyxl import Workbook, load_workbook
 
-from openpyxl import load_workbook
+from screening.quality.stage1 import (DEFAULT_POLICY, QualityResponseError, build_stage1_result,
+    validate_features, validate_stage1_result, screen, stage1_passes)
+from screening.quality.runner import QUALITY_CONTRACT_VERSION, QualityRunner, QualityRunConfig, QualityStageIncomplete
+from screening.module_tests import run_stage1 as standalone
+from screening.delivery.eligibility import delivery_labels
+from screening.delivery.publish import collect_and_validate_artifacts, validate_manifest_artifacts, PublicationError
+from screening.pipeline.cli import main as pipeline_main
+from screening.shared.llm import LlmConfig
+from screening.shared.risk_keywords import load_risk_keywords
 
-from screening.module_tests import run_stage1 as runner
-from screening.shared.llm import LlmConfig, LlmRequestError
-
-
-PASSED = {
-    "category_fit": "exact",
-    "semantic_completeness": "self_contained",
-    "intent_clarity": "clear",
-    "validity": "valid",
-    "blocking_issues": [],
-}
-REJECTED = {
-    **PASSED,
-    "semantic_completeness": "context_dependent",
-    "validity": "invalid",
-    "blocking_issues": ["attachment_dependency"],
-}
-CONFIG = LlmConfig(
-    api_url="https://offline.example.invalid/v1/chat/completions",
-    api_key="offline-secret-do-not-save",
-    model="offline-model",
-    max_tokens=512,
-    timeout=3.0,
-    stream=False,
-    enable_thinking=False,
-    skip_special_tokens=False,
-)
+PACKAGE = Path(__file__).resolve().parents[2]
+CONFIG = LlmConfig(api_url="https://offline.example.invalid/v1/chat/completions", api_key="offline-secret",
+    model="offline-model", max_tokens=4096, timeout=3, stream=False, enable_thinking=False, skip_special_tokens=False)
+CATEGORY = {"status": "reviewed", "fit": "exact"}
 
 
-def labeled(target: str = "测试目标", context: str = "") -> dict:
-    return {
-        "text": f"{context} | {target}" if context else target,
-        "context_text": context,
-        "target_query": target,
-        "turn_count": len(context.split(" | ")) + 1 if context else 1,
-        "L1": "测试一级",
-        "L2": "测试二级",
-        "cluster_id": 1,
-        "cluster_prob": 0.9,
-        "frequency": 2,
-        "session_id": "same-session",
-        "set": "P1_benchmark",
-        "quality_task_difficulty": "old-difficulty-must-not-leak",
-        "intent_label": "old-intent-must-not-leak",
-        "executable": 0,
-    }
+def feature(turns, *, anchor="task", goal="处理当前请求", points=(), deps=(), broken=False):
+    return {"text_state": "broken" if broken else "recoverable", "anchor": anchor,
+        "goal": goal, "objects": [], "constraints": [],
+        "open_points": [{"kind": kind, "description": "需要确定的信息"} for kind in points],
+        "dependencies": [{"source": source, "description": "必要依赖", "locator": turns[-1] if source in DEFAULT_POLICY["runtime_capabilities"] else None} for source in deps]}
+
+
+def record(target="打开客厅灯", context="", category=True):
+    turns = (context.split(" | ") if context else []) + [target]
+    return {"sample_id": "reference", "context_text": context, "target_query": target,
+        "sample_type": "multi_turn" if context else "single_turn", "conversation_turns": turns,
+        "candidate_category": {"L1": "设备", "L2": "控制"} if category else {"L1": None, "L2": None}}
+
+
+def fake_features(turns):
+    target = turns[-1]
+    if target in {"闹钟", "冰糖冬枣", "视频剪辑", "临沂"}:
+        return feature(turns, anchor="topic", goal=None, points=("intent",))
+    if target in {"嗯", "这样", "他说也不错", "下个路口左转"}:
+        return feature(turns, anchor="none", goal=None)
+    if target == "帮我设闹钟":
+        return feature(turns, points=("parameter",))
+    if target == "总结这份文件":
+        return feature(turns, deps=("missing_material",))
+    if target == "选择第二个":
+        return feature(turns, deps=("missing_context",))
+    if target == "总结当前视频":
+        return feature(turns, deps=("current_screen_media",))
+    return feature(turns)
+
+
+def fake_client(calls):
+    def call(messages, **kwargs):
+        prompt = messages[0]["content"]
+        calls.append(prompt)
+        if prompt.startswith("# Stage1：基于文本"):
+            payload = json.loads(prompt[prompt.rfind("\n{")+1:])
+            assert set(payload) == {"sample_type", "conversation_turns"}
+            value = fake_features(payload["conversation_turns"])
+        elif prompt.startswith("# Stage1：独立"):
+            payload = json.loads(prompt[prompt.rfind("\n{")+1:])
+            assert set(payload) == {"sample_type", "conversation_turns", "candidate_category"}
+            value = {"category_fit": "exact"}
+        elif prompt.startswith("# P2"):
+            payload = json.loads(prompt[prompt.rfind("\n{")+1:])
+            assert "stage1_features" in payload and "screening" not in payload
+            value = {"is_challenge": True, "primary_challenge": "multi_constraint", "challenge_types": ["multi_constraint"]}
+        elif prompt.startswith("# 第二阶段"):
+            payload = json.loads(prompt[prompt.rfind("\n{")+1:])
+            assert set(payload) == {"sample_type", "conversation_turns"}
+            # Deliberate cross-stage disagreement must not veto direct eligibility.
+            value = {"task_difficulty": "simple", "intent_label": "qa", "execution_issues": ["attachment_dependency"]}
+        else:
+            return "OK", 1.0, 2.0
+        return json.dumps(value, ensure_ascii=False), 1.0, 2.0
+    return call
+
+
+class Stage1ContractTests(unittest.TestCase):
+    def test_objects_and_constraints_retained_without_excerpt_fields(self):
+        turns=["帮我设置工作日早上的闹钟"]
+        observation=feature(turns,points=("parameter",),deps=("user_to_specify",))
+        observation["objects"]=["闹钟"]
+        observation["constraints"]=["工作日","早上"]
+        result=build_stage1_result(observation,CATEGORY,turns=turns)
+        self.assertEqual(result["stage1"]["features"],observation)
+        self.assertEqual(result["stage1"]["screening"]["route"],"clarification")
+        self.assertNotIn('"evidence"',json.dumps(result))
+        for field in ("open_points","dependencies"):
+            old=copy.deepcopy(observation);old[field][0]["evidence"]=[]
+            with self.assertRaises(QualityResponseError): validate_features(old,turns)
+
+    def test_versioned_illustrative_fixtures(self):
+        fixture=json.loads((PACKAGE/"artifacts/evals/stage1_cases.json").read_text(encoding="utf-8"))
+        self.assertEqual(fixture["quality_contract_version"],QUALITY_CONTRACT_VERSION)
+        for case in fixture["cases"]:
+            with self.subTest(case=case["id"]):
+                result=build_stage1_result(case["features"],case["category"],case["policy"],turns=case["input"]["conversation_turns"])
+                self.assertEqual(result["stage1"]["screening"],case["expected_screening"])
+
+    def test_ordered_rules_and_independent_category(self):
+        for target, expected in (("打开客厅灯", "direct"), ("闹钟", "clarification"),
+                ("冰糖冬枣", "clarification"), ("临沂", "clarification"), ("帮我设闹钟", "clarification"),
+                ("嗯", "excluded"), ("这样", "excluded"), ("他说也不错", "excluded"), ("下个路口左转", "excluded"),
+                ("总结这份文件", "excluded"), ("选择第二个", "excluded"), ("总结当前视频", "direct")):
+            with self.subTest(target=target):
+                result = build_stage1_result(fake_features([target]), CATEGORY, turns=[target])
+                self.assertEqual(result["stage1"]["screening"]["route"], expected)
+                self.assertEqual(stage1_passes(result), expected != "excluded")
+        f = feature(["总结文件并设闹钟"], points=("parameter",), deps=("missing_material", "missing_context"))
+        result = build_stage1_result(f, {"status": "reviewed", "fit": "partial"})
+        self.assertEqual(result["stage1"]["screening"]["reasons"], ["missing_material", "missing_context", "category_partial"])
+
+    def test_replay_policy_and_invalid_observation_or_decision(self):
+        f = fake_features(["闹钟"])
+        default = build_stage1_result(f, CATEGORY)
+        policy = copy.deepcopy(DEFAULT_POLICY); policy["allowed_routes"] = ["direct"]
+        self.assertFalse(stage1_passes(build_stage1_result(f, CATEGORY, policy)))
+        bad = copy.deepcopy(default); bad["stage1"]["screening"]["admitted"] = False
+        with self.assertRaises(QualityResponseError): validate_stage1_result(bad)
+        bad_feature = copy.deepcopy(f); bad_feature["evidence"] = []
+        with self.assertRaises(QualityResponseError): validate_features(bad_feature, ["闹钟"])
+        runtime = fake_features(["总结当前视频"])
+        bad_feature = copy.deepcopy(runtime); bad_feature["dependencies"][0]["locator"] = "虚构文件路径"
+        with self.assertRaises(QualityResponseError): validate_features(bad_feature, ["总结当前视频"])
+        runtime = fake_features(["总结当前视频"])
+        policy["runtime_capabilities"] = []
+        self.assertIn("runtime_unavailable", screen(runtime, CATEGORY, policy)["reasons"])
+        f["text_state"] = "broken"
+        self.assertEqual(screen(f, CATEGORY, DEFAULT_POLICY)["route"], "excluded")
+
+    def test_missing_category_does_not_change_text_route(self):
+        f = fake_features(["冰糖冬枣"])
+        result = build_stage1_result(f, {"status": "not_provided", "fit": None})
+        self.assertEqual(result["stage1"]["screening"]["route"], "clarification")
+        self.assertEqual(result["stage1"]["screening"]["reasons"], ["category_not_provided"])
+
+    def test_executable_retains_other_filters_and_stage2_intent(self):
+        with tempfile.TemporaryDirectory() as td:
+            risk_path = Path(td)/"risk.xlsx"
+            workbook = Workbook(); workbook.active.title = "Sheet1"; workbook.active.append(["关键词", "风险级别"]); workbook.active.append(["关机", "高"]); workbook.save(risk_path)
+            risk = load_risk_keywords(risk_path)
+            stage2 = {"intent_label": "qa", "execution_issues": ["attachment_dependency"]}
+            for turns, expected in ((["打开客厅灯"],1), (["暂停"],0), (["闹钟"],0), (["帮我设闹钟"],0), (["请关机"],0), (["开灯", "调暗一点"],0)):
+                candidate = {"conversation": {"target_query": turns[-1], "sample_type": "multi_turn" if len(turns)>1 else "single_turn"}}
+                stage1 = build_stage1_result(fake_features(turns), CATEGORY)
+                labels = delivery_labels(candidate, stage2, risk, stage1)
+                self.assertEqual(labels["executable"], expected)
+                self.assertEqual(labels["intent_label"], "qa")
+                self.assertEqual(bool(labels["executable_reasons"]), not expected)
 
 
 class Stage1ModuleTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="screening_stage1_test_")
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.input = self.root / "samples.jsonl"
-        self.output = self.root / "output"
-        self.prompt = self.root / "prompt.md"
-        self.prompt.write_text("RULES\n{CANDIDATE_JSON}\nEND\n", encoding="utf-8")
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup); self.root = Path(self.temp.name)
 
-    def write_samples(self, records: list) -> None:
-        self.input.write_text(
-            "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
-            encoding="utf-8",
-        )
+    def write(self, rows, name="input.jsonl"):
+        path = self.root/name; path.write_text("".join(json.dumps(r,ensure_ascii=False)+"\n" for r in rows),encoding="utf-8"); return path
 
-    def run_samples(self, client: Mock | None = None, **kwargs) -> tuple[int, Mock]:
-        if client is None:
-            client = Mock(return_value=(json.dumps(PASSED), 1.25, 2.5))
+    def run_samples(self, rows, **kwargs):
+        path = self.write(rows); calls=[]
         with contextlib.redirect_stdout(io.StringIO()):
-            code = runner.run_stage1_test(
-                self.input, self.output, llm_config=CONFIG,
-                prompt_path=self.prompt, llm_call=client, **kwargs,
-            )
-        return code, client
+            code = standalone.run_stage1_test(path,self.root/"out",llm_config=CONFIG,llm_call=fake_client(calls),**kwargs)
+        results=[json.loads(x) for x in (self.root/"out/results.jsonl").read_text(encoding="utf-8").splitlines()]
+        return code,calls,results
 
-    def read_results(self) -> list[dict]:
-        return [json.loads(line) for line in (self.output / "results.jsonl").read_text(encoding="utf-8").splitlines()]
-
-    def read_info(self) -> dict:
-        return json.loads((self.output / "run.json").read_text(encoding="utf-8"))
-
-    def artifact_text(self, artifact: Path) -> str:
-        if artifact.suffix != ".xlsx":
-            return artifact.read_text(encoding="utf-8")
-        workbook = load_workbook(artifact)
-        try:
-            return "\n".join(
-                str(cell.value)
-                for sheet in workbook for row in sheet for cell in row
-                if cell.value is not None
-            )
-        finally:
-            workbook.close()
-
-    def test_preserve_exact_turns_and_isolate_old_labels(self) -> None:
-        records = [labeled("  [(图片)]目标  "), labeled("改成乙", "第一轮 | 第二轮")]
-        records[1]["set"] = "P2_adversarial"
-        self.write_samples(records)
-        code, client = self.run_samples()
-        self.assertEqual(code, 0)
-        results = self.read_results()
-        self.assertEqual(results[0]["stage1_input"]["conversation_turns"], ["  [(图片)]目标  "])
-        self.assertEqual(results[1]["stage1_input"], {
-            "sample_type": "multi_turn",
-            "conversation_turns": ["第一轮", "第二轮", "改成乙"],
-            "candidate_category": {"L1": "测试一级", "L2": "测试二级"},
-        })
-        for source, result, call in zip(records, results, client.call_args_list):
-            self.assertEqual(result["source_record"], source)
-            rendered = call.args[0][0]["content"]
-            self.assertEqual(json.loads(rendered.removeprefix("RULES\n").removesuffix("\nEND\n")), result["stage1_input"])
-            self.assertNotIn(source["intent_label"], rendered)
-            self.assertNotIn(source["quality_task_difficulty"], rendered)
-            self.assertNotIn("executable", rendered)
-            self.assertEqual(call.kwargs, {"model": CONFIG.model, **CONFIG.options()})
-
-    def test_bad_records_do_not_invoke_model(self) -> None:
-        mutations = [
-            {"text": "不一致"}, {"turn_count": True}, {"turn_count": 2},
-            {"context_text": None}, {"L1": " "}, {"target_query": ""},
-        ]
-        for mutation in mutations:
-            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                runner.build_stage1_input({**labeled(), **mutation})
-        self.write_samples([labeled(), None, {"target_query": "缺字段"}, {**labeled(), "text": "不一致"}])
-        code, client = self.run_samples()
-        self.assertEqual(code, 2)
-        self.assertEqual(client.call_count, 1)
-        for result in self.read_results()[1:]:
-            self.assertEqual(result["status"], "input_error")
-            self.assertIsNone(result["stage1_pass"])
-            self.assertIsNone(result["stage1_input"])
-
-    def test_partial_response_failures_are_not_rejections(self) -> None:
-        self.write_samples([labeled(str(i)) for i in range(5)])
-        conflict = {**PASSED, "blocking_issues": ["attachment_dependency"]}
-        client = Mock(side_effect=[
-            (f"```json\n{json.dumps(PASSED)}\n```", 1.0, 2.0),
-            (json.dumps(REJECTED), 1.0, 2.0),
-            ("not JSON", 1.0, 2.0),
-            (json.dumps(conflict), 1.0, 2.0),
-            LlmRequestError(429),
-        ])
-        code, _ = self.run_samples(client)
-        self.assertEqual(code, 2)
-        self.assertEqual(client.call_count, 5)
-        results = self.read_results()
-        self.assertEqual([r["stage1_pass"] for r in results], [True, False, None, None, None])
-        self.assertEqual([r["status"] for r in results], ["ok", "ok", "response_error", "response_error", "request_error"])
-        self.assertEqual(results[2]["raw_response"], "not JSON")
-        self.assertIsNone(results[4]["raw_response"])
-        info = self.read_info()
-        self.assertEqual(info["counts"], {"selected": 5, "processed": 5, "passed": 1, "rejected": 1, "failed": 3})
-        self.assertEqual(info["status"], "completed_with_errors")
-        self.assertIn("通过 1 条，拒绝 1 条，失败 3 条", (self.output / "report.md").read_text(encoding="utf-8"))
-        workbook = load_workbook(self.output / "results.xlsx")
-        try:
-            sheet = workbook["Stage1结果"]
-            values = list(sheet.values)
-            rows = [dict(zip(values[0], row)) for row in values[1:]]
-            self.assertEqual([row["stage1_pass"] for row in rows], [1, 0, None, None, None])
-            self.assertEqual([row["source_line"] for row in rows], [1, 2, 3, 4, 5])
-            self.assertEqual(rows[1]["blocking_issues"], '["attachment_dependency"]')
-            self.assertEqual(rows[2]["raw_response"], "not JSON")
-            self.assertEqual(rows[4]["status"], "request_error")
-            self.assertEqual(sheet.freeze_panes, "E2")
-            self.assertEqual(sheet.auto_filter.ref, sheet.dimensions)
-        finally:
-            workbook.close()
-
-    def test_bom_blanks_invalid_json_limit_and_line_numbers(self) -> None:
-        valid = json.dumps(labeled(), ensure_ascii=False)
-        self.input.write_text(f"\n{{bad json\n\n{valid}\n{valid}\n", encoding="utf-8-sig")
-        code, client = self.run_samples(limit=2)
-        self.assertEqual(code, 2)
-        self.assertEqual(client.call_count, 1)
-        results = self.read_results()
-        self.assertEqual([r["source_line"] for r in results], [2, 4])
-        self.assertEqual(results[0]["source_text"], "{bad json")
-        self.assertEqual(results[0]["status"], "input_error")
-
-    def test_duplicates_and_repeated_runs_make_fresh_requests(self) -> None:
-        self.write_samples([labeled(), labeled()])
-        code, client = self.run_samples()
-        self.assertEqual(code, 0)
-        self.assertEqual(client.call_count, 2)
-        self.output = self.root / "another_output"
-        code, _ = self.run_samples(client)
-        self.assertEqual(code, 0)
-        self.assertEqual(client.call_count, 4)
-        self.assertEqual(len(self.read_results()), 2)
-
-    def test_nonempty_directory_and_file_are_never_overwritten(self) -> None:
-        self.write_samples([labeled()])
-        self.output.mkdir()
-        original = self.output / "keep.txt"
-        original.write_text("keep", encoding="utf-8")
-        client = Mock()
-        with self.assertRaisesRegex(ValueError, "不会覆盖"):
-            self.run_samples(client)
-        self.assertEqual(original.read_text(encoding="utf-8"), "keep")
-        self.assertEqual(list(self.output.iterdir()), [original])
-        self.output = self.root / "existing_file"
-        self.output.write_text("keep", encoding="utf-8")
-        with self.assertRaises(ValueError):
-            self.run_samples(client)
-        self.assertEqual(self.output.read_text(encoding="utf-8"), "keep")
-        client.assert_not_called()
-
-    def test_preexisting_empty_output_and_complete_artifacts(self) -> None:
-        self.write_samples([labeled()])
-        self.output.mkdir()
-        code, _ = self.run_samples()
-        self.assertEqual(code, 0)
-        self.assertEqual(
-            {p.name for p in self.output.iterdir()},
-            {"results.jsonl", "results.xlsx", "report.md", "run.json", "stage1_prompt.md"},
-        )
-        self.assertEqual(
-            (self.output / "stage1_prompt.md").read_text(encoding="utf-8"),
-            self.prompt.read_text(encoding="utf-8"),
-        )
-        info = self.read_info()
-        self.assertEqual(info["input_sha256"], runner.sha256_file(self.input))
-        self.assertEqual(info["prompt_sha256"], runner.sha256_file(self.output / "stage1_prompt.md"))
-        self.assertEqual(info["llm"], CONFIG.public_metadata())
-        self.assertEqual(info["attempts_per_record"], 1)
-        self.assertFalse(info["cache_enabled"])
-
-    def test_invalid_prompt_empty_input_and_invalid_limit_fail_before_writes(self) -> None:
-        self.write_samples([labeled()])
-        client = Mock()
-        for content in ("no placeholder", "{CANDIDATE_JSON}{CANDIDATE_JSON}"):
-            with self.subTest(content=content):
-                self.prompt.write_text(content, encoding="utf-8")
-                with self.assertRaises(ValueError):
-                    self.run_samples(client)
-                self.assertFalse(self.output.exists())
-        for limit in (0, -1, True):
-            with self.subTest(limit=limit), self.assertRaises(ValueError):
-                self.run_samples(client, limit=limit)
-        self.input.write_text("\n \n", encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "没有非空"):
-            self.run_samples(client)
-        self.assertFalse(self.output.exists())
-        client.assert_not_called()
-
-    def test_credentials_are_not_persisted_even_in_client_exception(self) -> None:
-        self.write_samples([labeled()])
-        client = Mock(side_effect=RuntimeError(f"{CONFIG.api_url} {CONFIG.api_key}"))
-        code, _ = self.run_samples(client)
-        self.assertEqual(code, 2)
-        for artifact in self.output.iterdir():
-            text = self.artifact_text(artifact)
-            self.assertNotIn(CONFIG.api_url, text)
-            self.assertNotIn(CONFIG.api_key, text)
-
-    def test_keyboard_interrupt_preserves_finished_results(self) -> None:
-        self.write_samples([labeled(), labeled()])
-        client = Mock(side_effect=[(json.dumps(PASSED), 1.0, 2.0), KeyboardInterrupt()])
-        code, _ = self.run_samples(client)
-        self.assertEqual(code, 130)
-        self.assertEqual(len(self.read_results()), 1)
-        info = self.read_info()
-        self.assertEqual(info["status"], "interrupted")
-        self.assertEqual(info["counts"], {"selected": 2, "processed": 1, "passed": 1, "rejected": 0, "failed": 0})
-
-    def test_required_paths_and_invalid_cli_limit_do_not_load_model(self) -> None:
-        arguments = [[], ["--input", str(self.input)], ["--output-dir", str(self.output)],
-                     ["--input", str(self.input), "--output-dir", str(self.output), "--limit", "0"]]
-        for argv in arguments:
-            with self.subTest(argv=argv), patch.object(runner, "load_llm_config") as load:
-                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
-                    runner.main(argv)
-                self.assertEqual(raised.exception.code, 2)
-                load.assert_not_called()
-                self.assertFalse(self.output.exists())
-
-    def test_actual_client_with_mock_http_and_relative_paths(self) -> None:
-        self.write_samples([labeled(), labeled()])
-        config_path = self.root / "model.json"
-        config_path.write_text(json.dumps({
-            "api_url": CONFIG.api_url, "api_key": CONFIG.api_key,
-            "model": CONFIG.model, **CONFIG.options(),
-        }), encoding="utf-8")
-        response = Mock()
-        response.json.return_value = {"choices": [{"message": {"content": json.dumps(PASSED)}}]}
-        previous_cwd = Path.cwd()
-        try:
-            os.chdir(self.root)
-            with patch("requests.post", return_value=response) as post, contextlib.redirect_stdout(io.StringIO()):
-                code = runner.main(["--input", "samples.jsonl", "--output-dir", "relative_output",
-                                    "--prompt", "prompt.md", "--llm-config", "model.json", "--limit", "1"])
-        finally:
-            os.chdir(previous_cwd)
-        self.assertEqual(code, 0)
-        post.assert_called_once()
-        self.assertEqual(post.call_args.kwargs["json"]["model"], CONFIG.model)
-        self.assertIn('"conversation_turns"', post.call_args.kwargs["json"]["messages"][0]["content"])
-        self.output = self.root / "relative_output"
-        self.assertEqual(self.read_info()["input_path"], str(self.input.resolve()))
-        self.assertEqual(len(self.read_results()), 1)
-        for artifact in self.output.iterdir():
-            self.assertNotIn(CONFIG.api_key, self.artifact_text(artifact))
-
-    def test_xlsx_literal_text_long_values_and_original_fields(self) -> None:
-        source = labeled("=1+1")
-        source.update({
-            "L2": "#REF!", "session_id": "0001234567890123456789",
-            "cluster_id": 1234567890123456789, "extra_control": "A\x01B",
-            "extra_long": "x" * 40000, "extra_nested": {"key": ["值"]},
-            "status": "old-status", "source.status": "another-status",
-        })
-        self.write_samples([source, source])
-        code, client = self.run_samples()
-        self.assertEqual(code, 0)
-        self.assertEqual(client.call_count, 2)
-        workbook = load_workbook(self.output / "results.xlsx")
-        try:
-            sheet = workbook["Stage1结果"]
-            self.assertEqual(workbook.sheetnames, ["Stage1结果"])
-            rows = list(sheet.values)
-            self.assertEqual(len(rows), 3)
-            self.assertEqual(len(rows[0]), len(set(rows[0])))
-            record = dict(zip(rows[0], rows[1]))
-            self.assertEqual(record["target_query"], "=1+1")
-            self.assertEqual(record["L2"], "#REF!")
-            self.assertEqual(record["session_id"], source["session_id"])
-            self.assertEqual(record["cluster_id"], str(source["cluster_id"]))
-            self.assertEqual(record["extra_control"], "A\\u0001B")
-            self.assertEqual(len(record["extra_long"]), 32767)
-            self.assertIn("完整内容见 results.jsonl", record["extra_long"])
-            self.assertEqual(json.loads(record["extra_nested"]), source["extra_nested"])
-            self.assertEqual(record["source.status"], "old-status")
-            self.assertEqual(record["source.source.status"], "another-status")
-            self.assertEqual(json.loads(record["stage1_input"]), self.read_results()[0]["stage1_input"])
-            self.assertFalse(any(cell.data_type in {"f", "e"} for row in sheet for cell in row))
-        finally:
-            workbook.close()
-        self.assertEqual(self.read_results()[0]["source_record"], source)
-
-    def test_xlsx_dependency_checked_before_model_call(self) -> None:
-        self.write_samples([labeled()])
-        client = Mock()
-        with patch.object(runner, "validate_xlsx_dependency", side_effect=RuntimeError("missing dependency")):
-            with self.assertRaises(RuntimeError):
-                self.run_samples(client)
-        client.assert_not_called()
-        self.assertFalse(self.output.exists())
-
-    def test_xlsx_export_failure_keeps_json_results(self) -> None:
-        self.write_samples([labeled()])
-        client = Mock(return_value=(json.dumps(PASSED), 1.0, 2.0))
-        with patch.object(runner, "write_results_xlsx", side_effect=OSError("export failed")):
-            with self.assertRaises(OSError):
-                self.run_samples(client)
-        client.assert_called_once()
-        self.assertTrue(self.read_results()[0]["stage1_pass"])
-        self.assertTrue((self.output / "report.md").is_file())
-
-    def test_default_prompt_and_config_are_independent_of_cwd(self) -> None:
-        self.write_samples([labeled()])
-        client = Mock(return_value=(json.dumps(PASSED), 1.0, 2.0))
-        previous_cwd = Path.cwd()
-        try:
-            os.chdir(self.root)
-            with patch.object(runner, "load_llm_config", return_value=CONFIG) as load:
-                with patch.object(LlmConfig, "bind", return_value=client), contextlib.redirect_stdout(io.StringIO()):
-                    code = runner.main(["--input", "samples.jsonl", "--output-dir", "output"])
-        finally:
-            os.chdir(previous_cwd)
-        self.assertEqual(code, 0)
-        load.assert_called_once_with(runner.DEFAULT_LLM_CONFIG_PATH)
-        self.assertEqual((self.output / "stage1_prompt.md").read_text(encoding="utf-8"), runner.DEFAULT_PROMPT_PATH.read_text(encoding="utf-8"))
-        self.assertEqual(client.call_count, 1)
-
-    def test_direct_script_and_module_entrypoints(self) -> None:
-        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"}
-        script = Path(runner.__file__).resolve()
-        commands = [
-            ([sys.executable, "-B", str(script), "--help"], self.root, 0),
-            ([sys.executable, "-B", str(script), "--input", str(self.input)], self.root, 2),
-            ([sys.executable, "-B", "-m", "screening.module_tests.run_stage1", "--help"], script.parents[2], 0),
-        ]
-        for command, cwd, expected in commands:
-            with self.subTest(command=command):
-                completed = subprocess.run(command, cwd=cwd, env=env, capture_output=True, encoding="utf-8", timeout=30)
-                self.assertEqual(completed.returncode, expected, completed.stderr)
-                self.assertIn("--output-dir", completed.stdout + completed.stderr)
-        self.assertFalse(self.output.exists())
+    def test_reference_duplicates_category_skip_and_replay_without_credentials(self):
+        code,calls,rows=self.run_samples([record("冰糖冬枣",category=False),record("冰糖冬枣",category=False),record()])
+        self.assertEqual(code,0);self.assertEqual(len(calls),4)
+        self.assertEqual([r["route"] for r in rows],["clarification","clarification","direct"])
+        self.assertEqual(rows[0]["stage_status"]["category"],"not_provided")
+        self.assertEqual([r["source_line"] for r in rows],[1,2,3])
+        policy=copy.deepcopy(DEFAULT_POLICY);policy["allowed_routes"]=["direct"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            code=standalone.run_stage1_test(self.root/"out/results.jsonl",self.root/"replay",replay=True,policy=policy)
+        self.assertEqual(code,0)
+        again=[json.loads(x) for x in (self.root/"replay/results.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(again[0]["features"],rows[0]["features"])
+        self.assertIn("route_disabled",again[0]["stage1_result"]["stage1"]["screening"]["reasons"])
+        self.assertEqual(again[0]["observation_provenance"],rows[0]["observation_provenance"])
+        workbook=load_workbook(self.root/"out/results.xlsx");self.assertEqual(workbook.active.max_row,4)
+        tampered=copy.deepcopy(rows[2]);tampered["source_record"]["candidate_category"]["L2"]="其他"
+        tampered["stage1_input"]["candidate_category"]["L2"]="其他"
+        tampered_input=self.write([tampered],"tampered.jsonl")
+        with contextlib.redirect_stdout(io.StringIO()):
+            code=standalone.run_stage1_test(tampered_input,self.root/"bad-replay",replay=True)
+        self.assertEqual(code,2)
 
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_invalid_inputs_and_output_directory(self):
+        bad=record();bad["conversation_turns"]=["不同输入"]
+        code,calls,rows=self.run_samples([bad,record("打开客厅灯", "旧话题")])
+        self.assertEqual(code,2);self.assertEqual(rows[0]["status"],"input_error");self.assertIsNone(rows[0]["stage1_pass"])
+        self.assertEqual(len(calls),2)
+        with self.assertRaises(ValueError): standalone.run_stage1_test(self.root/"input.jsonl",self.root/"out",llm_config=CONFIG)
+        old=record(); old.update(text="打开客厅灯",turn_count=1,L1="设备",L2="控制",intent_label="old-label")
+        payload=standalone.build_stage1_input(old);self.assertNotIn("intent_label",payload)
+
+    def test_category_failure_preserves_successful_features(self):
+        calls=[];good=fake_client(calls)
+        def client(messages,**kwargs):
+            if messages[0]["content"].startswith("# Stage1：独立"): return "not json",0,0
+            return good(messages,**kwargs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code=standalone.run_stage1_test(self.write([record()]),self.root/"out",llm_config=CONFIG,llm_call=client)
+        row=json.loads((self.root/"out/results.jsonl").read_text(encoding="utf-8"))
+        self.assertEqual(code,2);self.assertEqual(row["status"],"response_error");self.assertIsNotNone(row["features"]);self.assertIsNone(row["stage1_pass"])
+
+    def test_local_reference_shape_when_available(self):
+        path=PACKAGE.parent/"当前透传到外部的样本仅供参考/query_samples_all.jsonl"
+        if not path.exists(): self.skipTest("本地参考文件不随代码入库")
+        rows=[json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+        self.assertEqual(len(rows),202)
+        payloads=[standalone.build_stage1_input(r) for r in rows]
+        self.assertEqual(sum(p["sample_type"]=="single_turn" for p in payloads),149)
+        self.assertTrue(all(p["candidate_category"]=={"L1":None,"L2":None} for p in payloads))
+
+
+class RunnerIsolationTests(unittest.TestCase):
+    def test_component_cache_category_isolation_retry_and_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            calls=[]
+            client=fake_client(calls)
+            attempts={"category":0}
+            def flaky(messages,**kwargs):
+                if messages[0]["content"].startswith("# Stage1：独立"):
+                    attempts["category"]+=1
+                    if attempts["category"]==1:
+                        raise RuntimeError("do not log endpoint or credential here")
+                return client(messages,**kwargs)
+            kwargs=dict(stage1_prompt=standalone.DEFAULT_PROMPT_PATH.read_text(encoding="utf-8"),
+                category_prompt=standalone.DEFAULT_CATEGORY_PROMPT_PATH.read_text(encoding="utf-8"),
+                stage2_prompt=(PACKAGE/"artifacts/prompts/quality_stage2.md").read_text(encoding="utf-8"),
+                challenge_prompt=(PACKAGE/"artifacts/prompts/quality_challenge.md").read_text(encoding="utf-8"),
+                model=CONFIG.model,llm_options=CONFIG.options(),config=QualityRunConfig(workers=2,sleep_seconds=0,max_retries=1))
+            from screening.candidate.contract import parse_conversation
+            conversation=parse_conversation("打开客厅灯")
+            a={"source_identity_sha256":"a"*64,"conversation_sha256":"c"*64,
+                "conversation":conversation,"source":{"source_line":1},"taxonomy":{"l1":"设备","l2":"控制","l2_key":"设备/控制"}}
+            b=copy.deepcopy(a);b["source_identity_sha256"]="b"*64;b["source"]["source_line"]=2;b["taxonomy"]["l2"]="其他"
+            runner=QualityRunner(root,llm_call=flaky,**kwargs)
+            with self.assertRaises(QualityStageIncomplete): runner.run_stage1([a])
+            self.assertNotIn("do not log endpoint",(root/"stage1_category_attempts.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(len([p for p in calls if p.startswith("# Stage1：基于文本")]),1)
+            # A fresh runner resumes the feature cache after category failure.
+            restarted=QualityRunner(root,llm_call=client,**kwargs)
+            first=restarted.run_stage1([a,b])
+            self.assertEqual(set(first),{"a"*64,"b"*64})
+            self.assertEqual(len([p for p in calls if p.startswith("# Stage1：基于文本")]),1)
+            self.assertEqual(len([p for p in calls if p.startswith("# Stage1：独立")]),2)
+            before=len(calls);restarted.run_stage1([a,b]);self.assertEqual(len(calls),before)
+            self.assertNotEqual(restarted.task_id("stage1_category",a),restarted.task_id("stage1_category",b))
+            self.assertEqual(restarted.task_id("stage1_features",a),restarted.task_id("stage1_features",b))
+            policy=copy.deepcopy(DEFAULT_POLICY);policy["allowed_routes"]=["direct"]
+            with self.assertRaises(ValueError): QualityRunner(root,llm_call=client,screening_policy=policy,**kwargs)
+
+
+class ProductionRoundTripTests(unittest.TestCase):
+    def test_pipeline_resume_export_publish_and_policy_tamper(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);source=root/"cluster.jsonl";taxonomy=root/"taxonomy.json";risk=root/"risk.xlsx"
+            texts=["打开客厅灯","帮我设闹钟","冰糖冬枣","总结当前视频","请关机","暂停",
+                "把音量降低一点","给妈妈拨打电话","播放音乐 | 换成古典音乐", "先查询附近餐厅，再比较价格并选择最近一家",
+                "明早六点叫我 | 改成七点", "先查询天气，然后把结果发送给妈妈", "添加日历 | 添加桌面日历 | 嗯，是的",
+                "总结这份文件", "选择第二个"]
+            source.write_text("".join(json.dumps({"session":f"s{i}","text":text,"cluster":1,"cluster_prob":0.4 if i%2 else 0.95,"frequency":i+1},ensure_ascii=False)+"\n" for i,text in enumerate(texts)),encoding="utf-8")
+            taxonomy.write_text(json.dumps({"categories":[{"name":"设备","total_size":len(texts),"assigned_clusters":[1],"sub_intents":[{"name":"控制","size":len(texts),"cluster_ids":[1]}]}]},ensure_ascii=False),encoding="utf-8")
+            workbook=Workbook();workbook.active.title="Sheet1";workbook.active.append(["关键词","风险级别"]);workbook.active.append(["关机","高"]);workbook.save(risk)
+            profile=json.loads((PACKAGE/"artifacts/config/pipeline.default.json").read_text(encoding="utf-8"))
+            profile["inputs"]={"source":str(source),"taxonomy":str(taxonomy),"risk_keywords":str(risk)}
+            profile["outputs"]["output_root"]=str(root/"outputs")
+            for k in profile["prompts"]: profile["prompts"][k]=str((PACKAGE/"artifacts/config"/profile["prompts"][k]).resolve())
+            profile["quality"]={"workers":3,"max_retries":2,"sleep_seconds":0}
+            profile["index"].update(min_free_space_gb=0,reserve_free_space_gb=0,sqlite_cache_mb=1)
+            profile["sampling"]["p1"]["target_n"]=14;profile["sampling"]["p2"].update(target_n=3,batch_size=6,soft_min_by_primary={k:0 for k in profile["sampling"]["p2"]["soft_min_by_primary"]})
+            config_path=root/"pipeline.json";config_path.write_text(json.dumps(profile,ensure_ascii=False),encoding="utf-8")
+            calls=[];client=fake_client(calls)
+            errors = io.StringIO()
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output),contextlib.redirect_stderr(errors):
+                code=pipeline_main(["--config",str(config_path),"--publish-root",str(root/"live-delivery")],llm_config_override=CONFIG,llm_call_override=client)
+            self.assertEqual(code,0, output.getvalue() + errors.getvalue()[-1200:])
+            run=next((root/"outputs/runs").iterdir());manifest=json.loads((run/"manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"],"published")
+            self.assertEqual(manifest["contract"]["labeled_mapping_version"],7)
+            self.assertNotIn("legacy_mapping_version",manifest["contract"])
+            self.assertEqual(len(list((root/"live-delivery").rglob("*_v6_labeled.jsonl"))),3)
+            validate_manifest_artifacts(run,manifest)
+            originals={r["session"]:r for r in (json.loads(line) for line in source.read_text(encoding="utf-8").splitlines())}
+            all_records=[]
+            for name in ("P0","P1","P2"):
+                rows=[json.loads(x) for x in (run/name/"screened.canonical.jsonl").read_text(encoding="utf-8").splitlines()]
+                self.assertTrue(rows);all_records+=rows
+                exported=next((run/name).glob("*_v6_labeled.jsonl"))
+                delivered=[json.loads(x) for x in exported.read_text(encoding="utf-8").splitlines()]
+                self.assertTrue(all(len(r)==15 and "stage1" in r and r["intent_label"]=="qa" for r in delivered))
+                for item,internal in zip(delivered,rows):
+                    original=originals[item["session_id"]]
+                    self.assertEqual(item["frequency"],original["frequency"])
+                    self.assertEqual(item["cluster_prob"],original["cluster_prob"])
+                    self.assertEqual(item["cluster_id"],original["cluster"])
+                    self.assertEqual(item["stage1"],internal["quality"]["stage1"])
+            self.assertTrue(any(r["quality"]["stage1"]["screening"]["route"]=="clarification" for r in all_records))
+            self.assertTrue(any(r["delivery_labels"]["executable"]==1 and r["quality"]["execution_issues"] for r in all_records))
+            count=len(calls)
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                code=pipeline_main(["--config",str(config_path),"--publish-root",str(root/"delivery")],llm_config_override=CONFIG,llm_call_override=client)
+            self.assertEqual(code,0);self.assertEqual(len(calls),count+1) # connectivity preflight only
+            self.assertEqual(len(list((root/"delivery").rglob("*_v6_labeled.jsonl"))),3)
+            feature_rows=run/"quality/stage1_features_results.jsonl";original=feature_rows.read_text(encoding="utf-8")
+            modified=[json.loads(x) for x in original.splitlines()];modified[0]["result"]["goal"]="tampered";feature_rows.write_text("".join(json.dumps(r,ensure_ascii=False)+"\n" for r in modified),encoding="utf-8")
+            with self.assertRaises((PublicationError,QualityResponseError)): collect_and_validate_artifacts(run)
+            feature_rows.write_text(original,encoding="utf-8")
+            old=json.loads(config_path.read_text(encoding="utf-8"));old["config_version"]=7;config_path.write_text(json.dumps(old),encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()): self.assertEqual(pipeline_main(["--config",str(config_path)],llm_config_override=CONFIG,llm_call_override=client),1)
+
+
+if __name__ == "__main__": unittest.main()

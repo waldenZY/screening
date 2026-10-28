@@ -18,17 +18,17 @@ from ..candidate.dedup import RULES_SHA256, load_or_build_idf_snapshot, validate
 from ..candidate.p2_adaptive import P2_ALGORITHM
 from ..shared.json_io import JsonObject, sha256_file, stable_hash, write_json
 from ..shared.risk_keywords import validate_risk_snapshot
-from ..delivery.legacy import LEGACY_MAPPING_VERSION, LEGACY_SCHEMA_NAME
+from ..delivery.labeled import LABELED_MAPPING_VERSION, LABELED_SCHEMA_NAME
 from ..delivery.report import RUN_REPORT_SCHEMA_VERSION
 from .orchestrator import BUILD_CONFIG_VERSION, BuildConfig
 from ..delivery.screened import SCREENED_CANONICAL_SCHEMA_VERSION
-from ..quality.two_stage import QualityRunConfig
-from ..quality.two_stage import QUALITY_CONTRACT_VERSION
+from ..quality.runner import QualityRunConfig
+from ..quality.runner import QUALITY_CONTRACT_VERSION
 from .checkpoints import CHECKPOINT_SCHEMA_VERSION
 
 
-PIPELINE_VERSION = 4
-MANIFEST_SCHEMA_VERSION = 4
+PIPELINE_VERSION = 6
+MANIFEST_SCHEMA_VERSION = 6
 _LOCK = threading.RLock()
 _RESUMABLE = {"created", "running", "incomplete", "partial_failed", "publish_failed"}
 _REUSABLE = {"completed", "published"}
@@ -61,6 +61,8 @@ def build_run_contract(
     quality_config: QualityRunConfig,
     *,
     stage1_prompt: str,
+    category_prompt: str,
+    screening_policy: Mapping[str, Any],
     challenge_prompt: str,
     stage2_prompt: str,
     llm_metadata: Mapping[str, Any],
@@ -80,8 +82,8 @@ def build_run_contract(
         "p012_build_config_version": BUILD_CONFIG_VERSION,
         "p2_algorithm": P2_ALGORITHM,
         "screened_canonical_schema_version": SCREENED_CANONICAL_SCHEMA_VERSION,
-        "legacy_schema": LEGACY_SCHEMA_NAME,
-        "legacy_mapping_version": LEGACY_MAPPING_VERSION,
+        "labeled_schema": LABELED_SCHEMA_NAME,
+        "labeled_mapping_version": LABELED_MAPPING_VERSION,
         "run_report_schema_version": RUN_REPORT_SCHEMA_VERSION,
         "quality_contract_version": QUALITY_CONTRACT_VERSION,
         "risk_keywords_source_sha256": risk_snapshot["source_sha256"],
@@ -91,8 +93,10 @@ def build_run_contract(
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "build_config": asdict(build_config),
         "quality_run_config": asdict(quality_config),
+        "screening_policy": dict(screening_policy),
         "prompts": {
             "stage1_sha256": _prompt_hash(stage1_prompt),
+            "category_sha256": _prompt_hash(category_prompt),
             "challenge_sha256": _prompt_hash(challenge_prompt),
             "stage2_sha256": _prompt_hash(stage2_prompt),
         },
@@ -103,7 +107,7 @@ def build_run_contract(
 def _load_manifest(path: Path) -> JsonObject:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
-        raise ValueError("v3 manifest 必须是 JSON 对象")
+        raise ValueError("v4 manifest 必须是 JSON 对象")
     return value
 
 
@@ -114,12 +118,12 @@ def _new_run_id(config_id: str) -> str:
 
 def _validate_frozen_run(run_root: Path, manifest: Mapping[str, Any], contract: Mapping[str, Any]) -> None:
     if manifest.get("manifest_schema_version") != MANIFEST_SCHEMA_VERSION:
-        raise ValueError("run manifest schema 与 v3 不兼容")
+        raise ValueError("run manifest schema 与 v4 不兼容")
     if manifest.get("pipeline_version") != PIPELINE_VERSION:
-        raise ValueError("run pipeline version 与 v3 不兼容")
+        raise ValueError("run pipeline version 与 v4 不兼容")
     if manifest.get("contract") != dict(contract):
         raise ValueError("run 与当前输入、配置、Prompt 或模型不兼容")
-    for stage in ("stage1", "challenge", "stage2"):
+    for stage in ("stage1", "category", "challenge", "stage2"):
         path = run_root / "prompts" / f"{stage}.md"
         expected = contract["prompts"][f"{stage}_sha256"]
         if not path.is_file() or sha256_file(path) != expected:
@@ -135,6 +139,8 @@ def prepare_run_context(
     quality_config: QualityRunConfig,
     *,
     stage1_prompt: str,
+    category_prompt: str,
+    screening_policy: Mapping[str, Any],
     challenge_prompt: str,
     stage2_prompt: str,
     llm_metadata: Mapping[str, Any],
@@ -158,6 +164,8 @@ def prepare_run_context(
         build_config,
         quality_config,
         stage1_prompt=stage1_prompt,
+        category_prompt=category_prompt,
+        screening_policy=screening_policy,
         challenge_prompt=challenge_prompt,
         stage2_prompt=stage2_prompt,
         llm_metadata=llm_metadata,
@@ -175,7 +183,7 @@ def prepare_run_context(
             raise ValueError("run ID 非法")
         path = runs_root / run_id / "manifest.json"
         if not path.is_file():
-            raise FileNotFoundError(f"找不到 v3 run: {run_id}")
+            raise FileNotFoundError(f"找不到 v4 run: {run_id}")
         manifest = _load_manifest(path)
         _validate_frozen_run(path.parent, manifest, contract)
         selected = (path.parent, manifest)
@@ -207,6 +215,7 @@ def prepare_run_context(
         run_root.mkdir(parents=True, exist_ok=False)
         prompt_root = run_root / "prompts"
         prompt_root.mkdir()
+        (prompt_root / "category.md").write_text(category_prompt, encoding="utf-8", newline="\n")
         (prompt_root / "stage1.md").write_text(stage1_prompt, encoding="utf-8", newline="\n")
         (prompt_root / "challenge.md").write_text(challenge_prompt, encoding="utf-8", newline="\n")
         (prompt_root / "stage2.md").write_text(stage2_prompt, encoding="utf-8", newline="\n")
@@ -251,7 +260,7 @@ def prepare_run_context(
                 "final_membership": {"status": "pending"},
                 "quality_stage2": {"status": "pending"},
                 "screened_export": {"status": "pending"},
-                "legacy_export": {"status": "pending"},
+                "labeled_export": {"status": "pending"},
                 "batch_report": {"status": "pending"},
                 "publish": {"status": "pending"},
             },

@@ -1,5 +1,5 @@
 {
-  "quality_contract_version": 9,
+  "quality_contract_version": 11,
   "purpose": "Offline expected-label examples for rule review and request/response contract tests; no model accuracy is measured.",
   "cases": [
     {"id": "direct_control", "input": {"sample_type": "single_turn", "conversation_turns": ["打开空调"]}, "expected": {"task_difficulty": "atomic", "intent_label": "task", "execution_issues": []}},

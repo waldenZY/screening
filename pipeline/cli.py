@@ -16,15 +16,15 @@ from ..candidate.index import (
 )
 from ..shared.json_io import JsonObject, sha256_file
 from ..shared.taxonomy import TaxonomyMappings, load_taxonomy_mappings
-from ..delivery.legacy import LEGACY_MAPPING_VERSION
+from ..delivery.labeled import LABELED_MAPPING_VERSION
 from ..delivery.report import RUN_REPORT_SCHEMA_VERSION
 from ..shared.llm import LlmConfig, load_llm_config, validate_llm_dependency
 from .orchestrator import BuildConfig, run_build
 from .preflight import run_preflight
 from ..delivery.screened import SCREENED_CANONICAL_SCHEMA_VERSION
-from ..quality.two_stage import (
+from ..quality.runner import (
     QualityStageIncomplete,
-    TwoStageQualityRunner,
+    QualityRunner,
 )
 from ..delivery.publish import (
     PublicationError,
@@ -58,7 +58,7 @@ DEFAULT_CONFIG_PATH = PACKAGE_ROOT / "artifacts" / "config" / "pipeline.default.
 def _read_manifest(run_root: Path) -> JsonObject:
     value = json.loads((run_root / "manifest.json").read_text(encoding="utf-8"))
     if not isinstance(value, dict):
-        raise ValueError("v3 manifest 必须是对象")
+        raise ValueError("v4 manifest 必须是对象")
     return value
 
 
@@ -105,7 +105,7 @@ def _execute_pipeline_impl(
     index: CanonicalIndexHandle,
     build_config: BuildConfig,
     taxonomy: TaxonomyMappings,
-    quality_runner: TwoStageQualityRunner,
+    quality_runner: QualityRunner,
     *,
     publish_root: Path | None,
     replace: bool = False,
@@ -157,7 +157,7 @@ def _execute_pipeline_impl(
             taxonomy=taxonomy,
             run_root=context.run_root,
             quality_runner=quality_runner,
-            logger=logging.getLogger("screening.v3"),
+            logger=logging.getLogger("screening.v4"),
             on_branch_complete=publish_completed_branch,
         )
     except QualityStageIncomplete as exc:
@@ -180,7 +180,7 @@ def _execute_pipeline_impl(
                 "engineering_failures": list(exc.failures),
             },
         }
-        if exc.stage == "stage1":
+        if exc.stage in {"stage1", "stage1_features", "stage1_category"}:
             stages["quality_stage1"] = {
                 "status": "incomplete",
                 "engineering_failure_count": len(exc.failures),
@@ -248,9 +248,9 @@ def _execute_pipeline_impl(
                 "screened_schema_version": SCREENED_CANONICAL_SCHEMA_VERSION,
                 "error": None,
             },
-            "legacy_export": {
+            "labeled_export": {
                 "status": "completed",
-                "legacy_mapping_version": LEGACY_MAPPING_VERSION,
+                "labeled_mapping_version": LABELED_MAPPING_VERSION,
                 "error": None,
             },
             "batch_report": {
@@ -273,12 +273,12 @@ def execute_pipeline(
     index: CanonicalIndexHandle,
     build_config: BuildConfig,
     taxonomy: TaxonomyMappings,
-    quality_runner: TwoStageQualityRunner,
+    quality_runner: QualityRunner,
     *,
     publish_root: Path | None,
     replace: bool = False,
 ) -> int:
-    """Measure and execute one resumable v3 invocation."""
+    """Measure and execute one resumable v4 invocation."""
     started_ns = begin_invocation(context.run_root, context.disposition)
     result: int | None = None
     try:
@@ -315,7 +315,7 @@ def execute_pipeline(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="构建并发布 screening v3 P0/P1/P2 数据集")
+    parser = argparse.ArgumentParser(description="构建并发布 screening v4 P0/P1/P2 数据集")
     parser.add_argument("--source", type=Path, default=None, help="覆盖配置中的 cluster JSONL")
     parser.add_argument("--taxonomy", type=Path, default=None, help="覆盖配置中的 taxonomy JSON")
     parser.add_argument("--risk-keywords", type=Path, default=None, help="风险关键词 Excel")
@@ -327,6 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--new-run", action="store_true")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--stage1-prompt", type=Path, default=None)
+    parser.add_argument("--category-prompt", type=Path, default=None)
     parser.add_argument("--challenge-prompt", type=Path, default=None)
     parser.add_argument("--stage2-prompt", type=Path, default=None)
     parser.add_argument("--workers", type=int, default=None)
@@ -390,6 +391,7 @@ def main(
                 "risk_keywords": args.risk_keywords,
                 "output_root": args.output_root,
                 "stage1_prompt": args.stage1_prompt,
+                "category_prompt": args.category_prompt,
                 "challenge_prompt": args.challenge_prompt,
                 "stage2_prompt": args.stage2_prompt,
                 "workers": args.workers,
@@ -410,14 +412,15 @@ def main(
         if args.replace and not effective.publication.enabled:
             raise ValueError("--replace 只能用于发布")
         configure_logging(effective.log_level)
-        logger = logging.getLogger("screening.v3")
-        logger.info("screening v3 startup config=%s", effective.config_path)
+        logger = logging.getLogger("screening.v4")
+        logger.info("screening v4 startup config=%s", effective.config_path)
         effective.validate_for_execution()
         assert effective.source is not None and effective.taxonomy is not None and effective.risk_keywords is not None
         from ..shared.risk_keywords import load_risk_keywords
         risk_snapshot = load_risk_keywords(effective.risk_keywords)
         build_config = effective.build
         quality_config = effective.quality
+        category_prompt = effective.category_prompt.read_text(encoding="utf-8")
         stage1_prompt = effective.stage1_prompt.read_text(encoding="utf-8")
         challenge_prompt = effective.challenge_prompt.read_text(encoding="utf-8")
         stage2_prompt = effective.stage2_prompt.read_text(encoding="utf-8")
@@ -427,7 +430,7 @@ def main(
         llm_call = llm_call_override or llm_config.bind()
         preflight = run_preflight(
             effective,
-            prompts={"stage1": stage1_prompt, "challenge": challenge_prompt, "stage2": stage2_prompt},
+            prompts={"stage1": stage1_prompt, "category": category_prompt, "challenge": challenge_prompt, "stage2": stage2_prompt},
             llm_config=llm_config, llm_call=llm_call, replace=args.replace, logger=logger,
         )
         taxonomy_sha256 = sha256_file(effective.taxonomy)
@@ -459,6 +462,8 @@ def main(
             build_config,
             quality_config,
             stage1_prompt=stage1_prompt,
+            category_prompt=category_prompt,
+            screening_policy=effective.screening_policy,
             challenge_prompt=challenge_prompt,
             stage2_prompt=stage2_prompt,
             llm_metadata=metadata,
@@ -480,9 +485,11 @@ def main(
                 replace_files=args.replace,
             ),
         )
-        runner = TwoStageQualityRunner(
+        runner = QualityRunner(
             context.run_root / "quality",
             stage1_prompt=stage1_prompt,
+            category_prompt=category_prompt,
+            screening_policy=effective.screening_policy,
             challenge_prompt=challenge_prompt,
             stage2_prompt=stage2_prompt,
             model=llm_config.model,
@@ -501,7 +508,7 @@ def main(
             replace=args.replace,
         )
         final_manifest = _read_manifest(context.run_root)
-        print(f"v3 run={context.run_id} status={final_manifest['status']}")
+        print(f"v4 run={context.run_id} status={final_manifest['status']}")
         if result == 2:
             branch_states = final_manifest.get("branches", {})
             print(
@@ -513,5 +520,5 @@ def main(
             )
         return result
     except (OSError, ValueError, RuntimeError, KeyError, PublicationError) as exc:
-        print(f"screening v3 failed: {exc}")
+        print(f"screening v4 failed: {exc}")
         return 1

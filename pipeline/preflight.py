@@ -10,7 +10,7 @@ import tempfile
 import time
 from typing import Any, Mapping
 
-from ..delivery.legacy import LEGACY_FILENAMES
+from ..delivery.labeled import LABELED_FILENAMES
 from ..shared.llm import LlmCall, LlmConfig
 from .config import PipelineConfig
 
@@ -95,7 +95,7 @@ def check_publication_targets(root: Path, replace: bool, logger: logging.Logger)
     """Report existing files; final content equivalence remains a publication gate."""
     started = time.perf_counter()
     existing = []
-    for set_name, relative in LEGACY_FILENAMES.items():
+    for set_name, relative in LABELED_FILENAMES.items():
         destination = root / relative
         try:
             if not destination.exists():
@@ -174,7 +174,7 @@ def run_preflight(config: PipelineConfig, *, prompts: Mapping[str, str],
     existing = []
     if config.publish_root is not None:
         directories.append(check_directory(config.publish_root, "publish", logger))
-        for set_name, relative in LEGACY_FILENAMES.items():
+        for set_name, relative in LABELED_FILENAMES.items():
             directories.append(check_directory((config.publish_root / relative).parent,
                                                f"publish_{set_name}", logger))
         existing = check_publication_targets(config.publish_root, replace, logger)

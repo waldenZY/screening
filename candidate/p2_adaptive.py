@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .index import CanonicalCandidateIndex
 from .sampling import COMPLEXITY_RANK, P2SamplingConfig, allocate_sqrt_quotas
-from ..quality.two_stage import CHALLENGE_TYPES, challenge_passes
+from ..quality.runner import CHALLENGE_TYPES, challenge_passes
 from ..shared.json_io import JsonObject
 
 

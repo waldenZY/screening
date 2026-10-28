@@ -1,5 +1,6 @@
 outputs_v2/
 outputs_v3/
+outputs_v4/
 .pytest_cache/
 .pytest_tmp*/
 __pycache__/

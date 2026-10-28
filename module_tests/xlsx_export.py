@@ -9,7 +9,7 @@ from typing import Any
 
 REVIEW_COLUMNS = (
     "source_line", "target_query", "L1", "L2", "stage1_pass", "status",
-    "category_fit", "semantic_completeness", "intent_clarity", "validity", "blocking_issues",
+    "route", "category_status", "category_fit", "screening_reasons", "features", "policy_sha256",
 )
 DETAIL_COLUMNS = (
     "error_type", "error_message", "elapsed_ms", "first_token_latency_ms", "full_latency_ms",
@@ -69,13 +69,17 @@ def write_results_xlsx(path: Path, results: list[dict[str, Any]]) -> None:
     rows = [headers]
     for result in results:
         source = result["source_record"] if isinstance(result["source_record"], dict) else {}
-        quality = result["stage1_result"] or {}
+        quality = (result["stage1_result"] or {}).get("stage1", {})
+        screening = quality.get("screening", {})
+        category = result.get("category_review") or {}
+        supplied = source.get("candidate_category") or {}
         error = result["error"] or {}
         decision = result["stage1_pass"]
         rows.append([
-            result["source_line"], source.get("target_query"), source.get("L1"), source.get("L2"),
+            result["source_line"], source.get("target_query"), source.get("L1", supplied.get("L1")), source.get("L2", supplied.get("L2")),
             None if decision is None else int(decision), result["status"],
-            *(quality.get(key) for key in REVIEW_COLUMNS[6:]),
+            result.get("route"), category.get("status"), category.get("fit"),
+            screening.get("reasons"), result.get("features"), screening.get("policy_sha256"),
             *(source.get(key) for key in source_columns),
             error.get("type"), error.get("message"), result["elapsed_ms"],
             result["first_token_latency_ms"], result["full_latency_ms"],
@@ -104,8 +108,8 @@ def write_results_xlsx(path: Path, results: list[dict[str, Any]]) -> None:
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     widths = {
         "source_line": 12, "target_query": 48, "L1": 16, "L2": 18, "stage1_pass": 14,
-        "status": 20, "category_fit": 18, "semantic_completeness": 24, "intent_clarity": 18,
-        "validity": 16, "blocking_issues": 32, "context_text": 48, "text": 48,
+        "status": 20, "category_fit": 18, "category_status": 20, "route": 20,
+        "features": 65, "screening_reasons": 35, "context_text": 48, "text": 48,
         "raw_response": 55, "stage1_input": 55, "source_text": 48, "error_message": 48,
     }
     for index, name in enumerate(headers, start=1):

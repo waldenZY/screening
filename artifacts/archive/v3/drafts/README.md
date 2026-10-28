@@ -4,5 +4,5 @@
 
 `p2_challenge_rubric_initial.md` 使用已经废弃的 `challenge_type/challenge_level` 协议。
 `screening_v3_p0_adaptive_proposal.md` 是未实施的 P0 Anchor/补采讨论稿，不代表当前采样规则。
-当前 Challenge 契约以 `artifacts/prompts/quality_challenge.md` 和
-`artifacts/docs/screening_v3_p2_adaptive.md` 为准。
+当前 Challenge 契约以 [V4 Challenge Prompt](../../../prompts/quality_challenge.md) 和
+[V4 P2 说明](../../../docs/screening_v4_p2_adaptive.md) 为准。

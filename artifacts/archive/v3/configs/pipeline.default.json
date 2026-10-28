@@ -1,0 +1,106 @@
+{
+  "config_version": 7,
+  "inputs": {
+    "source": "",
+    "taxonomy": "",
+    "risk_keywords": ""
+  },
+  "outputs": {
+    "output_root": "../../outputs_v3"
+  },
+  "prompts": {
+    "stage1": "../prompts/quality_stage1.md",
+    "challenge": "../prompts/quality_challenge.md",
+    "stage2": "../prompts/quality_stage2.md"
+  },
+  "quality": {
+    "workers": 10,
+    "max_retries": 20,
+    "sleep_seconds": 1.0
+  },
+  "index": {
+    "cache_root": null,
+    "batch_size": 50000,
+    "progress_every": 100000,
+    "sqlite_cache_mb": 1024,
+    "min_free_space_gb": 10.0,
+    "reserve_free_space_gb": 8.0,
+    "verify_full_source_hash": false
+  },
+  "logging": {
+    "level": "INFO"
+  },
+  "publication": {
+    "enabled": false,
+    "publish_root": null
+  },
+  "sampling": {
+    "p0": {
+      "l1_big_threshold": 3000,
+      "l2_per_l1_big": 3,
+      "l2_per_l1_small": 2,
+      "max_per_cluster": 5,
+      "fallback_pool_size": 10,
+      "mmr_lambda": 0.7
+    },
+    "p1": {
+      "target_n": 6000,
+      "probability_weights": {"high": 3, "mid": 2, "boundary": 1},
+      "frequency_weights": {"hot": 2, "warm": 2, "cold": 1},
+      "cold_boundary_floor": 1,
+      "mmr_lambda": 0.7
+    },
+    "p2": {
+      "target_n": 1000,
+      "candidate_source_shares": {
+        "complex": 0.3,
+        "multi_turn": 0.3,
+        "boundary": 0.2,
+        "exploration": 0.2
+      },
+      "minimum_complexity": "moderate",
+      "boundary_probability_cap": 0.5,
+      "soft_min_by_primary": {
+        "implicit_goal": 50,
+        "multi_constraint": 50,
+        "multi_turn_context": 50,
+        "long_tail_expr": 50,
+        "ambiguity": 50,
+        "multi_intent": 20,
+        "boundary": 5,
+        "cross_app": 1
+      },
+      "max_per_primary": 350,
+      "batch_size": 1000
+    },
+    "dedup": {
+      "normalization_rule": "unicode_whitespace_and_category_P_removed_v1",
+      "idf_rule": "all_indexed_rows_unique_character_2_3grams_log((N+1)/(df+1))+1_v1",
+      "rules_sha256": "53925f3af1c77cf27af01754a4da1a384f50312f60cccea8e70d8f9c7a62027a",
+      "candidate_jaccard_min": 0.45,
+      "weighted_jaccard_min": 0.8,
+      "edit_similarity_min": 0.9
+    }
+  },
+  "p1_supplement": {
+    "max_rounds": 3,
+    "default_pass_rate": 0.55,
+    "pass_rate_prior_strength": 10.0,
+    "minimum_pass_rate": 0.1,
+    "maximum_pass_rate": 0.95,
+    "safety_factor": 1.1
+  },
+  "p2_supplement": {
+    "max_rounds": 3,
+    "default_yield": 0.1,
+    "type_default_yield": 0.0125,
+    "prior_strength": 10.0,
+    "minimum_yield": 0.005,
+    "safety_factor": 1.1,
+    "exploration_share": 0.2,
+    "max_sampled": 20000,
+    "max_tail_sampled": 1000,
+    "tail_batch_size": 250,
+    "max_stalled_batches": 2
+  }
+}

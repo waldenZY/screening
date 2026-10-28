@@ -1,4 +1,4 @@
-"""Deterministic, sanitized run-level reporting for screening v3."""
+"""Deterministic, sanitized run-level reporting for screening v4."""
 
 from __future__ import annotations
 
@@ -10,30 +10,21 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from ..quality.stage1 import stage1_usable, category_fit
+from .eligibility import REASON_ORDER as EXECUTABLE_REASONS
 from ..candidate.p2_adaptive import P2_ALGORITHM, P2_SOURCE_NAMES
-from ..quality.two_stage import (
-    CHALLENGE_TYPES,
-    TASK_DIFFICULTIES,
-    STAGE2_FIELDS,
-    STAGE1_FIELDS,
-    STAGE1_BLOCKING_ISSUES,
-    EXECUTION_ISSUES,
-    stage1_issue_summary,
-    stage2_semantic_review,
-    validate_stage1_result,
-    validate_stage2_result,
-    stage1_passes,
-)
+from ..quality.runner import (CHALLENGE_TYPES, TASK_DIFFICULTIES, STAGE2_FIELDS, EXECUTION_ISSUES, stage2_semantic_review, validate_stage2_result)
+from ..quality.stage1 import (STAGE1_FIELDS, STAGE1_BLOCKING_ISSUES, stage1_issue_summary, validate_stage1_result, stage1_passes)
 from ..shared.json_io import JsonObject, write_json
 from ..shared.taxonomy import TaxonomyMappings
 from .screened import validate_screened_canonical_record
 
 
-RUN_REPORT_SCHEMA_VERSION = 10
+RUN_REPORT_SCHEMA_VERSION = 11
 RUN_REPORT_JSON = "screening_run_report.json"
 RUN_REPORT_MARKDOWN = "screening_run_report.md"
 SET_NAMES = ("P0", "P1", "P2")
-_CATEGORY_FIT_VALUES = ("exact", "partial", "mismatch")
+_CATEGORY_FIT_VALUES = ("exact", "partial", "mismatch", "not_provided")
 _SENSITIVE_KEYS = frozenset({"text", "raw_text", "target_query", "context_turns", "conversation_turns", "full_text"})
 
 
@@ -52,12 +43,7 @@ def _ratio(numerator: int, denominator: int) -> JsonObject:
 
 
 def _is_usable(stage1: Mapping[str, Any]) -> bool:
-    return (
-        stage1["semantic_completeness"] == "self_contained"
-        and stage1["intent_clarity"] == "clear"
-        and stage1["validity"] == "valid"
-        and not stage1["blocking_issues"]
-    )
+    return stage1_usable(stage1)
 
 
 def _l1_for_l2(taxonomy: TaxonomyMappings, l2_key: str) -> str:
@@ -87,11 +73,11 @@ def _empty_counts() -> dict[str, Any]:
 
 def _add_stage1(counts: dict[str, Any], result: Mapping[str, Any]) -> None:
     counts["stage1_evaluated"] += 1
-    counts["category_fit"][result["category_fit"]] += 1
+    counts["category_fit"][category_fit(result)] += 1
     usable = _is_usable(result)
     if usable:
         counts["usable_queries"] += 1
-        if result["category_fit"] == "exact":
+        if category_fit(result) == "exact":
             counts["category_exact_among_usable"] += 1
     if stage1_passes(result):
         counts["stage1_pass"] += 1
@@ -323,6 +309,7 @@ def build_run_report(
         final_quality = {"task_difficulty": Counter()}
         intent_labels: Counter[str] = Counter()
         executable_values: Counter[str] = Counter()
+        zero_reasons: Counter[str] = Counter()
         final_l2_counts: Counter[str] = Counter()
         for record in final_records[set_name]:
             validate_screened_canonical_record(record)
@@ -351,6 +338,7 @@ def build_run_report(
             final_quality["task_difficulty"][quality["task_difficulty"]] += 1
             intent_labels[quality["intent_label"]] += 1
             executable_values[str(record["delivery_labels"]["executable"])] += 1
+            zero_reasons.update(record["delivery_labels"]["executable_reasons"])
 
         target_scope = {
             key for key, value in p1_target_quotas.items() if int(value) > 0
@@ -482,6 +470,7 @@ def build_run_report(
             ),
             "p1_target_distribution_deviation": distribution_deviation,
             "waves": wave_rows,
+            "executable_zero_reasons": {reason: zero_reasons[reason] for reason in EXECUTABLE_REASONS},
             "final_quality_distribution": {
                 "task_difficulty": _distribution(
                     final_quality["task_difficulty"],
@@ -504,13 +493,13 @@ def build_run_report(
         ),
         "metric_definitions": {
             "query_usability_rate": (
-                "self_contained + clear + valid + no blocking issues / all completed stage1 candidates"
+                "direct or clarification text route / all completed stage1 candidates"
             ),
             "semantic_label_fit_rate": (
-                "category_fit=exact among self_contained + clear + valid + no blocking issues candidates"
+                "category_fit=exact among direct or clarification text route candidates"
             ),
             "stage1_admission_rate": (
-                "exact + self_contained + clear + valid + no blocking issues / all completed stage1 candidates"
+                "policy admitted / all completed stage1 candidates"
             ),
             "scope_l2_coverage_rate": (
                 "final covered L2 / reporting scope L2; P1 uses frozen quota L2, "
@@ -817,21 +806,32 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         if (not isinstance(blockers, Mapping) or set(blockers) != set(STAGE1_BLOCKING_ISSUES)
                 or any(type(count) is not int or not 0 <= count <= evaluated for count in blockers.values())):
             raise RunReportError(f"{set_name} Stage1 阻断统计非法；多原因计数允许重叠")
-        validity_counts = [set_report.get(key) for key in ("stage1_borderline", "stage1_invalid")]
-        if (any(type(count) is not int or count < 0 for count in validity_counts)
-                or sum(validity_counts) > evaluated - set_report.get("stage1_pass", 0)
-                or any(count > sum(validity_counts) for count in blockers.values())):
-            raise RunReportError(f"{set_name} Stage1 validity 统计不守恒")
+        routes = set_report.get("stage1_route_counts")
+        admitted_routes = set_report.get("stage1_admitted_route_counts")
+        if (not isinstance(routes, Mapping) or set(routes) != {"direct", "clarification", "excluded"}
+                or any(type(v) is not int or v < 0 for v in routes.values()) or sum(routes.values()) != evaluated
+                or not isinstance(admitted_routes, Mapping) or set(admitted_routes) != {"direct", "clarification"}
+                or any(type(v) is not int or not 0 <= v <= routes[k] for k, v in admitted_routes.items())
+                or sum(admitted_routes.values()) != set_report.get("stage1_pass", 0)):
+            raise RunReportError(f"{set_name} Stage1 route 统计不守恒")
+        if set_report.get("stage1_route_admission_rates") != {
+            route: _ratio(admitted_routes[route], routes[route]) for route in ("direct", "clarification")
+        }:
+            raise RunReportError(f"{set_name} Stage1 分类型准入率不一致")
         rejections = set_report.get("stage1_rejection_combinations")
         if (not isinstance(rejections, Mapping)
-                or any(not isinstance(key, str) or len(key.split("/")) != 4
+                or any(not isinstance(key, str) or not key or any(x not in STAGE1_BLOCKING_ISSUES for x in key.split("/"))
                        or type(count) is not int or count <= 0 for key, count in rejections.items())
                 or sum(rejections.values()) != evaluated - set_report.get("stage1_pass", 0)):
-            raise RunReportError(f"{set_name} Stage1 四标签拒绝组合不守恒")
+            raise RunReportError(f"{set_name} Stage1 策略拒绝原因不守恒")
         review = set_report.get("stage2_semantic_review")
         if not isinstance(review, Mapping):
             raise RunReportError(f"{set_name} 缺少 Stage2 语义问题复核信号")
         final_count = set_report["final_count"]
+        zero_reasons = set_report.get("executable_zero_reasons")
+        if (not isinstance(zero_reasons, Mapping) or set(zero_reasons) != set(EXECUTABLE_REASONS)
+                or any(type(v) is not int or not 0 <= v <= final_count for v in zero_reasons.values())):
+            raise RunReportError(f"{set_name} executable 原因统计非法")
         issue_count = review.get("with_issues")
         issue_counts = review.get("by_issue")
         if (review.get("evaluated_final") != final_count or type(issue_count) is not int
@@ -920,7 +920,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
     """Render the validated JSON report as a presentation-friendly Markdown file."""
     validate_run_report(report)
     lines = [
-        "# Screening v3 批跑报告",
+        "# Screening v4 批跑报告",
         "",
         f"> Run ID：`{_cell(report['run_id'])}`  ",
         "> 语义标签一致率由 Stage1 LLM 判断得到，是自动评估指标，不等同于人工金标准确率。",
@@ -947,9 +947,9 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             "",
             "## 指标口径",
             "",
-            "- Query 基础可用率：Stage1 候选中同时满足 self_contained、clear、valid 且无阻断原因的比例。",
+            "- Query 基础可用率：Stage1 候选中可进入直接测试或澄清测试的比例，独立于类别核验。",
             "- 语义标签一致率：基础可用 Query 中 category_fit=exact 的比例。",
-            "- Stage1 准入率：同时满足 exact、self_contained、clear、valid 且无阻断原因的比例。",
+            "- Stage1 准入率：冻结筛选策略允许纳入的样本占全部 Stage1 候选的比例。",
             "- P1 的目标范围为冻结配额大于 0 的 L2；P0/P2 的目标范围为实际进入 Stage1 的 L2。",
             "- 最终集 category_fit=exact 为准入约束，不作为独立准确率结论。",
         ]
@@ -1049,10 +1049,11 @@ def render_run_report(report: Mapping[str, Any]) -> str:
                 "### 质量与难度摘要",
                 "",
                 f"- Stage1 category_fit：exact={category['exact']}，partial={category['partial']}，mismatch={category['mismatch']}。",
-                f"- Stage1 阻断原因（多原因计数允许重叠）：{json.dumps(value['stage1_blocking_counts'], ensure_ascii=False, sort_keys=True)}；borderline={value['stage1_borderline']}，invalid={value['stage1_invalid']}。",
+                f"- Stage1 阻断原因（多原因计数允许重叠）：{json.dumps(value['stage1_blocking_counts'], ensure_ascii=False, sort_keys=True)}；routes={json.dumps(value['stage1_route_counts'], ensure_ascii=False, sort_keys=True)}。",
                 f"- Stage2 语义问题复核信号：{value['stage2_semantic_review']['with_issues']}/{value['stage2_semantic_review']['evaluated_final']}，比例={value['stage2_semantic_review']['rate']}；分类={json.dumps(value['stage2_semantic_review']['by_issue'], ensure_ascii=False, sort_keys=True)}。不是人工真值准确率。",
                 f"- Stage2 task_difficulty：{json.dumps(value['final_quality_distribution']['task_difficulty'], ensure_ascii=False, sort_keys=True)}。",
                 f"- intent_label：{json.dumps(value['final_quality_distribution']['intent_label'], ensure_ascii=False, sort_keys=True)}。",
+                f"- executable 置零原因：{json.dumps(value['executable_zero_reasons'], ensure_ascii=False, sort_keys=True)}。",
                 f"- executable：{json.dumps(value['final_quality_distribution']['executable'], ensure_ascii=False, sort_keys=True)}。",
             ]
         )
