@@ -1,9 +1,9 @@
 # P2 Adaptive 技术方案（已实施）
 
 > 所属产品版本：Screening V4
-> Pipeline 配置版本：`config_version=8`
+> Pipeline 配置版本：`config_version=10`
 > P2 算法标识：`adaptive_challenge_batches_2`
-> 文档状态：当前已实施口径，核对于 2026-10-28；默认值以 [pipeline.default.json](../config/pipeline.default.json) 为准
+> 文档状态：当前已实施口径，核对于 2026-10-29；默认值以 [pipeline.default.json](../config/pipeline.default.json) 为准
 
 ## 1. 目标
 
@@ -165,8 +165,8 @@ long_tail_expr
 - `adaptive_challenge_batches_2` 同时进入总 run contract 和 P012 构建契约，旧配置和旧检查点不会按新配额语义续跑。
 - 中断恢复复用已完成结果，不重复标注调用；启动仍有一次 LLM 预检。总状态为 `failed` 时须显式指定兼容的原 `--run-id`，其他状态的自动选择规则见 [配置手册](screening_pipeline_configuration_v4.md#23-严格续跑条件)。
 - 总预算、尾部预算和连续无进展批次数进入检查点，续跑不会重置。
-- `screened_schema_version=9`：P2 保存三个 Challenge 字段和 `challenge.challenge_task_id`；P0/P1 的 `challenge` 为 `null`。质量契约为11，报告契约为11，labeled_v6为15字段；其他版本见 [文档索引](README.md)。
-- P2 允许 `supplement_wave`；采样配额算法不因 v6 明细改变，Challenge 输入和缓存新增 Stage1 特征。
+- `screened_schema_version=11`：P2 保存三个 Challenge 字段和 `challenge.challenge_task_id`；P0/P1 的 `challenge` 为 `null`。质量契约为13，报告契约为13，labeled_v8为14字段；其他版本见 [文档索引](README.md)。
+- P2 允许 `supplement_wave`；采样配额算法不因 v8 明细改变，Challenge 输入和缓存新增 Stage1 特征。
 - P2 汇总写入 `P2/adaptive_summary.json`，总报告写入 `p2_diagnostics`。
 - 去重数值复验兼容 `1e-12` 以内的 0/1 边界误差，不放宽确认阈值、不改写旧审计或检查点；不升级规则或数据契约。
 
@@ -181,12 +181,12 @@ long_tail_expr
 - Judge PASS 但未入集的数量；
 - 最终数量、`target_gap` 和候选耗尽状态；
 - 总抽样与尾部预算的已用、剩余、批次上限、无进展批数和预算停止原因；
-- Challenge 标签与 Stage2 issue 的组合诊断。
+- 如显式启用隔离模块，可从独立附加结果分析 Challenge 与语义复核信号；默认主报告不包含此项。
 
 ## 9. 实现位置
 
 - `screening/candidate/p2_adaptive.py`：候选池、分层抽样、后验产出率和最终选择；
-- `screening/quality/runner.py`：Stage1/Challenge/Stage2 统一缓存与重试；
+- `screening/quality/runner.py`：Stage1/Challenge 及显式启用的附加标注共用缓存与重试；
 - `screening/pipeline/orchestrator.py`：批次、补采、checkpoint 和最终重选；
 - `screening/delivery/screened.py`：canonical Challenge 契约；
 - `screening/delivery/report.py`：P2 诊断；

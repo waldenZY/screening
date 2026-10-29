@@ -9,7 +9,8 @@ from typing import Any
 
 REVIEW_COLUMNS = (
     "source_line", "target_query", "L1", "L2", "stage1_pass", "status",
-    "route", "category_status", "category_fit", "screening_reasons", "features", "policy_sha256",
+    "route", "admission_group", "intent_label", "intent_reason", "open_points", "dependencies",
+    "category_status", "category_fit", "screening_reasons", "features", "policy_sha256",
 )
 DETAIL_COLUMNS = (
     "error_type", "error_message", "elapsed_ms", "first_token_latency_ms", "full_latency_ms",
@@ -75,10 +76,13 @@ def write_results_xlsx(path: Path, results: list[dict[str, Any]]) -> None:
         supplied = source.get("candidate_category") or {}
         error = result["error"] or {}
         decision = result["stage1_pass"]
+        features = result.get("features") or {}
         rows.append([
             result["source_line"], source.get("target_query"), source.get("L1", supplied.get("L1")), source.get("L2", supplied.get("L2")),
             None if decision is None else int(decision), result["status"],
-            result.get("route"), category.get("status"), category.get("fit"),
+            result.get("route"), result.get("admission_group"), features.get("intent_label"),
+            features.get("intent_reason"), features.get("open_points"), features.get("dependencies"),
+            category.get("status"), category.get("fit"),
             screening.get("reasons"), result.get("features"), screening.get("policy_sha256"),
             *(source.get(key) for key in source_columns),
             error.get("type"), error.get("message"), result["elapsed_ms"],
@@ -110,6 +114,7 @@ def write_results_xlsx(path: Path, results: list[dict[str, Any]]) -> None:
         "source_line": 12, "target_query": 48, "L1": 16, "L2": 18, "stage1_pass": 14,
         "status": 20, "category_fit": 18, "category_status": 20, "route": 20,
         "features": 65, "screening_reasons": 35, "context_text": 48, "text": 48,
+        "intent_reason": 48, "open_points": 45, "dependencies": 55, "admission_group": 32,
         "raw_response": 55, "stage1_input": 55, "source_text": 48, "error_message": 48,
     }
     for index, name in enumerate(headers, start=1):

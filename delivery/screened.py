@@ -10,11 +10,11 @@ from typing import Any
 
 from ..candidate.contract import validate_canonical_candidate
 from ..shared.json_io import JsonObject
-from ..quality.runner import (CHALLENGE_FIELDS, STAGE2_FIELDS, validate_challenge_result, validate_stage2_result)
-from ..quality.stage1 import (STAGE1_FIELDS, stage1_passes, validate_stage1_result)
+from ..quality.runner import CHALLENGE_FIELDS, validate_challenge_result
+from ..quality.stage1 import (STAGE1_FIELDS, stage1_passes, validate_stage1_result, mapped_intent_label)
 
 
-SCREENED_CANONICAL_SCHEMA_VERSION = 9
+SCREENED_CANONICAL_SCHEMA_VERSION = 11
 SET_NAMES = frozenset({"P0", "P1", "P2"})
 SELECTION_ORIGINS = frozenset({"initial_wave", "supplement_wave"})
 _HASH = re.compile(r"[0-9a-f]{64}")
@@ -35,7 +35,6 @@ def build_screened_canonical_record(
     set_name: str,
     candidate: JsonObject,
     stage1_result: Mapping[str, Any],
-    stage2_result: Mapping[str, Any],
     delivery_labels: Mapping[str, Any],
     *,
     challenge_result: Mapping[str, Any] | None = None,
@@ -44,7 +43,6 @@ def build_screened_canonical_record(
     round_id: int,
     candidate_task_id: str,
     stage1_task_id: str,
-    stage2_task_id: str,
 ) -> JsonObject:
     """Build and independently validate one authoritative screened record."""
     validate_canonical_candidate(candidate)
@@ -61,7 +59,7 @@ def build_screened_canonical_record(
         "candidate": screened_candidate,
         "quality": {
             **validate_stage1_result(dict(stage1_result)),
-            **validate_stage2_result(dict(stage2_result)),
+            "intent_label": mapped_intent_label(stage1_result["stage1"]["features"]),
         },
         "delivery_labels": dict(delivery_labels),
         "challenge": (
@@ -77,7 +75,6 @@ def build_screened_canonical_record(
             "round_id": round_id,
             "candidate_task_id": candidate_task_id,
             "stage1_task_id": stage1_task_id,
-            "stage2_task_id": stage2_task_id,
         },
     }
     validate_screened_canonical_record(record)
@@ -121,19 +118,20 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
         raise ScreenedCanonicalError("P0/P1 challenge 必须为 null")
 
     quality = record.get("quality")
-    if not isinstance(quality, Mapping) or set(quality) != STAGE1_FIELDS | STAGE2_FIELDS:
+    if not isinstance(quality, Mapping) or set(quality) != STAGE1_FIELDS | {"intent_label"}:
         raise ScreenedCanonicalError("screened canonical quality 字段不一致")
-    from ..quality.runner import stage2_quality_input
-    stage1 = validate_stage1_result({key: quality[key] for key in STAGE1_FIELDS}, stage2_quality_input(candidate)["conversation_turns"])
+    stage1 = validate_stage1_result({key: quality[key] for key in STAGE1_FIELDS})
     if (not stage1["stage1"]["policy"]["require_category_exact"]
             or stage1["stage1"]["category"] != {"status": "reviewed", "fit": "exact"}
             or not stage1_passes(stage1)):
         raise ScreenedCanonicalError("screened canonical 包含未通过第一阶段的样本")
-    stage2 = validate_stage2_result({key: quality[key] for key in STAGE2_FIELDS})
+    intent = mapped_intent_label(stage1["stage1"]["features"])
+    if quality["intent_label"] != intent:
+        raise ScreenedCanonicalError("quality intent_label 必须映射自 Stage1")
     labels = record.get("delivery_labels")
     if (not isinstance(labels, Mapping)
             or set(labels) != {"intent_label", "executable", "executable_reasons"}
-            or labels.get("intent_label") != stage2["intent_label"]
+            or labels.get("intent_label") != intent
             or type(labels.get("executable")) is not int
             or labels["executable"] not in (0, 1)):
         raise ScreenedCanonicalError("screened canonical 下游标签非法")
@@ -145,7 +143,7 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
         raise ScreenedCanonicalError("executable 原因不一致")
     selection = record.get("selection")
     selection_fields = {
-        "origin", "round_id", "candidate_task_id", "stage1_task_id", "stage2_task_id"
+        "origin", "round_id", "candidate_task_id", "stage1_task_id"
     }
     if not isinstance(selection, Mapping) or set(selection) != selection_fields:
         raise ScreenedCanonicalError("screened canonical selection 字段不一致")
@@ -159,7 +157,7 @@ def validate_screened_canonical_record(record: Mapping[str, Any]) -> None:
         raise ScreenedCanonicalError("selection origin 与 round_id 不一致")
     if set_name == "P0" and origin != "initial_wave":
         raise ScreenedCanonicalError("P0 不能包含补采样本")
-    for key in ("candidate_task_id", "stage1_task_id", "stage2_task_id"):
+    for key in ("candidate_task_id", "stage1_task_id"):
         value = selection.get(key)
         if not isinstance(value, str) or not value:
             raise ScreenedCanonicalError(f"selection.{key} 不能为空")

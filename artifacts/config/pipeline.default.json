@@ -1,5 +1,5 @@
 {
-  "config_version": 8,
+  "config_version": 10,
   "inputs": {
     "source": "",
     "taxonomy": "",
@@ -11,8 +11,11 @@
   "prompts": {
     "stage1": "../prompts/quality_stage1.md",
     "challenge": "../prompts/quality_challenge.md",
-    "stage2": "../prompts/quality_stage2.md",
     "category": "../prompts/quality_stage1_category.md"
+  },
+  "optional_stage2": {
+    "enabled": false,
+    "prompt": null
   },
   "quality": {
     "workers": 10,
@@ -113,7 +116,7 @@
     "max_stalled_batches": 2
   },
   "screening_policy": {
-    "version": 1,
+    "version": 2,
     "allowed_routes": [
       "direct",
       "clarification"

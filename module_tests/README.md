@@ -44,4 +44,10 @@ run.json 保存模式、输入与策略哈希、版本、计数和非敏感模�
 
 route 是文本类型，stage1_pass 含完整策略要求；工程失败时二者为 null。类别阶段失败仍保留成功特征。Excel 的1/0/空白分别表示准入/未准入/工程未判定；query及响应按文本保存，不执行公式。XLSX长单元格截短，完整内容以JSONL为准。
 
+features 严格包含 intent_label、intent_reason、open_points、dependencies。类型为 task/dialogue/undetermined；最终交付由 Stage1 映射 task/qa，Stage2 不再判断类型。dialogue 即使有 open_points 仍走 direct；task 的必要澄清才走 clarification。dependencies 每项只含 source、description，用户待定事项不重复写作依赖。
+
+JSONL 保存 admission_group，Excel 分列展示类型、原因、澄清点、依赖和五种分组。统计包括五组准入结果、目标类型、文本路线和全部阻断原因；只有成功完成的判断参与五组统计，工程失败单列。无类别参考集默认未准入时，仍可从文本类型和路线观察识别效果。重筛校验当前四字段特征及策略版本2；旧七字段观察需重新识别，不能自动补造新字段。
+
 退出码：0全部完成（可含正常排除）；2有单条工程失败；1配置、目录或文件错误；130用户中断。无人工真值，不报告准确率。这里的文本筛选不认证正式用例已就绪，正式测试仍需构建环境、判据和证据。
+
+生产链路 Stage2 默认关闭，Stage1 独立复测始终不依赖该隔离模块。正式交付统一为 labeled_v8 的14字段，不包含难度；本工具的审阅 JSONL/Excel 保留自身明细，不等同于正式交付文件。可选模块及专用测试见 [说明](../quality/optional_stage2/README.md)。

@@ -13,14 +13,14 @@ from typing import Any
 from ..quality.stage1 import stage1_usable, category_fit
 from .eligibility import REASON_ORDER as EXECUTABLE_REASONS
 from ..candidate.p2_adaptive import P2_ALGORITHM, P2_SOURCE_NAMES
-from ..quality.runner import (CHALLENGE_TYPES, TASK_DIFFICULTIES, STAGE2_FIELDS, EXECUTION_ISSUES, stage2_semantic_review, validate_stage2_result)
-from ..quality.stage1 import (STAGE1_FIELDS, STAGE1_BLOCKING_ISSUES, stage1_issue_summary, validate_stage1_result, stage1_passes)
+from ..quality.runner import CHALLENGE_TYPES
+from ..quality.stage1 import (STAGE1_FIELDS, STAGE1_BLOCKING_ISSUES, ADMISSION_GROUPS, INTENT_LABELS, stage1_issue_summary, validate_stage1_result, stage1_passes)
 from ..shared.json_io import JsonObject, write_json
 from ..shared.taxonomy import TaxonomyMappings
 from .screened import validate_screened_canonical_record
 
 
-RUN_REPORT_SCHEMA_VERSION = 11
+RUN_REPORT_SCHEMA_VERSION = 13
 RUN_REPORT_JSON = "screening_run_report.json"
 RUN_REPORT_MARKDOWN = "screening_run_report.md"
 SET_NAMES = ("P0", "P1", "P2")
@@ -306,7 +306,6 @@ def build_run_report(
             _add_stage1(wave_counts[round_id], result)
 
         final_round_counts: Counter[int] = Counter()
-        final_quality = {"task_difficulty": Counter()}
         intent_labels: Counter[str] = Counter()
         executable_values: Counter[str] = Counter()
         zero_reasons: Counter[str] = Counter()
@@ -332,10 +331,6 @@ def build_run_report(
                     for key in STAGE1_FIELDS
                 }
             )
-            validate_stage2_result(
-                {key: quality[key] for key in STAGE2_FIELDS},
-            )
-            final_quality["task_difficulty"][quality["task_difficulty"]] += 1
             intent_labels[quality["intent_label"]] += 1
             executable_values[str(record["delivery_labels"]["executable"])] += 1
             zero_reasons.update(record["delivery_labels"]["executable_reasons"])
@@ -452,10 +447,6 @@ def build_run_report(
                 stage1_results[candidate["source_identity_sha256"]]
                 for candidate in evaluated_candidates[set_name]
             ]),
-            "stage2_semantic_review": stage2_semantic_review([
-                {key: record["quality"][key] for key in STAGE2_FIELDS}
-                for record in final_records[set_name]
-            ]),
             "taxonomy_l1_coverage_rate": _ratio(
                 len(covered_l1), len(taxonomy.l1_order)
             ),
@@ -472,10 +463,6 @@ def build_run_report(
             "waves": wave_rows,
             "executable_zero_reasons": {reason: zero_reasons[reason] for reason in EXECUTABLE_REASONS},
             "final_quality_distribution": {
-                "task_difficulty": _distribution(
-                    final_quality["task_difficulty"],
-                    sorted(TASK_DIFFICULTIES),
-                ),
                 "intent_label": _distribution(intent_labels, ("task", "qa")),
                 "executable": _distribution(executable_values, ("0", "1")),
             },
@@ -803,6 +790,16 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
             raise RunReportError(f"{set_name} 报告必须是对象")
         blockers = set_report.get("stage1_blocking_counts")
         evaluated = set_report.get("stage1_evaluated", 0)
+        groups = set_report.get("stage1_admission_groups")
+        intents = set_report.get("stage1_intent_counts")
+        if (not isinstance(groups, Mapping) or set(groups) != set(ADMISSION_GROUPS)
+                or any(type(v) is not int or v < 0 for v in groups.values())
+                or sum(groups.values()) != evaluated
+                or groups["excluded"] != evaluated - set_report.get("stage1_pass", 0)
+                or not isinstance(intents, Mapping) or set(intents) != INTENT_LABELS
+                or any(type(v) is not int or v < 0 for v in intents.values())
+                or sum(intents.values()) != evaluated):
+            raise RunReportError(f"{set_name} Stage1 目标类型或五组统计不守恒")
         if (not isinstance(blockers, Mapping) or set(blockers) != set(STAGE1_BLOCKING_ISSUES)
                 or any(type(count) is not int or not 0 <= count <= evaluated for count in blockers.values())):
             raise RunReportError(f"{set_name} Stage1 阻断统计非法；多原因计数允许重叠")
@@ -818,29 +815,20 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
             route: _ratio(admitted_routes[route], routes[route]) for route in ("direct", "clarification")
         }:
             raise RunReportError(f"{set_name} Stage1 分类型准入率不一致")
+        if (groups["task_clarification"] != admitted_routes["clarification"]
+                or sum(groups[k] for k in ("dialogue_without_open_points", "dialogue_with_open_points", "task_direct")) != admitted_routes["direct"]):
+            raise RunReportError(f"{set_name} Stage1 五组与路线统计不一致")
         rejections = set_report.get("stage1_rejection_combinations")
         if (not isinstance(rejections, Mapping)
                 or any(not isinstance(key, str) or not key or any(x not in STAGE1_BLOCKING_ISSUES for x in key.split("/"))
                        or type(count) is not int or count <= 0 for key, count in rejections.items())
                 or sum(rejections.values()) != evaluated - set_report.get("stage1_pass", 0)):
             raise RunReportError(f"{set_name} Stage1 策略拒绝原因不守恒")
-        review = set_report.get("stage2_semantic_review")
-        if not isinstance(review, Mapping):
-            raise RunReportError(f"{set_name} 缺少 Stage2 语义问题复核信号")
         final_count = set_report["final_count"]
         zero_reasons = set_report.get("executable_zero_reasons")
         if (not isinstance(zero_reasons, Mapping) or set(zero_reasons) != set(EXECUTABLE_REASONS)
                 or any(type(v) is not int or not 0 <= v <= final_count for v in zero_reasons.values())):
             raise RunReportError(f"{set_name} executable 原因统计非法")
-        issue_count = review.get("with_issues")
-        issue_counts = review.get("by_issue")
-        if (review.get("evaluated_final") != final_count or type(issue_count) is not int
-                or not 0 <= issue_count <= final_count
-                or not isinstance(issue_counts, Mapping) or set(issue_counts) != set(EXECUTION_ISSUES)
-                or any(type(count) is not int or not 0 <= count <= issue_count for count in issue_counts.values())
-                or sum(issue_counts.values()) < issue_count
-                or review.get("rate") != (round(issue_count / final_count, 6) if final_count else None)):
-            raise RunReportError(f"{set_name} Stage2 语义问题复核统计不守恒")
         for metric in (
             "query_usability_rate",
             "semantic_label_fit_rate",
@@ -857,11 +845,10 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
             raise RunReportError(f"{set_name} 不得包含 P1 配额完成率")
         quality_distribution = set_report.get("final_quality_distribution")
         if not isinstance(quality_distribution, Mapping) or set(quality_distribution) != {
-            "task_difficulty", "intent_label", "executable"
+            "intent_label", "executable"
         }:
             raise RunReportError(f"{set_name} 最终标签分布非法")
         for field, expected_keys in (
-            ("task_difficulty", TASK_DIFFICULTIES),
             ("intent_label", {"task", "qa"}),
             ("executable", {"0", "1"}),
         ):
@@ -1046,12 +1033,11 @@ def render_run_report(report: Mapping[str, Any]) -> str:
         lines.extend(
             [
                 "",
-                "### 质量与难度摘要",
+                "### 质量摘要",
                 "",
                 f"- Stage1 category_fit：exact={category['exact']}，partial={category['partial']}，mismatch={category['mismatch']}。",
+                f"- Stage1 五组准入结果：{json.dumps(value['stage1_admission_groups'], ensure_ascii=False, sort_keys=True)}；目标类型={json.dumps(value['stage1_intent_counts'], ensure_ascii=False, sort_keys=True)}。",
                 f"- Stage1 阻断原因（多原因计数允许重叠）：{json.dumps(value['stage1_blocking_counts'], ensure_ascii=False, sort_keys=True)}；routes={json.dumps(value['stage1_route_counts'], ensure_ascii=False, sort_keys=True)}。",
-                f"- Stage2 语义问题复核信号：{value['stage2_semantic_review']['with_issues']}/{value['stage2_semantic_review']['evaluated_final']}，比例={value['stage2_semantic_review']['rate']}；分类={json.dumps(value['stage2_semantic_review']['by_issue'], ensure_ascii=False, sort_keys=True)}。不是人工真值准确率。",
-                f"- Stage2 task_difficulty：{json.dumps(value['final_quality_distribution']['task_difficulty'], ensure_ascii=False, sort_keys=True)}。",
                 f"- intent_label：{json.dumps(value['final_quality_distribution']['intent_label'], ensure_ascii=False, sort_keys=True)}。",
                 f"- executable 置零原因：{json.dumps(value['executable_zero_reasons'], ensure_ascii=False, sort_keys=True)}。",
                 f"- executable：{json.dumps(value['final_quality_distribution']['executable'], ensure_ascii=False, sort_keys=True)}。",

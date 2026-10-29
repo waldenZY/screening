@@ -1,8 +1,8 @@
 # Screening v4 配置使用手册
 
 > 适用入口：`python -m screening.run_pipeline`
-> Pipeline 配置版本：`config_version=8`
-> 核对日期：2026-10-28；默认值以 [pipeline.default.json](../config/pipeline.default.json) 为准
+> Pipeline 配置版本：`config_version=10`
+> 核对日期：2026-10-29；默认值以 [pipeline.default.json](../config/pipeline.default.json) 为准
 
 ## 1. 文档用途
 
@@ -99,12 +99,13 @@ screening/artifacts/config/pipeline.default.json
 
 ```json
 {
-  "config_version": 8,
+  "config_version": 10,
   "inputs": {},
   "outputs": {},
   "prompts": {},
   "quality": {},
   "screening_policy": {},
+  "optional_stage2": {"enabled": false, "prompt": null},
   "index": {},
   "logging": {},
   "publication": {},
@@ -186,9 +187,9 @@ Excel 格式要求：
 | 定时开关机 | 高 |
 | 显示重绘刷新区域 | 低 |
 
-词表在 Stage2 之后用于确定性计算 `executable`。程序按 `shared/risk_keywords.py` 的前后缀规则和特殊映射提取核心词，同时保留原词，对最后一轮 `target_query` 作子串匹配。例如“定时开关机”生成“开关机”“关机”和原词，“请关机”即可命中。匹配不做语义推断、否定识别、词边界检查或大小写转换；维护词条时须考虑核心词过宽可能带来的命中。
+词表在成员冻结后用于确定性计算 `executable`。程序按 `shared/risk_keywords.py` 的前后缀规则和特殊映射提取核心词，同时保留原词，对最后一轮 `target_query` 作子串匹配。例如“定时开关机”生成“开关机”“关机”和原词，“请关机”即可命中。匹配不做语义推断、否定识别、词边界检查或大小写转换；维护词条时须考虑核心词过宽可能带来的命中。
 
-任一风险级别的词条命中均令 `executable=0`，样本仍保留和导出。词表不参与 Stage1 准入或 Stage2 模型标注，也不改变 P0/P1/P2 成员。`executable=0` 还可能来自多轮、短目标轮或 Stage1 只适合澄清；未命中词表不保证该字段为 `1`，完整口径见 [字段字典](screening_labeled_v6_field_dictionary.md#executable-口径)。
+任一风险级别的词条命中均令 `executable=0`，样本仍保留和导出。词表不参与 Stage1 准入或 Stage2 模型标注，也不改变 P0/P1/P2 成员。`executable=0` 还可能来自多轮、短目标轮或 Stage1 只适合澄清；未命中词表不保证该字段为 `1`，完整口径见 [字段字典](screening_labeled_v8_field_dictionary.md#executable-口径)。
 
 文件缺失或格式错误在启动阶段报错。run 根目录的 `risk_keywords.json` 保存词条、核心词、规则版本、`source_sha256` 和 `rules_sha256`；这些哈希进入 manifest 的冻结契约。续跑时须保持词表内容一致，修改原 Excel 内容需要新 run。发布复验校验快照和哈希，并从冻结快照重算 `executable`。
 
@@ -218,17 +219,19 @@ Excel 格式要求：
 
 ### 4.6 Prompts 与筛选策略
 
-`prompts.stage1` 指向特征识别 Prompt，新增必填 `prompts.category` 指向独立类别 Prompt，默认 `../prompts/quality_stage1_category.md`。保留 challenge、stage2。CLI 可用 `--category-prompt` 临时覆盖；四份 Prompt 均需唯一 `{CANDIDATE_JSON}`，内容进入冻结契约。
+`prompts` 仅含 stage1、category、challenge 三项；category 默认 `../prompts/quality_stage1_category.md`。CLI 可用 --category-prompt 临时覆盖。默认三份 Prompt 均需唯一 `{CANDIDATE_JSON}`，内容进入冻结契约；Stage2 不属于必填 Prompt。
 
 顶层必填 `screening_policy`：
 
 ```json
-{"version":1,"allowed_routes":["direct","clarification"],"require_category_exact":true,"runtime_capabilities":["public_information","system_app_state","current_screen_media","identified_device_resource"]}
+{"version":2,"allowed_routes":["direct","clarification"],"require_category_exact":true,"runtime_capabilities":["public_information","system_app_state","current_screen_media","identified_device_resource"]}
 ```
 
 只允许列出的路由与运行时能力，无重复项。生产必须 require_category_exact=true；独立参考重筛可以设为false，但不等于具备生产类别。修改策略或环境约定需新 run；无模型重筛见 [模块说明](../../module_tests/README.md)。模型请求不会接收策略。
 
-## 5. `quality`：Stage1、Challenge、Stage2 执行参数
+策略版本2中，dialogue 有澄清点仍走 direct；task 有必要澄清才走 clarification。undetermined、必要材料/背景缺失、未知依赖或未配置的运行时能力优先 excluded。类别排除不改写文本路线。Stage1 严格输出 intent_label、intent_reason、open_points、dependencies，可选 Stage2 启用时只在附加文件输出难度和语义障碍；交付 intent_label 唯一映射自 Stage1，dialogue→qa、task→task。
+
+## 5. `quality`：模型请求执行参数
 
 ### 5.1 `quality.workers`
 
@@ -264,7 +267,7 @@ Excel 格式要求：
 | --- | --- |
 | 类型/范围 | 大于等于 `0` 的数值 |
 | 默认值 | `1.0` |
-| 作用 | 每次 Stage1/Challenge/Stage2 实际 LLM 请求前的等待时间 |
+| 作用 | 每次 已启用标注阶段的实际 LLM 请求前的等待时间 |
 | 是否改变 run | 是 |
 
 调大可降低服务压力但会增加耗时；设为 `0` 吞吐最高，但只适合稳定且容量充足的本地服务。
@@ -395,9 +398,9 @@ DEBUG
 发布路径固定为：
 
 ```text
-<publish_root>/P0-冒烟集/P0_smoke_set_v6_labeled.jsonl
-<publish_root>/P1-基准集/P1_benchmark_set_v6_labeled.jsonl
-<publish_root>/P2-对抗集/P2_adversarial_set_v6_labeled.jsonl
+<publish_root>/P0-冒烟集/P0_smoke_set_v8_labeled.jsonl
+<publish_root>/P1-基准集/P1_benchmark_set_v8_labeled.jsonl
+<publish_root>/P2-对抗集/P2_adversarial_set_v8_labeled.jsonl
 ```
 
 不存在则复制；同名同哈希则复用；同名不同内容则该分支发布失败，其他分支继续。发布使用临时文件、哈希核对、原子替换，并在捕获写入异常时尝试回滚本次事务。已成功发布的其他分支不回滚；最终全量复验失败也不撤销之前的独立发布文件。该机制不保证进程被强制终止或机器断电后的事务恢复。
@@ -577,7 +580,7 @@ Copy-Item screening/artifacts/config/llm_config.example.json screening/artifacts
 | `enable_thinking` | 布尔值 | 传给服务端的思考开关 | 是 |
 | `skip_special_tokens` | 布尔值 | 传给服务端的特殊 token 处理开关 | 是 |
 
-Stage1、Challenge、Stage2 都输出短 JSON，通常不需要非常大的 `max_tokens`。具体下限应先用当前
+核心标注及可选 Stage2 均输出短 JSON，通常不需要非常大的 `max_tokens`。具体下限应先用当前
 服务试跑确认；调得过小可能截断 JSON，调得过大则增加异常长响应的空间。
 
 当前客户端没有显式发送 temperature、top_p 或 seed，结果是否完全确定取决于服务端
@@ -590,7 +593,7 @@ Stage1、Challenge、Stage2 都输出短 JSON，通常不需要非常大的 `max
 | cluster 文件或路径 | 是 | source snapshot 包含文件状态和路径 |
 | taxonomy 内容 | 是 | 使用文件 SHA-256 |
 | 风险关键词 Excel 内容 | 是 | 使用文件和规范化规则 SHA-256；内容变化需新 run |
-| Stage1/Challenge/Stage2 Prompt 内容 | 是 | 使用内容 SHA-256 |
+| 已启用的 Prompt 内容及附加标注开关 | 是 | 使用启用状态与内容 SHA-256；禁用时不读取附加 Prompt |
 | P0/P1/P2 采样参数 | 是 | 会改变候选成员 |
 | P1 补采参数 | 是 | 会改变请求量和成员 |
 | P2 补采参数 | 是 | 会改变请求路由和成员 |
@@ -620,7 +623,8 @@ python -m screening.run_pipeline --help
 | `--taxonomy` | `inputs.taxonomy` |
 | `--risk-keywords` | `inputs.risk_keywords` |
 | `--output-root` | `outputs.output_root` |
-| `--stage1-prompt` / `--challenge-prompt` / `--stage2-prompt` | `prompts.stage1/challenge/stage2` |
+| `--stage1-prompt` / `--challenge-prompt` | `prompts.stage1/challenge` |
+| `--enable-stage2` / `--disable-stage2` / `--stage2-prompt` | `optional_stage2.enabled/prompt`；指定 Prompt 不隐式启用 |
 | `--workers` | `quality.workers` |
 | `--max-retries` | `quality.max_retries` |
 | `--sleep` | `quality.sleep_seconds` |
@@ -666,7 +670,6 @@ P0/P1/P2 的 dedup_audit.jsonl
 P0/P1/P2 的 branch_audit.json
 P1/supplement_summary.json
 P2/adaptive_summary.json
-quality/stage2_results.jsonl
 ```
 
 ### 17.2 小规模试跑
@@ -750,7 +753,7 @@ tail -f screening.log
 - [ ] `output_root` 与 `cache_root` 有足够空间；
 - [ ] `llm_config.local.json` 已填写且未提交 Git；
 - [ ] LLM 服务允许当前 `workers` 并发；
-- [ ] Stage1/Challenge/Stage2 Prompt 在批跑期间不会修改；
+- [ ] 已启用的 Prompt 在批跑期间不会修改；
 - [ ] P1/P2 目标、P2 类型上下限和来源份额符合本次任务；
 - [ ] 默认发布关闭，或已确认 `publish_root`；
 - [ ] 同一配置没有另一个运行进程。
@@ -762,3 +765,9 @@ tail -f screening.log
 - [ ] 直接执行相同命令，不增加 `--new-run`；
 - [ ] 总状态为 `failed` 时显式指定原 `--run-id`；
 - [ ] 日志中的 run ID 与原 run 一致。
+
+## 可选 Stage2 开关
+
+顶层必填 `optional_stage2`，默认 `{"enabled":false,"prompt":null}`。禁用时不读取或校验附加 Prompt，不导入模块、不创建 Stage2 账本/检查点，也不以 Stage2 完成作为导出或发布条件。启用时 prompt=null 使用 `quality/optional_stage2/prompt.md`；自定义路径相对配置目录解析。CLI --enable-stage2/--disable-stage2 覆盖启用状态，--stage2-prompt 只覆盖路径。启用却缺模块或文件时启动失败。
+
+附加结果保存在各分支 `optional_annotations/stage2.jsonl` 和 `stage2_report.json`，请求复用质量并发门、缓存及重试。附加标注发生在成员确定后，不参与准入、成员或 executable。P0/P1/P2 始终交付 labeled_v8 相同14字段，不包含 quality_task_difficulty。开关及启用后的 Prompt 进入冻结契约，切换需新 run；禁用状态下更换未使用的路径不改变运行身份。详见 [隔离模块](../../quality/optional_stage2/README.md)。

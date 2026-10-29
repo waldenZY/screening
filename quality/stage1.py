@@ -1,6 +1,6 @@
 """Text observations, independent category review and deterministic admission.
 
-Model observations deliberately contain no admission labels. Policy can be
+Model observations contain intent labels but no admission decisions. Policy can be
 replayed without an LLM and the recorded policy is checked on every read.
 """
 from __future__ import annotations
@@ -18,18 +18,20 @@ class QualityResponseError(ValueError):
 
 STAGE1_FIELDS = frozenset({"stage1"})
 FEATURE_FIELDS = frozenset({
-    "text_state", "anchor", "goal", "objects", "constraints", "open_points", "dependencies",
+    "intent_label", "intent_reason", "open_points", "dependencies",
 })
+INTENT_LABELS = frozenset({"task", "dialogue", "undetermined"})
+ADMISSION_GROUPS = ("dialogue_without_open_points", "dialogue_with_open_points", "task_direct", "task_clarification", "excluded")
 RUNTIME_CAPABILITIES = ("public_information", "system_app_state", "current_screen_media", "identified_device_resource")
-DEPENDENCY_SOURCES = frozenset({"provided", "user_to_specify", "missing_material", "missing_context", "unknown", *RUNTIME_CAPABILITIES})
+DEPENDENCY_SOURCES = frozenset({"provided", "missing_material", "missing_context", "unknown", *RUNTIME_CAPABILITIES})
 OPEN_POINT_KINDS = frozenset({"intent", "action", "parameter", "object", "conflict"})
 REASON_ORDER = (
-    "unrecoverable_text", "no_anchor", "missing_material", "missing_context", "unknown_dependency",
-    "runtime_unavailable", "missing_goal", "route_disabled", "category_not_provided", "category_partial", "category_mismatch",
+    "undetermined_intent", "missing_material", "missing_context", "unknown_dependency",
+    "runtime_unavailable", "route_disabled", "category_not_provided", "category_partial", "category_mismatch",
 )
 STAGE1_BLOCKING_ISSUES = REASON_ORDER
 DEFAULT_POLICY = {
-    "version": 1,
+    "version": 2,
     "allowed_routes": ["direct", "clarification"],
     "require_category_exact": True,
     "runtime_capabilities": list(RUNTIME_CAPABILITIES),
@@ -57,8 +59,8 @@ def _enum(value: Any, allowed: set | frozenset | tuple, label: str) -> None:
 
 def validate_policy(value: Any) -> dict:
     _keys(value, set(DEFAULT_POLICY), "screening_policy")
-    if type(value["version"]) is not int or value["version"] != 1:
-        raise QualityResponseError("screening_policy.version 必须为 1")
+    if type(value["version"]) is not int or value["version"] != 2:
+        raise QualityResponseError("screening_policy.version 必须为 2")
     if type(value["require_category_exact"]) is not bool:
         raise QualityResponseError("require_category_exact 必须为布尔值")
     for field, allowed in (("allowed_routes", {"direct", "clarification"}), ("runtime_capabilities", set(RUNTIME_CAPABILITIES))):
@@ -68,19 +70,12 @@ def validate_policy(value: Any) -> dict:
     return copy.deepcopy(value)
 
 
-def validate_features(value: Any, turns: Sequence[str] | None = None) -> dict:
+def validate_features(value: Any) -> dict:
     _keys(value, FEATURE_FIELDS, "Stage1 features")
-    _enum(value["text_state"], {"recoverable", "broken"}, "text_state")
-    _enum(value["anchor"], {"task", "topic", "dialogue", "none"}, "anchor")
-    if value["goal"] is not None:
-        _string(value["goal"], "goal")
-    for field in ("objects", "constraints"):
-        if not isinstance(value[field], list):
-            raise QualityResponseError(f"{field} 必须是数组")
-        for item in value[field]:
-            _string(item, field)
+    _enum(value["intent_label"], INTENT_LABELS, "intent_label")
+    _string(value["intent_reason"], "intent_reason")
     for field, keys in (("open_points", {"kind", "description"}),
-                        ("dependencies", {"source", "description", "locator"})):
+                        ("dependencies", {"source", "description"})):
         if not isinstance(value[field], list):
             raise QualityResponseError(f"{field} 必须是数组")
         for item in value[field]:
@@ -90,16 +85,15 @@ def validate_features(value: Any, turns: Sequence[str] | None = None) -> dict:
                 _enum(item["kind"], OPEN_POINT_KINDS, "open point kind")
             else:
                 _enum(item["source"], DEPENDENCY_SOURCES, "dependency source")
-                if item["locator"] is not None:
-                    _string(item["locator"], "locator")
-                if item["source"] in RUNTIME_CAPABILITIES and item["locator"] is None:
-                    raise QualityResponseError("运行时依赖必须给出有文本依据的定位条件")
-            if (field == "dependencies" and item["source"] in RUNTIME_CAPABILITIES
-                    and turns is not None and not any(item["locator"] in turn for turn in turns)):
-                raise QualityResponseError("运行时 locator 必须是输入原文中的选择条件")
-    if value["anchor"] in {"none", "topic"} and value["goal"] is not None:
-        raise QualityResponseError("没有具体任务或交流诉求时不能补造 goal")
     return copy.deepcopy(value)
+
+
+def mapped_intent_label(features: Mapping[str, Any]) -> str:
+    """The only projection from observed intent to the delivery vocabulary."""
+    label = validate_features(dict(features))["intent_label"]
+    if label == "undetermined":
+        raise QualityResponseError("undetermined 不得映射为交付 intent_label")
+    return {"dialogue": "qa", "task": "task"}[label]
 
 
 def validate_category(value: Any) -> dict:
@@ -121,10 +115,8 @@ def screen(features: Mapping[str, Any], category: Mapping[str, Any], policy: Map
     """Hard dependencies precede any opportunity to clarify; never repairs data."""
     features, category, policy = validate_features(dict(features)), validate_category(dict(category)), validate_policy(dict(policy))
     reasons = set()
-    if features["text_state"] == "broken":
-        reasons.add("unrecoverable_text")
-    if features["anchor"] == "none":
-        reasons.add("no_anchor")
+    if features["intent_label"] == "undetermined":
+        reasons.add("undetermined_intent")
     for dep in features["dependencies"]:
         source = dep["source"]
         if source in {"missing_material", "missing_context"}:
@@ -135,13 +127,10 @@ def screen(features: Mapping[str, Any], category: Mapping[str, Any], policy: Map
             reasons.add("runtime_unavailable")
     if reasons:
         route = "excluded"
-    elif features["anchor"] == "topic" or features["open_points"] or any(d["source"] == "user_to_specify" for d in features["dependencies"]):
+    elif features["intent_label"] == "task" and features["open_points"]:
         route = "clarification"
-    elif features["goal"] is not None:
-        route = "direct"
     else:
-        route = "excluded"
-        reasons.add("missing_goal")
+        route = "direct"
     if route != "excluded" and route not in policy["allowed_routes"]:
         reasons.add("route_disabled")
     if policy["require_category_exact"]:
@@ -157,18 +146,18 @@ def screen(features: Mapping[str, Any], category: Mapping[str, Any], policy: Map
     }
 
 
-def build_stage1_result(features: Any, category: Any, policy: Any = None, *, turns: Sequence[str] | None = None) -> dict:
-    features = validate_features(features, turns)
+def build_stage1_result(features: Any, category: Any, policy: Any = None) -> dict:
+    features = validate_features(features)
     category = validate_category(category)
     policy = validate_policy(DEFAULT_POLICY if policy is None else policy)
     return {"stage1": {"features": features, "category": category, "policy": policy, "screening": screen(features, category, policy)}}
 
 
-def validate_stage1_result(value: Any, turns: Sequence[str] | None = None) -> dict:
+def validate_stage1_result(value: Any) -> dict:
     _keys(value, STAGE1_FIELDS, "Stage1 result")
     inner = value["stage1"]
     _keys(inner, {"features", "category", "policy", "screening"}, "Stage1 result")
-    expected = build_stage1_result(inner["features"], inner["category"], inner["policy"], turns=turns)
+    expected = build_stage1_result(inner["features"], inner["category"], inner["policy"])
     if value != expected or type(inner["screening"].get("admitted")) is not bool:
         raise QualityResponseError("Stage1 筛选结果与冻结策略不一致")
     return expected
@@ -186,11 +175,25 @@ def category_fit(value: Mapping[str, Any]) -> str:
     return value["stage1"]["category"]["fit"] or "not_provided"
 
 
+def admission_group(value: Mapping[str, Any]) -> str:
+    inner = validate_stage1_result(dict(value))["stage1"]
+    if not inner["screening"]["admitted"]:
+        return "excluded"
+    features = inner["features"]
+    if features["intent_label"] == "dialogue":
+        return "dialogue_with_open_points" if features["open_points"] else "dialogue_without_open_points"
+    return "task_clarification" if inner["screening"]["route"] == "clarification" else "task_direct"
+
+
 def stage1_issue_summary(results: Sequence[Mapping[str, Any]]) -> dict:
     values = [validate_stage1_result(dict(v))["stage1"] for v in results]
     counts = Counter(reason for v in values for reason in v["screening"]["reasons"])
     rejected = Counter("/".join(v["screening"]["reasons"]) for v in values if not v["screening"]["admitted"])
+    groups = Counter(admission_group({"stage1": v}) for v in values)
+    intents = Counter(v["features"]["intent_label"] for v in values)
     return {
+        "stage1_admission_groups": {key: groups[key] for key in ADMISSION_GROUPS},
+        "stage1_intent_counts": {key: intents[key] for key in sorted(INTENT_LABELS)},
         "stage1_blocking_counts": {key: counts[key] for key in REASON_ORDER},
         "stage1_route_counts": {route: sum(v["screening"]["route"] == route for v in values) for route in ("direct", "clarification", "excluded")},
         "stage1_admitted_route_counts": {route: sum(v["screening"]["admitted"] and v["screening"]["route"] == route for v in values) for route in ("direct", "clarification")},

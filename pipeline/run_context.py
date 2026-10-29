@@ -27,8 +27,8 @@ from ..quality.runner import QUALITY_CONTRACT_VERSION
 from .checkpoints import CHECKPOINT_SCHEMA_VERSION
 
 
-PIPELINE_VERSION = 6
-MANIFEST_SCHEMA_VERSION = 6
+PIPELINE_VERSION = 8
+MANIFEST_SCHEMA_VERSION = 8
 _LOCK = threading.RLock()
 _RESUMABLE = {"created", "running", "incomplete", "partial_failed", "publish_failed"}
 _REUSABLE = {"completed", "published"}
@@ -64,7 +64,7 @@ def build_run_contract(
     category_prompt: str,
     screening_policy: Mapping[str, Any],
     challenge_prompt: str,
-    stage2_prompt: str,
+    additional_prompts: Mapping[str, str],
     llm_metadata: Mapping[str, Any],
     risk_snapshot: Mapping[str, Any],
     idf_snapshot: Mapping[str, Any],
@@ -98,7 +98,7 @@ def build_run_contract(
             "stage1_sha256": _prompt_hash(stage1_prompt),
             "category_sha256": _prompt_hash(category_prompt),
             "challenge_sha256": _prompt_hash(challenge_prompt),
-            "stage2_sha256": _prompt_hash(stage2_prompt),
+            **{f"{name}_sha256": _prompt_hash(prompt) for name, prompt in additional_prompts.items()},
         },
         "llm": dict(llm_metadata),
     }
@@ -123,7 +123,8 @@ def _validate_frozen_run(run_root: Path, manifest: Mapping[str, Any], contract: 
         raise ValueError("run pipeline version 与 v4 不兼容")
     if manifest.get("contract") != dict(contract):
         raise ValueError("run 与当前输入、配置、Prompt 或模型不兼容")
-    for stage in ("stage1", "category", "challenge", "stage2"):
+    for key in contract["prompts"]:
+        stage = key.removesuffix("_sha256")
         path = run_root / "prompts" / f"{stage}.md"
         expected = contract["prompts"][f"{stage}_sha256"]
         if not path.is_file() or sha256_file(path) != expected:
@@ -142,7 +143,7 @@ def prepare_run_context(
     category_prompt: str,
     screening_policy: Mapping[str, Any],
     challenge_prompt: str,
-    stage2_prompt: str,
+    additional_prompts: Mapping[str, str],
     llm_metadata: Mapping[str, Any],
     risk_snapshot: Mapping[str, Any],
     idf_snapshot: Mapping[str, Any] | None = None,
@@ -167,7 +168,7 @@ def prepare_run_context(
         category_prompt=category_prompt,
         screening_policy=screening_policy,
         challenge_prompt=challenge_prompt,
-        stage2_prompt=stage2_prompt,
+        additional_prompts=additional_prompts,
         llm_metadata=llm_metadata,
         risk_snapshot=risk_snapshot,
         idf_snapshot=idf_snapshot,
@@ -218,7 +219,8 @@ def prepare_run_context(
         (prompt_root / "category.md").write_text(category_prompt, encoding="utf-8", newline="\n")
         (prompt_root / "stage1.md").write_text(stage1_prompt, encoding="utf-8", newline="\n")
         (prompt_root / "challenge.md").write_text(challenge_prompt, encoding="utf-8", newline="\n")
-        (prompt_root / "stage2.md").write_text(stage2_prompt, encoding="utf-8", newline="\n")
+        for name, prompt in additional_prompts.items():
+            (prompt_root / f"{name}.md").write_text(prompt, encoding="utf-8", newline="\n")
         write_json(run_root / "risk_keywords.json", dict(risk_snapshot))
         write_json(run_root / "dedup_idf.json", dict(idf_snapshot))
         now = utc_now()
@@ -258,7 +260,6 @@ def prepare_run_context(
                 "p2_supplement": {"status": "pending"},
                 "quality_p2_challenge": {"status": "pending"},
                 "final_membership": {"status": "pending"},
-                "quality_stage2": {"status": "pending"},
                 "screened_export": {"status": "pending"},
                 "labeled_export": {"status": "pending"},
                 "batch_report": {"status": "pending"},

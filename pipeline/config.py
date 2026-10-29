@@ -14,7 +14,7 @@ from ..shared.json_io import JsonObject
 from .orchestrator import BUILD_CONFIG_VERSION, BuildConfig, parse_build_config
 
 
-PIPELINE_CONFIG_VERSION = 8
+PIPELINE_CONFIG_VERSION = 10
 LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 _TOP_LEVEL_FIELDS = {
@@ -24,6 +24,7 @@ _TOP_LEVEL_FIELDS = {
     "prompts",
     "quality",
     "screening_policy",
+    "optional_stage2",
     "index",
     "logging",
     "publication",
@@ -85,6 +86,7 @@ _OVERRIDE_FIELDS = {
     "category_prompt",
     "challenge_prompt",
     "stage2_prompt",
+    "stage2_enabled",
     "workers",
     "max_retries",
     "sleep_seconds",
@@ -197,7 +199,8 @@ class PipelineConfig:
     category_prompt: Path
     screening_policy: dict[str, Any]
     challenge_prompt: Path
-    stage2_prompt: Path
+    stage2_prompt: Path | None
+    stage2_enabled: bool
     quality: QualityRunConfig
     index: IndexRuntimeConfig
     log_level: str
@@ -216,7 +219,17 @@ class PipelineConfig:
     def publish_root(self) -> Path | None:
         return self.publication.publish_root if self.publication.enabled else None
 
+    @property
+    def enabled_stage2_prompt(self) -> Path | None:
+        if not self.stage2_enabled:
+            return None
+        return self.stage2_prompt or Path(__file__).resolve().parents[1] / "quality/optional_stage2/prompt.md"
+
     def validate_for_execution(self) -> None:
+        if type(self.stage2_enabled) is not bool:
+            raise ValueError("optional_stage2.enabled 必须是布尔值")
+        if self.stage2_enabled and not self.enabled_stage2_prompt.is_file():
+            raise FileNotFoundError(f"可选 Stage2 Prompt 不存在: {self.enabled_stage2_prompt}")
         for label, path in (
             ("inputs.source", self.source),
             ("inputs.taxonomy", self.taxonomy),
@@ -224,7 +237,6 @@ class PipelineConfig:
             ("prompts.stage1", self.stage1_prompt),
             ("prompts.category", self.category_prompt),
             ("prompts.challenge", self.challenge_prompt),
-            ("prompts.stage2", self.stage2_prompt),
         ):
             if path is None:
                 raise ValueError(f"{label} 不能为空；请在配置文件中填写或使用 CLI 覆盖")
@@ -250,8 +262,8 @@ class PipelineConfig:
                 "stage1": str(self.stage1_prompt),
                 "category": str(self.category_prompt),
                 "challenge": str(self.challenge_prompt),
-                "stage2": str(self.stage2_prompt),
             },
+            "optional_stage2": {"enabled": self.stage2_enabled, "prompt": str(self.enabled_stage2_prompt) if self.enabled_stage2_prompt else None},
             "quality": asdict(self.quality),
             "screening_policy": self.screening_policy,
             "index": {
@@ -338,7 +350,11 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
     publication = _object(value["publication"], "publication")
     _exact_fields(inputs, {"source", "taxonomy", "risk_keywords"}, "inputs")
     _exact_fields(outputs, {"output_root"}, "outputs")
-    _exact_fields(prompts, {"stage1", "category", "challenge", "stage2"}, "prompts")
+    _exact_fields(prompts, {"stage1", "category", "challenge"}, "prompts")
+    optional_stage2 = _object(value["optional_stage2"], "optional_stage2")
+    _exact_fields(optional_stage2, {"enabled", "prompt"}, "optional_stage2")
+    if type(optional_stage2["enabled"]) is not bool:
+        raise ValueError("optional_stage2.enabled 必须是布尔值")
     _exact_fields(quality, {"workers", "max_retries", "sleep_seconds"}, "quality")
     _exact_fields(
         index,
@@ -381,7 +397,8 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
         screening_policy=screening_policy,
         stage1_prompt=_path(prompts["stage1"], "prompts.stage1", base_dir),  # type: ignore[arg-type]
         challenge_prompt=_path(prompts["challenge"], "prompts.challenge", base_dir),  # type: ignore[arg-type]
-        stage2_prompt=_path(prompts["stage2"], "prompts.stage2", base_dir),  # type: ignore[arg-type]
+        stage2_prompt=_path(optional_stage2["prompt"], "optional_stage2.prompt", base_dir, optional=True),
+        stage2_enabled=optional_stage2["enabled"],
         quality=QualityRunConfig(
             workers=workers,
             max_retries=max_retries,
@@ -494,6 +511,7 @@ def apply_pipeline_overrides(
             if "challenge_prompt" in values
             else config.challenge_prompt
         ),
+        stage2_enabled=values.get("stage2_enabled", config.stage2_enabled),
         stage2_prompt=(
             _path(values["stage2_prompt"], "--stage2-prompt", base_dir)  # type: ignore[arg-type]
             if "stage2_prompt" in values

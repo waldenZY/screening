@@ -1,9 +1,9 @@
 {
-  "quality_contract_version": 11,
-  "purpose": "Illustrative observations and deterministic policy expectations; not human gold and not measured model accuracy. Category values are synthetic contract fixtures.",
+  "quality_contract_version": 13,
+  "purpose": "Illustrative proposed observations and independent deterministic expectations; synthetic contract fixtures, not human gold or measured model accuracy.",
   "cases": [
     {
-      "id": "boundary_1",
+      "id": "direct_control",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
@@ -11,11 +11,8 @@
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "task",
-        "goal": "处理当前请求",
-        "objects": [],
-        "constraints": [],
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
         "open_points": [],
         "dependencies": []
       },
@@ -24,7 +21,7 @@
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
         "allowed_routes": [
           "direct",
           "clarification"
@@ -41,29 +38,21 @@
         "route": "direct",
         "admitted": true,
         "reasons": [],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
       }
     },
     {
-      "id": "boundary_2",
+      "id": "email_reply",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
-          "闹钟"
+          "写一封请假邮件，不要发送"
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "topic",
-        "goal": null,
-        "objects": [],
-        "constraints": [],
-        "open_points": [
-          {
-            "kind": "intent",
-            "description": "需要确定的信息"
-          }
-        ],
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
         "dependencies": []
       },
       "category": {
@@ -71,7 +60,7 @@
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
         "allowed_routes": [
           "direct",
           "clarification"
@@ -85,32 +74,24 @@
         ]
       },
       "expected_screening": {
-        "route": "clarification",
+        "route": "direct",
         "admitted": true,
         "reasons": [],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
       }
     },
     {
-      "id": "boundary_3",
+      "id": "email_send",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
-          "视频剪辑"
+          "写一封请假邮件并发给妈妈"
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "topic",
-        "goal": null,
-        "objects": [],
-        "constraints": [],
-        "open_points": [
-          {
-            "kind": "intent",
-            "description": "需要确定的信息"
-          }
-        ],
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [],
         "dependencies": []
       },
       "category": {
@@ -118,7 +99,7 @@
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
         "allowed_routes": [
           "direct",
           "clarification"
@@ -132,40 +113,37 @@
         ]
       },
       "expected_screening": {
-        "route": "clarification",
+        "route": "direct",
         "admitted": true,
         "reasons": [],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
       }
     },
     {
-      "id": "boundary_4",
+      "id": "summary_provided",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
-          "冰糖冬枣"
+          "总结这段文字：会议决定周五发布，张明负责测试"
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "topic",
-        "goal": null,
-        "objects": [],
-        "constraints": [],
-        "open_points": [
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": [
           {
-            "kind": "intent",
-            "description": "需要确定的信息"
+            "source": "provided",
+            "description": "待总结正文已完整写在会话中。"
           }
-        ],
-        "dependencies": []
+        ]
       },
       "category": {
         "status": "reviewed",
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
         "allowed_routes": [
           "direct",
           "clarification"
@@ -179,32 +157,24 @@
         ]
       },
       "expected_screening": {
-        "route": "clarification",
+        "route": "direct",
         "admitted": true,
         "reasons": [],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
       }
     },
     {
-      "id": "boundary_5",
+      "id": "weekend_plan",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
-          "临沂"
+          "制定周末旅行计划"
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "topic",
-        "goal": null,
-        "objects": [],
-        "constraints": [],
-        "open_points": [
-          {
-            "kind": "intent",
-            "description": "需要确定的信息"
-          }
-        ],
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
         "dependencies": []
       },
       "category": {
@@ -212,7 +182,7 @@
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
         "allowed_routes": [
           "direct",
           "clarification"
@@ -226,30 +196,236 @@
         ]
       },
       "expected_screening": {
-        "route": "clarification",
+        "route": "direct",
         "admitted": true,
         "reasons": [],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
       }
     },
     {
-      "id": "boundary_6",
+      "id": "weather_information",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
-          "帮我设闹钟"
+          "查北京明天的天气"
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "task",
-        "goal": "处理当前请求",
-        "objects": [],
-        "constraints": [],
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": [
+          {
+            "source": "public_information",
+            "description": "天气预报可通过运行时公开检索获取。"
+          }
+        ]
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "weather_app",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "打开天气应用"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "nearby_recommendation",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "推荐附近餐厅"
+        ]
+      },
+      "features": {
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": [
+          {
+            "source": "system_app_state",
+            "description": "附近条件依赖运行时读取当前位置。"
+          },
+          {
+            "source": "public_information",
+            "description": "餐厅信息可公开检索。"
+          }
+        ]
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "translation",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "把你好翻译成英语"
+        ]
+      },
+      "features": {
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "calculation",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "计算12加8"
+        ]
+      },
+      "features": {
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "qa_open_points",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "把你好翻译成外语"
+        ]
+      },
+      "features": {
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
         "open_points": [
           {
             "kind": "parameter",
-            "description": "需要确定的信息"
+            "description": "需要确定目标语言，可先说明需要补充语言。"
           }
         ],
         "dependencies": []
@@ -259,7 +435,7 @@
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
         "allowed_routes": [
           "direct",
           "clarification"
@@ -273,26 +449,23 @@
         ]
       },
       "expected_screening": {
-        "route": "clarification",
+        "route": "direct",
         "admitted": true,
         "reasons": [],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
       }
     },
     {
-      "id": "boundary_7",
+      "id": "compression_method",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
-          "嗯"
+          "如何把图片压到1MB"
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "none",
-        "goal": null,
-        "objects": [],
-        "constraints": [],
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
         "open_points": [],
         "dependencies": []
       },
@@ -301,7 +474,7 @@
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
         "allowed_routes": [
           "direct",
           "clarification"
@@ -315,166 +488,28 @@
         ]
       },
       "expected_screening": {
-        "route": "excluded",
-        "admitted": false,
-        "reasons": [
-          "no_anchor"
-        ],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
       }
     },
     {
-      "id": "boundary_8",
+      "id": "compression_missing_image",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
-          "这样"
+          "把这张图压到1MB"
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "none",
-        "goal": null,
-        "objects": [],
-        "constraints": [],
-        "open_points": [],
-        "dependencies": []
-      },
-      "category": {
-        "status": "reviewed",
-        "fit": "exact"
-      },
-      "policy": {
-        "version": 1,
-        "allowed_routes": [
-          "direct",
-          "clarification"
-        ],
-        "require_category_exact": true,
-        "runtime_capabilities": [
-          "public_information",
-          "system_app_state",
-          "current_screen_media",
-          "identified_device_resource"
-        ]
-      },
-      "expected_screening": {
-        "route": "excluded",
-        "admitted": false,
-        "reasons": [
-          "no_anchor"
-        ],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
-      }
-    },
-    {
-      "id": "boundary_9",
-      "input": {
-        "sample_type": "single_turn",
-        "conversation_turns": [
-          "他说也不错"
-        ]
-      },
-      "features": {
-        "text_state": "recoverable",
-        "anchor": "none",
-        "goal": null,
-        "objects": [],
-        "constraints": [],
-        "open_points": [],
-        "dependencies": []
-      },
-      "category": {
-        "status": "reviewed",
-        "fit": "exact"
-      },
-      "policy": {
-        "version": 1,
-        "allowed_routes": [
-          "direct",
-          "clarification"
-        ],
-        "require_category_exact": true,
-        "runtime_capabilities": [
-          "public_information",
-          "system_app_state",
-          "current_screen_media",
-          "identified_device_resource"
-        ]
-      },
-      "expected_screening": {
-        "route": "excluded",
-        "admitted": false,
-        "reasons": [
-          "no_anchor"
-        ],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
-      }
-    },
-    {
-      "id": "boundary_10",
-      "input": {
-        "sample_type": "single_turn",
-        "conversation_turns": [
-          "下个路口左转"
-        ]
-      },
-      "features": {
-        "text_state": "recoverable",
-        "anchor": "none",
-        "goal": null,
-        "objects": [],
-        "constraints": [],
-        "open_points": [],
-        "dependencies": []
-      },
-      "category": {
-        "status": "reviewed",
-        "fit": "exact"
-      },
-      "policy": {
-        "version": 1,
-        "allowed_routes": [
-          "direct",
-          "clarification"
-        ],
-        "require_category_exact": true,
-        "runtime_capabilities": [
-          "public_information",
-          "system_app_state",
-          "current_screen_media",
-          "identified_device_resource"
-        ]
-      },
-      "expected_screening": {
-        "route": "excluded",
-        "admitted": false,
-        "reasons": [
-          "no_anchor"
-        ],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
-      }
-    },
-    {
-      "id": "boundary_11",
-      "input": {
-        "sample_type": "single_turn",
-        "conversation_turns": [
-          "总结这份文件"
-        ]
-      },
-      "features": {
-        "text_state": "recoverable",
-        "anchor": "task",
-        "goal": "处理当前请求",
-        "objects": [],
-        "constraints": [],
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
         "open_points": [],
         "dependencies": [
           {
             "source": "missing_material",
-            "description": "必要依赖",
-            "locator": null
+            "description": "必须读取原图，但记录未提供图片或可定位资源。"
           }
         ]
       },
@@ -483,7 +518,7 @@
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
         "allowed_routes": [
           "direct",
           "clarification"
@@ -502,29 +537,25 @@
         "reasons": [
           "missing_material"
         ],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
       }
     },
     {
-      "id": "boundary_12",
+      "id": "video_processing",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
-          "选择第二个"
+          "把最新保存的视频剪成一分钟"
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "task",
-        "goal": "处理当前请求",
-        "objects": [],
-        "constraints": [],
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
         "open_points": [],
         "dependencies": [
           {
-            "source": "missing_context",
-            "description": "必要依赖",
-            "locator": null
+            "source": "identified_device_resource",
+            "description": "最新保存的视频有明确选择条件，可在运行时读取。"
           }
         ]
       },
@@ -533,7 +564,769 @@
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "image_generation",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "生成一张猫的图片"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "emotion",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "我很难过，陪我聊聊"
+        ]
+      },
+      "features": {
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "missing_alarm_time",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "帮我设个闹钟"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [
+          {
+            "kind": "parameter",
+            "description": "需要确定闹钟日期和时间。"
+          }
+        ],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "clarification",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "missing_action",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "帮我调整明天的闹钟"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [
+          {
+            "kind": "action",
+            "description": "需要确定具体调整项目。"
+          }
+        ],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "clarification",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "mixed_request",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "查明天天气，再帮我设闹钟"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [
+          {
+            "kind": "parameter",
+            "description": "需要确定闹钟时间。"
+          }
+        ],
+        "dependencies": [
+          {
+            "source": "public_information",
+            "description": "天气信息可公开检索。"
+          }
+        ]
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "clarification",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "alarm_topic",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "闹钟"
+        ]
+      },
+      "features": {
+        "intent_label": "undetermined",
+        "intent_reason": "结合现有会话仍没有可确定的需求，不能从主题或无背景碎片补造操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "undetermined_intent"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "editing_topic",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "视频剪辑"
+        ]
+      },
+      "features": {
+        "intent_label": "undetermined",
+        "intent_reason": "结合现有会话仍没有可确定的需求，不能从主题或无背景碎片补造操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "undetermined_intent"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "product_topic",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "冰糖冬枣"
+        ]
+      },
+      "features": {
+        "intent_label": "undetermined",
+        "intent_reason": "结合现有会话仍没有可确定的需求，不能从主题或无背景碎片补造操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "undetermined_intent"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "place_topic",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "临沂"
+        ]
+      },
+      "features": {
+        "intent_label": "undetermined",
+        "intent_reason": "结合现有会话仍没有可确定的需求，不能从主题或无背景碎片补造操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "undetermined_intent"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "no_anchor",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "嗯"
+        ]
+      },
+      "features": {
+        "intent_label": "undetermined",
+        "intent_reason": "结合现有会话仍没有可确定的需求，不能从主题或无背景碎片补造操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "undetermined_intent"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "reference_fragment",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "这样"
+        ]
+      },
+      "features": {
+        "intent_label": "undetermined",
+        "intent_reason": "结合现有会话仍没有可确定的需求，不能从主题或无背景碎片补造操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "undetermined_intent"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "opinion_fragment",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "他说也不错"
+        ]
+      },
+      "features": {
+        "intent_label": "undetermined",
+        "intent_reason": "结合现有会话仍没有可确定的需求，不能从主题或无背景碎片补造操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "undetermined_intent"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "navigation_fragment",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "下个路口左转"
+        ]
+      },
+      "features": {
+        "intent_label": "undetermined",
+        "intent_reason": "结合现有会话仍没有可确定的需求，不能从主题或无背景碎片补造操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "undetermined_intent"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "broken_text",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "@@%乱码无法恢复"
+        ]
+      },
+      "features": {
+        "intent_label": "undetermined",
+        "intent_reason": "结合现有会话仍没有可确定的需求，不能从主题或无背景碎片补造操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "undetermined_intent"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "brief_weather",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "北京天气"
+        ]
+      },
+      "features": {
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": [
+          {
+            "source": "public_information",
+            "description": "天气信息可公开查询。"
+          }
+        ]
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "current_video",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "总结我正在看的视频"
+        ]
+      },
+      "features": {
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": [
+          {
+            "source": "current_screen_media",
+            "description": "原文明确指向正在观看的视频，可运行时读取。"
+          }
+        ]
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "missing_document",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "总结这份文件"
+        ]
+      },
+      "features": {
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": [
+          {
+            "source": "missing_material",
+            "description": "需要原文件正文，记录未提供或定位。"
+          }
+        ]
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "missing_material"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "unknown_file_reference",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "压缩那个文件"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [],
+        "dependencies": [
+          {
+            "source": "missing_context",
+            "description": "无法确定那个文件指向哪个原对象。"
+          }
+        ]
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
         "allowed_routes": [
           "direct",
           "clarification"
@@ -552,11 +1345,489 @@
         "reasons": [
           "missing_context"
         ],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
       }
     },
     {
-      "id": "boundary_13",
+      "id": "missing_original_list",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "选择第二个结果"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [],
+        "dependencies": [
+          {
+            "source": "missing_context",
+            "description": "缺少原结果列表，不能重新检索代替。"
+          }
+        ]
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "missing_context"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "resolved_prior",
+      "input": {
+        "sample_type": "multi_turn",
+        "conversation_turns": [
+          "打开客厅灯",
+          "把它调暗一点"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "confirm_prior",
+      "input": {
+        "sample_type": "multi_turn",
+        "conversation_turns": [
+          "明早七点设闹钟",
+          "好的"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "correct_prior",
+      "input": {
+        "sample_type": "multi_turn",
+        "conversation_turns": [
+          "明早七点设闹钟",
+          "改成八点"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "cancel_operation",
+      "input": {
+        "sample_type": "multi_turn",
+        "conversation_turns": [
+          "播放音乐",
+          "不播放了，只解释爵士乐是什么"
+        ]
+      },
+      "features": {
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "irrelevant_prior",
+      "input": {
+        "sample_type": "multi_turn",
+        "conversation_turns": [
+          "这样",
+          "打开蓝牙"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": true,
+        "reasons": [],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "missing_prior_persists",
+      "input": {
+        "sample_type": "multi_turn",
+        "conversation_turns": [
+          "那个文件",
+          "把它压缩"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [],
+        "dependencies": [
+          {
+            "source": "missing_context",
+            "description": "相关前序仍不能定位原文件。"
+          }
+        ]
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "missing_context"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "multiple_blockers",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "压缩那个文件，完成后设闹钟"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [
+          {
+            "kind": "parameter",
+            "description": "需确定闹钟时间。"
+          }
+        ],
+        "dependencies": [
+          {
+            "source": "missing_material",
+            "description": "记录没有待处理文件。"
+          },
+          {
+            "source": "missing_context",
+            "description": "未知原文件对象。"
+          }
+        ]
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "partial"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "missing_material",
+          "missing_context",
+          "category_partial"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "category_mismatch",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "打开蓝牙"
+        ]
+      },
+      "features": {
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "mismatch"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": false,
+        "reasons": [
+          "category_mismatch"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "missing_category",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "查北京天气"
+        ]
+      },
+      "features": {
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": []
+      },
+      "category": {
+        "status": "not_provided",
+        "fit": null
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "direct",
+        "admitted": false,
+        "reasons": [
+          "category_not_provided"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "unknown_dependency",
+      "input": {
+        "sample_type": "single_turn",
+        "conversation_turns": [
+          "根据必要外部内容给我解释"
+        ]
+      },
+      "features": {
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [],
+        "dependencies": [
+          {
+            "source": "unknown",
+            "description": "确认需要外部内容，但无法判定来源。"
+          }
+        ]
+      },
+      "category": {
+        "status": "reviewed",
+        "fit": "exact"
+      },
+      "policy": {
+        "version": 2,
+        "allowed_routes": [
+          "direct",
+          "clarification"
+        ],
+        "require_category_exact": true,
+        "runtime_capabilities": [
+          "public_information",
+          "system_app_state",
+          "current_screen_media",
+          "identified_device_resource"
+        ]
+      },
+      "expected_screening": {
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "unknown_dependency"
+        ],
+        "policy_sha256": "924c6d1b1e9d7ca7ed81b74f430183efdd0ce1b04d26e236a2e12f4594d4c5f5"
+      }
+    },
+    {
+      "id": "runtime_disabled",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
@@ -564,17 +1835,13 @@
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "task",
-        "goal": "处理当前请求",
-        "objects": [],
-        "constraints": [],
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
         "open_points": [],
         "dependencies": [
           {
             "source": "current_screen_media",
-            "description": "必要依赖",
-            "locator": "总结当前视频"
+            "description": "当前视频需要运行时读取。"
           }
         ]
       },
@@ -583,58 +1850,50 @@
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
         "allowed_routes": [
           "direct",
           "clarification"
         ],
         "require_category_exact": true,
-        "runtime_capabilities": [
-          "public_information",
-          "system_app_state",
-          "current_screen_media",
-          "identified_device_resource"
-        ]
+        "runtime_capabilities": []
       },
       "expected_screening": {
-        "route": "direct",
-        "admitted": true,
-        "reasons": [],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "route": "excluded",
+        "admitted": false,
+        "reasons": [
+          "runtime_unavailable"
+        ],
+        "policy_sha256": "1a836bd99dad5d8207b1aab13c807f96bd27d406fcfbfe22322f38f26b4c86d0"
       }
     },
     {
-      "id": "public_information",
+      "id": "task_clarification_disabled",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
-          "明确的当前资源"
+          "帮我设闹钟"
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "task",
-        "goal": "处理当前请求",
-        "objects": [],
-        "constraints": [],
-        "open_points": [],
-        "dependencies": [
+        "intent_label": "task",
+        "intent_reason": "用户要求实际操作、资源变更、服务办理或文件媒体产出。",
+        "open_points": [
           {
-            "source": "public_information",
-            "description": "必要依赖",
-            "locator": "明确的当前资源"
+            "kind": "parameter",
+            "description": "需确定闹钟时间。"
           }
-        ]
+        ],
+        "dependencies": []
       },
       "category": {
         "status": "reviewed",
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
         "allowed_routes": [
-          "direct",
-          "clarification"
+          "direct"
         ],
         "require_category_exact": true,
         "runtime_capabilities": [
@@ -645,44 +1904,41 @@
         ]
       },
       "expected_screening": {
-        "route": "direct",
-        "admitted": true,
-        "reasons": [],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "route": "clarification",
+        "admitted": false,
+        "reasons": [
+          "route_disabled"
+        ],
+        "policy_sha256": "31e4046b859cecf2361118131fc05b23e3f03acd987f382bfc0d7e5c49c5a865"
       }
     },
     {
-      "id": "system_app_state",
+      "id": "qa_open_points_direct_policy",
       "input": {
         "sample_type": "single_turn",
         "conversation_turns": [
-          "明确的当前资源"
+          "把你好翻译成外语"
         ]
       },
       "features": {
-        "text_state": "recoverable",
-        "anchor": "task",
-        "goal": "处理当前请求",
-        "objects": [],
-        "constraints": [],
-        "open_points": [],
-        "dependencies": [
+        "intent_label": "dialogue",
+        "intent_reason": "用户期待回复中的信息、交流或文字内容，没有仍需实际执行的操作。",
+        "open_points": [
           {
-            "source": "system_app_state",
-            "description": "必要依赖",
-            "locator": "明确的当前资源"
+            "kind": "parameter",
+            "description": "需要确定目标语言。"
           }
-        ]
+        ],
+        "dependencies": []
       },
       "category": {
         "status": "reviewed",
         "fit": "exact"
       },
       "policy": {
-        "version": 1,
+        "version": 2,
         "allowed_routes": [
-          "direct",
-          "clarification"
+          "direct"
         ],
         "require_category_exact": true,
         "runtime_capabilities": [
@@ -696,103 +1952,7 @@
         "route": "direct",
         "admitted": true,
         "reasons": [],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
-      }
-    },
-    {
-      "id": "current_screen_media",
-      "input": {
-        "sample_type": "single_turn",
-        "conversation_turns": [
-          "明确的当前资源"
-        ]
-      },
-      "features": {
-        "text_state": "recoverable",
-        "anchor": "task",
-        "goal": "处理当前请求",
-        "objects": [],
-        "constraints": [],
-        "open_points": [],
-        "dependencies": [
-          {
-            "source": "current_screen_media",
-            "description": "必要依赖",
-            "locator": "明确的当前资源"
-          }
-        ]
-      },
-      "category": {
-        "status": "reviewed",
-        "fit": "exact"
-      },
-      "policy": {
-        "version": 1,
-        "allowed_routes": [
-          "direct",
-          "clarification"
-        ],
-        "require_category_exact": true,
-        "runtime_capabilities": [
-          "public_information",
-          "system_app_state",
-          "current_screen_media",
-          "identified_device_resource"
-        ]
-      },
-      "expected_screening": {
-        "route": "direct",
-        "admitted": true,
-        "reasons": [],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
-      }
-    },
-    {
-      "id": "identified_device_resource",
-      "input": {
-        "sample_type": "single_turn",
-        "conversation_turns": [
-          "明确的当前资源"
-        ]
-      },
-      "features": {
-        "text_state": "recoverable",
-        "anchor": "task",
-        "goal": "处理当前请求",
-        "objects": [],
-        "constraints": [],
-        "open_points": [],
-        "dependencies": [
-          {
-            "source": "identified_device_resource",
-            "description": "必要依赖",
-            "locator": "明确的当前资源"
-          }
-        ]
-      },
-      "category": {
-        "status": "reviewed",
-        "fit": "exact"
-      },
-      "policy": {
-        "version": 1,
-        "allowed_routes": [
-          "direct",
-          "clarification"
-        ],
-        "require_category_exact": true,
-        "runtime_capabilities": [
-          "public_information",
-          "system_app_state",
-          "current_screen_media",
-          "identified_device_resource"
-        ]
-      },
-      "expected_screening": {
-        "route": "direct",
-        "admitted": true,
-        "reasons": [],
-        "policy_sha256": "3d8d5c0051b9a5e9a47ec4a1d0126d41aa5f0ab351c06c3b5a12dc0de8ad2588"
+        "policy_sha256": "31e4046b859cecf2361118131fc05b23e3f03acd987f382bfc0d7e5c49c5a865"
       }
     }
   ]

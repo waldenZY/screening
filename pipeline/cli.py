@@ -162,9 +162,7 @@ def _execute_pipeline_impl(
         )
     except QualityStageIncomplete as exc:
         current_manifest = _read_manifest(context.run_root)
-        if exc.stage == "stage2":
-            stage_name = "quality_stage2"
-        elif exc.stage == "challenge":
+        if exc.stage == "challenge":
             stage_name = "quality_p2_challenge"
         elif current_manifest.get("stages", {}).get("p2_supplement", {}).get("status") == "running":
             stage_name = "p2_supplement"
@@ -242,7 +240,6 @@ def _execute_pipeline_impl(
                 "error": None,
             },
             "quality_p2_challenge": {"status": "completed", "error": None},
-            "quality_stage2": {"status": "completed", "error": None},
             "screened_export": {
                 "status": "completed",
                 "screened_schema_version": SCREENED_CANONICAL_SCHEMA_VERSION,
@@ -329,7 +326,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage1-prompt", type=Path, default=None)
     parser.add_argument("--category-prompt", type=Path, default=None)
     parser.add_argument("--challenge-prompt", type=Path, default=None)
-    parser.add_argument("--stage2-prompt", type=Path, default=None)
+    parser.add_argument("--stage2-prompt", type=Path, default=None, help="可选 Stage2 Prompt；不隐式启用")
+    optional_stage2 = parser.add_mutually_exclusive_group()
+    optional_stage2.add_argument("--enable-stage2", dest="stage2_enabled", action="store_true", default=None)
+    optional_stage2.add_argument("--disable-stage2", dest="stage2_enabled", action="store_false")
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--max-retries", type=int, default=None)
     parser.add_argument("--sleep", type=float, default=None)
@@ -394,6 +394,7 @@ def main(
                 "category_prompt": args.category_prompt,
                 "challenge_prompt": args.challenge_prompt,
                 "stage2_prompt": args.stage2_prompt,
+                "stage2_enabled": args.stage2_enabled,
                 "workers": args.workers,
                 "max_retries": args.max_retries,
                 "sleep_seconds": args.sleep,
@@ -423,14 +424,18 @@ def main(
         category_prompt = effective.category_prompt.read_text(encoding="utf-8")
         stage1_prompt = effective.stage1_prompt.read_text(encoding="utf-8")
         challenge_prompt = effective.challenge_prompt.read_text(encoding="utf-8")
-        stage2_prompt = effective.stage2_prompt.read_text(encoding="utf-8")
+        additional_stages = {}
+        if effective.stage2_enabled:
+            from ..quality.optional_stage2 import stage_definition
+            additional_stages["stage2"] = stage_definition(effective.enabled_stage2_prompt.read_text(encoding="utf-8"))
+        additional_prompts = {name: definition.prompt for name, definition in additional_stages.items()}
         llm_config = llm_config_override or load_llm_config()
         validate_llm_dependency()
         taxonomy = load_taxonomy_mappings(effective.taxonomy)
         llm_call = llm_call_override or llm_config.bind()
         preflight = run_preflight(
             effective,
-            prompts={"stage1": stage1_prompt, "category": category_prompt, "challenge": challenge_prompt, "stage2": stage2_prompt},
+            prompts={"stage1": stage1_prompt, "category": category_prompt, "challenge": challenge_prompt, **additional_prompts},
             llm_config=llm_config, llm_call=llm_call, replace=args.replace, logger=logger,
         )
         taxonomy_sha256 = sha256_file(effective.taxonomy)
@@ -465,7 +470,7 @@ def main(
             category_prompt=category_prompt,
             screening_policy=effective.screening_policy,
             challenge_prompt=challenge_prompt,
-            stage2_prompt=stage2_prompt,
+            additional_prompts=additional_prompts,
             llm_metadata=metadata,
             risk_snapshot=risk_snapshot,
             run_id=args.run_id,
@@ -491,7 +496,7 @@ def main(
             category_prompt=category_prompt,
             screening_policy=effective.screening_policy,
             challenge_prompt=challenge_prompt,
-            stage2_prompt=stage2_prompt,
+            additional_stages=additional_stages,
             model=llm_config.model,
             llm_options=llm_config.options(),
             llm_call=llm_call,

@@ -34,19 +34,19 @@ from ..candidate.p2_adaptive import (
     select_final_p2,
     source_yield_rates,
 )
-from ..delivery.labeled import LABELED_MAPPING_VERSION, export_labeled_branch
+from ..delivery.labeled import LABELED_MAPPING_VERSION, LABELED_SCHEMA_NAME, export_labeled_branch
 from ..delivery.eligibility import delivery_labels
 from ..delivery.report import RUN_REPORT_SCHEMA_VERSION, write_run_report
 from ..delivery.screened import (
     build_screened_canonical_record,
     validate_screened_canonical_records,
 )
-from ..quality.runner import (CHALLENGE_TYPES, QualityRunner, challenge_passes, stage2_semantic_review)
+from ..quality.runner import (CHALLENGE_TYPES, QualityRunner, challenge_passes)
 from ..quality.stage1 import (stage1_passes, stage1_issue_summary)
 from .checkpoints import CheckpointStore
 
 
-BUILD_CONFIG_VERSION = 6
+BUILD_CONFIG_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -1152,15 +1152,11 @@ def _finalize_branch(
     )
     write_jsonl(branch_root / "dedup_audit.jsonl", dedup_audit)
 
-    stage2_checkpoint = checkpoints.load("stage2")
-    if stage2_checkpoint is None:
-        _set_branch_status(run_root, set_name, "running", stage="stage2")
-        stage2 = _run_quality(
-            quality_runner, "run_stage2", selected, set_name
-        ) if selected else {}
-        checkpoints.save("stage2", {"results": stage2})
-    else:
-        stage2 = {str(key): dict(value) for key, value in stage2_checkpoint["results"].items()}
+    optional_artifacts = ()
+    if "stage2" in quality_runner.additional_stages:
+        from ..quality.optional_stage2 import annotate_branch
+        _set_branch_status(run_root, set_name, "running", stage="optional_annotations")
+        optional_artifacts = annotate_branch(quality_runner, selected, branch_root, set_name)
 
     risk_snapshot = json.loads((run_root / "risk_keywords.json").read_text(encoding="utf-8"))
     records = tuple(
@@ -1168,8 +1164,7 @@ def _finalize_branch(
             set_name,
             candidate,
             stage1[candidate["source_identity_sha256"]],
-            stage2[candidate["source_identity_sha256"]],
-            delivery_labels(candidate, stage2[candidate["source_identity_sha256"]], risk_snapshot, stage1[candidate["source_identity_sha256"]]),
+            delivery_labels(candidate, stage1[candidate["source_identity_sha256"]], risk_snapshot),
             challenge_result=(challenge_results[candidate["source_identity_sha256"]] if set_name == "P2" else None),
             challenge_task_id=(
                 _quality_task_id(quality_runner, "challenge", candidate)
@@ -1186,9 +1181,6 @@ def _finalize_branch(
                 f"{candidate['source_identity_sha256']}"
             ),
             stage1_task_id=_quality_task_id(quality_runner, "stage1", candidate),
-            stage2_task_id=_quality_task_id(
-                quality_runner, "stage2", candidate,
-            ),
         )
         for candidate in selected
     )
@@ -1203,9 +1195,6 @@ def _finalize_branch(
     export_report = export_labeled_branch(set_name, records, branch_root)
     final_audit = {
         **audit, "final": len(records),
-        "stage2_semantic_review": stage2_semantic_review([
-            stage2[candidate["source_identity_sha256"]] for candidate in selected
-        ]),
     }
     write_json(branch_root / "branch_audit.json", final_audit)
     write_json(
@@ -1227,6 +1216,7 @@ def _finalize_branch(
         "labeled_export_report.json",
         "branch_audit.json",
         "branch_report.json",
+        *optional_artifacts,
     )
     artifacts = {
         name: sha256_file(branch_root / name)
@@ -1822,7 +1812,7 @@ def run_build(
     write_json(
         run_root / "labeled_export_report.json",
         {
-            "labeled_schema": "labeled_v6",
+            "labeled_schema": LABELED_SCHEMA_NAME,
             "labeled_mapping_version": LABELED_MAPPING_VERSION,
             "sets": {name: value["export_report"] for name, value in results.items()},
             "total_records": sum(len(value["records"]) for value in results.values()),

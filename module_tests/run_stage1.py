@@ -14,7 +14,7 @@ if __package__ in {None, ""}:
 from screening.quality.runner import QUALITY_CONTRACT_VERSION
 from screening.quality.stage1 import (DEFAULT_POLICY, QualityResponseError, build_stage1_result,
     validate_features, validate_category, validate_category_response, validate_policy, validate_stage1_result,
-    stage1_passes, stable_hash)
+    stage1_passes, stable_hash, admission_group, stage1_issue_summary)
 from screening.module_tests.xlsx_export import validate_xlsx_dependency, write_results_xlsx
 from screening.shared.json_io import sha256_file, try_parse_json, write_json
 from screening.shared.llm import (DEFAULT_LLM_CONFIG_PATH, PACKAGE_ROOT, LlmCall, LlmConfig,
@@ -82,7 +82,7 @@ def _evaluate(sample: dict, feature_prompt: str, category_prompt: str, config: L
               client: LlmCall | None, policy: dict, *, replay: bool = False) -> dict:
     result = {**sample, "status": "input_error", "stage1_input": None, "feature_input": None,
         "category_input": None, "features": None, "category_review": None,
-        "stage1_result": None, "stage1_pass": None, "route": None, "raw_response": {},
+        "stage1_result": None, "stage1_pass": None, "route": None, "admission_group": None, "raw_response": {},
         "stage_status": {"features": "not_run", "category": "not_run"}, "observation_provenance": None,
         "elapsed_ms": 0.0, "first_token_latency_ms": 0.0, "full_latency_ms": 0.0, "error": None}
     previous = None
@@ -115,8 +115,8 @@ def _evaluate(sample: dict, feature_prompt: str, category_prompt: str, config: L
                     or provenance.get("feature_input_sha256") != stable_hash(feature_input)
                     or provenance.get("category_input_sha256") != stable_hash(category_input)):
                 raise QualityResponseError("原模型观察与输入哈希不一致")
-            prior_result = validate_stage1_result(previous.get("stage1_result"), payload["conversation_turns"])["stage1"]
-            features = validate_features(previous["features"], payload["conversation_turns"])
+            prior_result = validate_stage1_result(previous.get("stage1_result"))["stage1"]
+            features = validate_features(previous["features"])
             category = validate_category(previous["category_review"])
             if features != prior_result["features"] or category != prior_result["category"]:
                 raise QualityResponseError("原独立判断与聚合结果不一致")
@@ -139,7 +139,7 @@ def _evaluate(sample: dict, feature_prompt: str, category_prompt: str, config: L
                 if not ok:
                     raise QualityResponseError("响应不是合法 JSON 对象")
                 return parsed
-            features = validate_features(call("features", feature_prompt, feature_input), payload["conversation_turns"])
+            features = validate_features(call("features", feature_prompt, feature_input))
             result["features"] = features
             result["stage_status"]["features"] = "ok"
             current_stage = "category"
@@ -148,8 +148,8 @@ def _evaluate(sample: dict, feature_prompt: str, category_prompt: str, config: L
         if (category_input is None) != (category["status"] == "not_provided"):
             raise QualityResponseError("类别判断与是否提供类别不一致")
         result.update(features=features, category_review=category)
-        stage1 = build_stage1_result(features, category, policy, turns=payload["conversation_turns"])
-        result.update(status="ok", stage1_result=stage1, stage1_pass=stage1_passes(stage1), route=stage1["stage1"]["screening"]["route"])
+        stage1 = build_stage1_result(features, category, policy)
+        result.update(status="ok", stage1_result=stage1, stage1_pass=stage1_passes(stage1), route=stage1["stage1"]["screening"]["route"], admission_group=admission_group(stage1))
     except QualityResponseError as exc:
         result.update(status="response_error", error={"type": type(exc).__name__, "message": str(exc)})
         result["stage_status"][current_stage] = "response_error"
@@ -167,7 +167,7 @@ def _write_report(path: Path, info: dict, results: list[dict]) -> None:
              "缺少类别不等于语义无效；route 是文本筛选类型，stage1_pass 包含类别与策略要求。", "",
              "统计：", "", "```json", json.dumps(info["counts"], ensure_ascii=False, indent=2), "```", ""]
     for row in results:
-        lines += [f"## 输入第 {row['source_line']} 行", "", f"状态：{row['status']}；文本类型：{row['route']}；准入：{row['stage1_pass']}", ""]
+        lines += [f"## 输入第 {row['source_line']} 行", "", f"状态：{row['status']}；路线：{row['route']}；准入：{row['stage1_pass']}；分组：{row['admission_group']}", ""]
         # Indented blocks prevent embedded query Markdown from closing a fence.
         lines += ["\n".join("    " + line for line in json.dumps({k: row[k] for k in ("source_record", "stage1_result", "error")}, ensure_ascii=False, indent=2).splitlines()), ""]
     path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
@@ -218,7 +218,8 @@ def run_stage1_test(input_path: Path, output_dir: Path, *, llm_config: LlmConfig
         "passed": sum(r["stage1_pass"] is True for r in results), "rejected": sum(r["stage1_pass"] is False for r in results),
         "failed": sum(r["status"] != "ok" for r in results),
         **{route: sum(r["route"] == route for r in results) for route in ("direct", "clarification", "excluded")},
-        "category_not_provided": sum(r["category_review"] == {"status": "not_provided", "fit": None} for r in results)}
+        "category_not_provided": sum(r["category_review"] == {"status": "not_provided", "fit": None} for r in results),
+        **stage1_issue_summary([r["stage1_result"] for r in results if r["status"] == "ok"])}
     info["status"] = "interrupted" if interrupted else "completed_with_errors" if info["counts"]["failed"] else "completed"
     info["finished_at"] = datetime.now(timezone.utc).isoformat()
     write_json(output_dir / "run.json", info)

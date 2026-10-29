@@ -1,4 +1,4 @@
-"""Deterministic screened-to-labeled v6 export."""
+"""Deterministic screened-to-labeled v8 export."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from ..quality.runner import TASK_DIFFICULTIES
 from ..shared.json_io import JsonObject, write_json, write_jsonl
 from .screened import (
     SCREENED_CANONICAL_SCHEMA_VERSION,
@@ -17,22 +16,22 @@ from .screened import (
 )
 
 
-LABELED_MAPPING_VERSION = 7
-LABELED_SCHEMA_NAME = "labeled_v6"
+LABELED_MAPPING_VERSION = 9
+LABELED_SCHEMA_NAME = "labeled_v8"
 LABELED_SET_VALUES = {
     "P0": "P0_smoke",
     "P1": "P1_benchmark",
     "P2": "P2_adversarial",
 }
 LABELED_FILENAMES = {
-    "P0": Path("P0-冒烟集") / "P0_smoke_set_v6_labeled.jsonl",
-    "P1": Path("P1-基准集") / "P1_benchmark_set_v6_labeled.jsonl",
-    "P2": Path("P2-对抗集") / "P2_adversarial_set_v6_labeled.jsonl",
+    "P0": Path("P0-冒烟集") / "P0_smoke_set_v8_labeled.jsonl",
+    "P1": Path("P1-基准集") / "P1_benchmark_set_v8_labeled.jsonl",
+    "P2": Path("P2-对抗集") / "P2_adversarial_set_v8_labeled.jsonl",
 }
 LABELED_FIELDS = (
     "text", "context_text", "target_query", "turn_count", "L1", "L2",
     "cluster_id", "cluster_prob", "frequency", "session_id", "set",
-    "quality_task_difficulty", "intent_label", "executable", "stage1",
+    "intent_label", "executable", "stage1",
 )
 
 
@@ -69,16 +68,16 @@ def validate_labeled_record(
     *,
     canonical_record: Mapping[str, Any] | None = None,
 ) -> None:
-    """Independently check the 15-field order, types, and source mapping."""
-    from ..quality.stage1 import validate_stage1_result
+    """Independently check the 14-field order, types, and source mapping."""
+    from ..quality.stage1 import validate_stage1_result, mapped_intent_label
     validate_stage1_result({"stage1": record.get("stage1")})
     if tuple(record) != labeled_fields(set_name):
-        raise LabeledExportError("labeled 字段名称或顺序不符合当前 labeled_v6")
+        raise LabeledExportError("labeled 字段名称或顺序不符合当前 labeled_v8")
     if any(value is None for value in record.values()):
         raise LabeledExportError("labeled 必需字段不得为 null")
     for field in (
         "text", "context_text", "target_query", "L1", "L2", "session_id",
-        "set", "quality_task_difficulty", "intent_label",
+        "set", "intent_label",
     ):
         value = record[field]
         if not isinstance(value, str) or (field != "context_text" and not value):
@@ -94,8 +93,6 @@ def validate_labeled_record(
         raise LabeledExportError("labeled executable 必须是 0/1 整数")
     if record["intent_label"] not in {"task", "qa"}:
         raise LabeledExportError("labeled intent_label 非法")
-    if record["quality_task_difficulty"] not in TASK_DIFFICULTIES:
-        raise LabeledExportError("labeled task difficulty 枚举非法")
     if record["set"] != LABELED_SET_VALUES[set_name]:
         raise LabeledExportError("labeled set 值非法")
     expected_text = " | ".join(
@@ -107,8 +104,9 @@ def validate_labeled_record(
     expected_turns = 1 if not record["context_text"] else record["context_text"].count(" | ") + 2
     if record["turn_count"] != expected_turns:
         raise LabeledExportError("labeled turn_count 与会话字段不一致")
-    turns = (record["context_text"].split(" | ") if record["context_text"] else []) + [record["target_query"]]
-    stage1 = validate_stage1_result({"stage1": record["stage1"]}, turns)["stage1"]
+    stage1 = validate_stage1_result({"stage1": record["stage1"]})["stage1"]
+    if record["intent_label"] != mapped_intent_label(stage1["features"]):
+        raise LabeledExportError("labeled intent_label 必须映射自 Stage1")
     if (not stage1["screening"]["admitted"] or not stage1["policy"]["require_category_exact"]
             or stage1["category"] != {"status": "reviewed", "fit": "exact"}):
         raise LabeledExportError("交付包含未准入或未核验类别的样本")
@@ -138,7 +136,6 @@ def _labeled_values(record: Mapping[str, Any]) -> JsonObject:
         "frequency": candidate["signals"]["frequency"],
         "session_id": candidate["source"]["session_id"],
         "set": LABELED_SET_VALUES[set_name],
-        "quality_task_difficulty": record["quality"]["task_difficulty"],
         "intent_label": record["quality"]["intent_label"],
         "executable": record["delivery_labels"]["executable"],
         "stage1": record["quality"]["stage1"],
@@ -171,7 +168,6 @@ def export_labeled_branch(
             "round_id": selection["round_id"],
             "candidate_task_id": selection["candidate_task_id"],
             "stage1_task_id": selection["stage1_task_id"],
-            "stage2_task_id": selection["stage2_task_id"],
             "labeled_mapping_version": LABELED_MAPPING_VERSION,
         })
     write_jsonl(canonical_path, records)
