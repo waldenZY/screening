@@ -239,8 +239,8 @@ class AdaptiveP2Sampler:
                        c.cluster_json, c.l1, c.l2, c.l2_key, c.sample_type,
                        c.cluster_probability, c.frequency, c.frequency_less_count,
                        c.cluster_frequency_count, c.probability_band,
-                       c.frequency_band, c.normalized_frequency, c.relevance_p0,
-                       c.relevance_p2, c.length_band, c.complexity,
+                       c.frequency_band, c.normalized_frequency,
+                       c.length_band, c.complexity, c.formality,
                        q.quota,
                        ROW_NUMBER() OVER (
                            PARTITION BY c.l2_key, c.cluster_json
@@ -276,8 +276,7 @@ class AdaptiveP2Sampler:
                 "features": {
                     "probability_band": row[15], "frequency_band": row[16],
                     "normalized_frequency": float(row[17]),
-                    "relevance": {"p0": float(row[18]), "p2": float(row[19])},
-                    "length_band": row[20], "complexity": row[21],
+                    "length_band": row[18], "complexity": row[19], "formality": row[20],
                 },
             })
         return locators, available

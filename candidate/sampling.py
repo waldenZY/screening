@@ -1,6 +1,6 @@
 """Deterministic P0/P1/P2 sampling over the canonical index.
 
-The implementation intentionally has no dependency on either LLM stage.  It
+The Stage1 sampling implementation has no model-request dependencies. It
 materializes source text only when the labeled MMR/Jaccard rules require it and
 returns canonical locators to the orchestration layer.
 """
@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from .index import CanonicalCandidateIndex
+from .scoring import sampling_scores
 from .dedup import DedupConfig, normalize_text, selection_text, weighted_jaccard, edit_similarity
 from ..shared.json_io import JsonObject
 from ..shared.challenge import CHALLENGE_TYPES as P2_PRIMARY_TYPES
@@ -234,7 +235,7 @@ def allocate_feedback_cluster_quotas(
     round_draws: Mapping[Any, int],
     explore_all_clusters: bool,
 ) -> dict[Any, int]:
-    """Split one P1 supplement batch using remaining size and Stage1 yield."""
+    """Split one P1 supplement batch using remaining size and 准入评估 yield."""
     sizes = {key: count for key, count in remaining.items() if count > 0}
     target = min(target, sum(sizes.values()))
     if target <= 0:
@@ -397,7 +398,7 @@ class CandidateSampler:
     def _score(value: Mapping[str, Any], score: str) -> float:
         if score == "cluster_probability":
             return float(value["cluster_probability"])
-        return float(value["features"]["relevance"][score])
+        return float(sampling_scores(value)[score])
 
     def sample_p0(
         self, excluded: Iterable[str] = (), *,
@@ -611,7 +612,7 @@ def deduplicate_branch_candidates(
             if "signals" in item:
                 return float(item["signals"]["cluster_probability"])
             return float(item["cluster_probability"])
-        return float(item["features"]["relevance"]["p2"])
+        return float(sampling_scores(item)["p2"])
 
     accepted = list(existing)
     texts = [normalize_text(str(getter(item))) for item in accepted]

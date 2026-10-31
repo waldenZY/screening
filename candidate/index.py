@@ -34,7 +34,7 @@ from ..shared.json_io import JsonObject, stable_hash, write_json
 from ..shared.taxonomy import TaxonomyMappings
 
 
-CANONICAL_INDEX_VERSION = 3
+CANONICAL_INDEX_VERSION = 4
 DATABASE_NAME = "canonical_candidate_index.sqlite"
 BUILDING_DATABASE_NAME = "canonical_candidate_index.building.sqlite"
 METADATA_NAME = "canonical_metadata.json"
@@ -49,8 +49,7 @@ _CANDIDATE_COLUMNS = (
     "byte_length", "record_sha256", "cluster_json", "l1", "l2", "l2_key",
     "sample_type", "cluster_probability", "frequency", "frequency_less_count",
     "cluster_frequency_count", "probability_band", "frequency_band",
-    "normalized_frequency", "relevance_p0", "relevance_p2", "length_band",
-    "complexity",
+    "normalized_frequency", "length_band", "complexity", "formality",
 )
 
 
@@ -301,10 +300,9 @@ def _initialize(connection: sqlite3.Connection, source: Mapping[str, Any]) -> No
             probability_band TEXT NOT NULL,
             frequency_band TEXT,
             normalized_frequency REAL,
-            relevance_p0 REAL,
-            relevance_p2 REAL,
             length_band TEXT NOT NULL,
-            complexity TEXT NOT NULL
+            complexity TEXT NOT NULL,
+            formality TEXT NOT NULL
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS candidates_l1_source
             ON candidates(l1, source_line);
@@ -540,21 +538,13 @@ def _finalize_features(
                 """
                 UPDATE candidates
                 SET frequency_less_count=?, cluster_frequency_count=?,
-                    frequency_band=?, normalized_frequency=?,
-                    relevance_p0=(? * cluster_probability) + (? * ?),
-                    relevance_p2=(? * (1.0 - cluster_probability)) + (? * (1.0 - ?))
+                    frequency_band=?, normalized_frequency=?
                 WHERE cluster_json=? AND frequency=?
                 """,
                 (
                     less,
                     total,
                     band,
-                    normalized,
-                    feature_config.p0_probability_weight,
-                    feature_config.p0_frequency_weight,
-                    normalized,
-                    feature_config.p2_probability_weight,
-                    feature_config.p2_frequency_weight,
                     normalized,
                     cluster_json,
                     frequency,
@@ -575,7 +565,6 @@ def _finalize_features(
         SELECT COUNT(*) FROM candidates
         WHERE frequency_less_count IS NULL OR cluster_frequency_count IS NULL
            OR frequency_band IS NULL OR normalized_frequency IS NULL
-           OR relevance_p0 IS NULL OR relevance_p2 IS NULL
         """
     ).fetchone()
     if missing and int(missing[0]):
@@ -888,8 +877,8 @@ def _scan(
                                 source_line, byte_offset, byte_length, record_sha256,
                                 cluster_json, l1, l2, l2_key, sample_type,
                                 cluster_probability, frequency, probability_band,
-                                length_band, complexity
-                            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                length_band, complexity, formality
+                            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 source_identity,
@@ -908,6 +897,7 @@ def _scan(
                                 provisional["probability_band"],
                                 provisional["length_band"],
                                 provisional["complexity"],
+                                provisional["formality"],
                             ),
                         )
                         checkpoint["candidate_rows"] = int(checkpoint.get("candidate_rows", 0)) + 1
@@ -1228,8 +1218,7 @@ class CanonicalCandidateIndex:
                    cluster_json, l1, l2, l2_key, sample_type,
                    cluster_probability, frequency, frequency_less_count,
                    cluster_frequency_count, probability_band,
-                   frequency_band, normalized_frequency, relevance_p0,
-                   relevance_p2, length_band, complexity
+                   frequency_band, normalized_frequency, length_band, complexity, formality
             FROM candidates
             WHERE {column}=?
             ORDER BY source_line
@@ -1265,9 +1254,9 @@ class CanonicalCandidateIndex:
                         "probability_band": row[15],
                         "frequency_band": row[16],
                         "normalized_frequency": float(row[17]),
-                        "relevance": {"p0": float(row[18]), "p2": float(row[19])},
-                        "length_band": row[20],
-                        "complexity": row[21],
+                        "length_band": row[18],
+                        "complexity": row[19],
+                        "formality": row[20],
                     },
                 }
 

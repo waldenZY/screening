@@ -1,1 +1,1 @@
-"""Stage1, Challenge, and Stage2 quality evaluation."""
+"""Admission evaluation, Challenge judging and downstream quality annotation."""

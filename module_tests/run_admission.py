@@ -12,23 +12,32 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from screening.quality.runner import QUALITY_CONTRACT_VERSION
-from screening.quality.stage1 import (DEFAULT_POLICY, QualityResponseError, build_stage1_result,
-    validate_features, validate_category, validate_category_response, validate_policy, validate_stage1_result,
-    stage1_passes, stable_hash, admission_group, stage1_issue_summary)
+from screening.quality.admission import (DEFAULT_POLICY, QualityResponseError, build_admission_result,
+    validate_features, validate_category, validate_category_response, validate_policy, validate_admission_result,
+    admission_passes, stable_hash, admission_group, admission_issue_summary)
 from screening.module_tests.xlsx_export import validate_xlsx_dependency, write_results_xlsx
 from screening.shared.json_io import sha256_file, try_parse_json, write_json
 from screening.shared.llm import (DEFAULT_LLM_CONFIG_PATH, PACKAGE_ROOT, LlmCall, LlmConfig,
     LlmRequestError, load_llm_config, validate_llm_dependency)
 
-DEFAULT_PROMPT_PATH = PACKAGE_ROOT / "artifacts/prompts/quality_stage1.md"
-DEFAULT_CATEGORY_PROMPT_PATH = PACKAGE_ROOT / "artifacts/prompts/quality_stage1_category.md"
+DEFAULT_PROMPT_PATH = PACKAGE_ROOT / "artifacts/prompts/quality_admission.md"
+DEFAULT_CATEGORY_PROMPT_PATH = PACKAGE_ROOT / "artifacts/prompts/quality_admission_category.md"
 NOTICE = "参考样本复测；已有类别或标签不是人工真值，不计算准确率。文本筛选通过不代表正式用例已就绪。"
 
 
-def build_stage1_input(record: Any) -> dict[str, Any]:
+def build_admission_input(record: Any) -> dict[str, Any]:
     """Normalize two supported input shapes and reject conflicting duplicate fields."""
     if not isinstance(record, dict):
         raise ValueError("输入行必须是 JSON 对象")
+    if isinstance(record.get("candidate"), dict):
+        from screening.candidate.contract import parse_conversation
+        candidate = record["candidate"]
+        conversation = parse_conversation(candidate["source"]["raw_text"])
+        if conversation != candidate["conversation"]:
+            raise ValueError("冻结候选的会话与原文不一致")
+        return {"sample_type": conversation["sample_type"],
+            "conversation_turns": conversation["full_text"].split(" | "),
+            "candidate_category": {"L1": candidate["taxonomy"]["l1"], "L2": candidate["taxonomy"]["l2"]}}
     target, context = record.get("target_query"), record.get("context_text")
     if not isinstance(target, str) or not target.strip() or not isinstance(context, str):
         raise ValueError("target_query 必须非空，context_text 必须为字符串")
@@ -54,6 +63,13 @@ def build_stage1_input(record: Any) -> dict[str, Any]:
     for key in ("L1", "L2"):
         if key in record and record[key] != category[key]:
             raise ValueError("两种类别字段不一致")
+    if isinstance(record.get("raw_text"), str) and isinstance(record.get("stage1"), dict):
+        from screening.candidate.contract import parse_conversation
+        original = parse_conversation(record["raw_text"])
+        if (original["context_turns"] != (context.split(" | ") if context else [])
+                or original["target_query"] != target or original["sample_type"] != sample_type):
+            raise ValueError("交付会话与raw_text不一致")
+        turns = original["full_text"].split(" | ")
     return {"sample_type": sample_type, "conversation_turns": list(turns), "candidate_category": dict(category)}
 
 
@@ -80,9 +96,9 @@ def _read_samples(path: Path, limit: int | None) -> list[dict[str, Any]]:
 
 def _evaluate(sample: dict, feature_prompt: str, category_prompt: str, config: LlmConfig | None,
               client: LlmCall | None, policy: dict, *, replay: bool = False) -> dict:
-    result = {**sample, "status": "input_error", "stage1_input": None, "feature_input": None,
+    result = {**sample, "status": "input_error", "admission_input": None, "feature_input": None,
         "category_input": None, "features": None, "category_review": None,
-        "stage1_result": None, "stage1_pass": None, "route": None, "admission_group": None, "raw_response": {},
+        "admission_result": None, "admission_pass": None, "route": None, "admission_group": None, "raw_response": {},
         "stage_status": {"features": "not_run", "category": "not_run"}, "observation_provenance": None,
         "elapsed_ms": 0.0, "first_token_latency_ms": 0.0, "full_latency_ms": 0.0, "error": None}
     previous = None
@@ -95,15 +111,15 @@ def _evaluate(sample: dict, feature_prompt: str, category_prompt: str, config: L
                 raise ValueError("重筛输入必须是独立复测产生的 results.jsonl")
             result["source_record"] = previous["source_record"]
             result["source_line"] = previous["source_line"]
-        payload = build_stage1_input(result["source_record"])
-        if previous is not None and previous.get("stage1_input") != payload:
+        payload = build_admission_input(result["source_record"])
+        if previous is not None and previous.get("admission_input") != payload:
             raise ValueError("重筛输入与原始会话绑定不一致")
     except (ValueError, KeyError, TypeError) as exc:
         result["error"] = {"type": "input_error", "message": str(exc)}
         return result
     feature_input = {k: payload[k] for k in ("sample_type", "conversation_turns")}
     category_input = payload if payload["candidate_category"]["L1"] is not None else None
-    result.update(stage1_input=payload, feature_input=feature_input, category_input=category_input)
+    result.update(admission_input=payload, feature_input=feature_input, category_input=category_input)
     started = time.perf_counter()
     current_stage = "features"
     try:
@@ -115,7 +131,7 @@ def _evaluate(sample: dict, feature_prompt: str, category_prompt: str, config: L
                     or provenance.get("feature_input_sha256") != stable_hash(feature_input)
                     or provenance.get("category_input_sha256") != stable_hash(category_input)):
                 raise QualityResponseError("原模型观察与输入哈希不一致")
-            prior_result = validate_stage1_result(previous.get("stage1_result"))["stage1"]
+            prior_result = validate_admission_result(previous.get("admission_result"))["admission"]
             features = validate_features(previous["features"])
             category = validate_category(previous["category_review"])
             if features != prior_result["features"] or category != prior_result["category"]:
@@ -148,8 +164,8 @@ def _evaluate(sample: dict, feature_prompt: str, category_prompt: str, config: L
         if (category_input is None) != (category["status"] == "not_provided"):
             raise QualityResponseError("类别判断与是否提供类别不一致")
         result.update(features=features, category_review=category)
-        stage1 = build_stage1_result(features, category, policy)
-        result.update(status="ok", stage1_result=stage1, stage1_pass=stage1_passes(stage1), route=stage1["stage1"]["screening"]["route"], admission_group=admission_group(stage1))
+        admission = build_admission_result(features, category, policy)
+        result.update(status="ok", admission_result=admission, admission_pass=admission_passes(admission), route=admission["admission"]["screening"]["route"], admission_group=admission_group(admission))
     except QualityResponseError as exc:
         result.update(status="response_error", error={"type": type(exc).__name__, "message": str(exc)})
         result["stage_status"][current_stage] = "response_error"
@@ -163,17 +179,17 @@ def _evaluate(sample: dict, feature_prompt: str, category_prompt: str, config: L
 
 
 def _write_report(path: Path, info: dict, results: list[dict]) -> None:
-    lines = ["# Stage1 特征与策略复测", "", NOTICE, "", f"模式：{info['mode']}", "",
-             "缺少类别不等于语义无效；route 是文本筛选类型，stage1_pass 包含类别与策略要求。", "",
+    lines = ["# 准入评估 特征与策略复测", "", NOTICE, "", f"模式：{info['mode']}", "",
+             "缺少类别不等于语义无效；route 是文本筛选类型，admission_pass 包含类别与策略要求。", "",
              "统计：", "", "```json", json.dumps(info["counts"], ensure_ascii=False, indent=2), "```", ""]
     for row in results:
-        lines += [f"## 输入第 {row['source_line']} 行", "", f"状态：{row['status']}；路线：{row['route']}；准入：{row['stage1_pass']}；分组：{row['admission_group']}", ""]
+        lines += [f"## 输入第 {row['source_line']} 行", "", f"状态：{row['status']}；路线：{row['route']}；准入：{row['admission_pass']}；分组：{row['admission_group']}", ""]
         # Indented blocks prevent embedded query Markdown from closing a fence.
-        lines += ["\n".join("    " + line for line in json.dumps({k: row[k] for k in ("source_record", "stage1_result", "error")}, ensure_ascii=False, indent=2).splitlines()), ""]
+        lines += ["\n".join("    " + line for line in json.dumps({k: row[k] for k in ("source_record", "admission_result", "error")}, ensure_ascii=False, indent=2).splitlines()), ""]
     path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
 
 
-def run_stage1_test(input_path: Path, output_dir: Path, *, llm_config: LlmConfig | None = None,
+def run_admission_test(input_path: Path, output_dir: Path, *, llm_config: LlmConfig | None = None,
     prompt_path: Path = DEFAULT_PROMPT_PATH, category_prompt_path: Path = DEFAULT_CATEGORY_PROMPT_PATH,
     policy: dict | None = None, limit: int | None = None, llm_call: LlmCall | None = None, replay: bool = False) -> int:
     if limit is not None and (type(limit) is not int or limit < 1):
@@ -191,7 +207,7 @@ def run_stage1_test(input_path: Path, output_dir: Path, *, llm_config: LlmConfig
         raise ValueError("真实复测需要 LLM 配置")
     validate_xlsx_dependency()
     client = None if replay else (llm_call or llm_config.bind())
-    info = {"module": "stage1", "mode": "policy_replay" if replay else "model_review", "status": "running",
+    info = {"module": "admission", "mode": "policy_replay" if replay else "model_review", "status": "running",
         "notice": NOTICE, "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None,
         "input_path": str(input_path), "input_sha256": sha256_file(input_path),
         "quality_contract_version": QUALITY_CONTRACT_VERSION, "screening_policy": policy,
@@ -201,7 +217,7 @@ def run_stage1_test(input_path: Path, output_dir: Path, *, llm_config: LlmConfig
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "run.json").open("x", encoding="utf-8") as handle:
         json.dump(info, handle, ensure_ascii=False, indent=2)
-    (output_dir / "stage1_prompt.md").write_text(feature_prompt, encoding="utf-8", newline="\n")
+    (output_dir / "admission_prompt.md").write_text(feature_prompt, encoding="utf-8", newline="\n")
     (output_dir / "category_prompt.md").write_text(category_prompt, encoding="utf-8", newline="\n")
     results, interrupted = [], False
     with (output_dir / "results.jsonl").open("x", encoding="utf-8", newline="\n") as handle:
@@ -211,15 +227,15 @@ def run_stage1_test(input_path: Path, output_dir: Path, *, llm_config: LlmConfig
                 handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
                 handle.flush()
                 results.append(row)
-                print(f"[{len(results)}/{len(samples)}] line={row['source_line']} status={row['status']} route={row['route']} admitted={row['stage1_pass']}")
+                print(f"[{len(results)}/{len(samples)}] line={row['source_line']} status={row['status']} route={row['route']} admitted={row['admission_pass']}")
         except KeyboardInterrupt:
             interrupted = True
     info["counts"] = {"selected": len(samples), "processed": len(results),
-        "passed": sum(r["stage1_pass"] is True for r in results), "rejected": sum(r["stage1_pass"] is False for r in results),
+        "passed": sum(r["admission_pass"] is True for r in results), "rejected": sum(r["admission_pass"] is False for r in results),
         "failed": sum(r["status"] != "ok" for r in results),
         **{route: sum(r["route"] == route for r in results) for route in ("direct", "clarification", "excluded")},
         "category_not_provided": sum(r["category_review"] == {"status": "not_provided", "fit": None} for r in results),
-        **stage1_issue_summary([r["stage1_result"] for r in results if r["status"] == "ok"])}
+        **admission_issue_summary([r["admission_result"] for r in results if r["status"] == "ok"])}
     info["status"] = "interrupted" if interrupted else "completed_with_errors" if info["counts"]["failed"] else "completed"
     info["finished_at"] = datetime.now(timezone.utc).isoformat()
     write_json(output_dir / "run.json", info)
@@ -254,10 +270,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             config = load_llm_config(args.llm_config)
             validate_llm_dependency()
         policy = json.loads(args.policy.read_text(encoding="utf-8-sig")) if args.policy else None
-        return run_stage1_test(args.replay_results or args.input, args.output_dir, llm_config=config,
+        return run_admission_test(args.replay_results or args.input, args.output_dir, llm_config=config,
             prompt_path=args.prompt, category_prompt_path=args.category_prompt, policy=policy, limit=args.limit, replay=replay)
     except (OSError, ValueError, RuntimeError) as exc:
-        print(f"Stage1 启动或文件写入失败：{exc}", file=sys.stderr)
+        print(f"准入评估 启动或文件写入失败：{exc}", file=sys.stderr)
         return 1
 
 if __name__ == "__main__":

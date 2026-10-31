@@ -14,7 +14,7 @@ from ..shared.json_io import JsonObject
 from .orchestrator import BUILD_CONFIG_VERSION, BuildConfig, parse_build_config
 
 
-PIPELINE_CONFIG_VERSION = 10
+PIPELINE_CONFIG_VERSION = 11
 LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 _TOP_LEVEL_FIELDS = {
@@ -24,7 +24,6 @@ _TOP_LEVEL_FIELDS = {
     "prompts",
     "quality",
     "screening_policy",
-    "optional_stage2",
     "index",
     "logging",
     "publication",
@@ -82,11 +81,10 @@ _OVERRIDE_FIELDS = {
     "taxonomy",
     "risk_keywords",
     "output_root",
-    "stage1_prompt",
+    "admission_prompt",
     "category_prompt",
     "challenge_prompt",
-    "stage2_prompt",
-    "stage2_enabled",
+    "quality_annotation_prompt",
     "workers",
     "max_retries",
     "sleep_seconds",
@@ -195,12 +193,11 @@ class PipelineConfig:
     taxonomy: Path | None
     risk_keywords: Path | None
     output_root: Path
-    stage1_prompt: Path
+    admission_prompt: Path
     category_prompt: Path
     screening_policy: dict[str, Any]
     challenge_prompt: Path
-    stage2_prompt: Path | None
-    stage2_enabled: bool
+    quality_annotation_prompt: Path
     quality: QualityRunConfig
     index: IndexRuntimeConfig
     log_level: str
@@ -219,24 +216,15 @@ class PipelineConfig:
     def publish_root(self) -> Path | None:
         return self.publication.publish_root if self.publication.enabled else None
 
-    @property
-    def enabled_stage2_prompt(self) -> Path | None:
-        if not self.stage2_enabled:
-            return None
-        return self.stage2_prompt or Path(__file__).resolve().parents[1] / "quality/optional_stage2/prompt.md"
-
     def validate_for_execution(self) -> None:
-        if type(self.stage2_enabled) is not bool:
-            raise ValueError("optional_stage2.enabled 必须是布尔值")
-        if self.stage2_enabled and not self.enabled_stage2_prompt.is_file():
-            raise FileNotFoundError(f"可选 Stage2 Prompt 不存在: {self.enabled_stage2_prompt}")
         for label, path in (
             ("inputs.source", self.source),
             ("inputs.taxonomy", self.taxonomy),
             ("inputs.risk_keywords", self.risk_keywords),
-            ("prompts.stage1", self.stage1_prompt),
+            ("prompts.admission", self.admission_prompt),
             ("prompts.category", self.category_prompt),
             ("prompts.challenge", self.challenge_prompt),
+            ("prompts.quality_annotation", self.quality_annotation_prompt),
         ):
             if path is None:
                 raise ValueError(f"{label} 不能为空；请在配置文件中填写或使用 CLI 覆盖")
@@ -259,11 +247,11 @@ class PipelineConfig:
             },
             "outputs": {"output_root": str(self.output_root)},
             "prompts": {
-                "stage1": str(self.stage1_prompt),
+                "admission": str(self.admission_prompt),
                 "category": str(self.category_prompt),
                 "challenge": str(self.challenge_prompt),
+                "quality_annotation": str(self.quality_annotation_prompt),
             },
-            "optional_stage2": {"enabled": self.stage2_enabled, "prompt": str(self.enabled_stage2_prompt) if self.enabled_stage2_prompt else None},
             "quality": asdict(self.quality),
             "screening_policy": self.screening_policy,
             "index": {
@@ -350,11 +338,7 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
     publication = _object(value["publication"], "publication")
     _exact_fields(inputs, {"source", "taxonomy", "risk_keywords"}, "inputs")
     _exact_fields(outputs, {"output_root"}, "outputs")
-    _exact_fields(prompts, {"stage1", "category", "challenge"}, "prompts")
-    optional_stage2 = _object(value["optional_stage2"], "optional_stage2")
-    _exact_fields(optional_stage2, {"enabled", "prompt"}, "optional_stage2")
-    if type(optional_stage2["enabled"]) is not bool:
-        raise ValueError("optional_stage2.enabled 必须是布尔值")
+    _exact_fields(prompts, {"admission", "category", "challenge", "quality_annotation"}, "prompts")
     _exact_fields(quality, {"workers", "max_retries", "sleep_seconds"}, "quality")
     _exact_fields(
         index,
@@ -383,7 +367,7 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
     if type(index["verify_full_source_hash"]) is not bool:
         raise ValueError("index.verify_full_source_hash 必须是布尔值")
 
-    from ..quality.stage1 import validate_policy
+    from ..quality.admission import validate_policy
     screening_policy = validate_policy(value["screening_policy"])
     base_dir = config_path.parent
     return PipelineConfig(
@@ -395,10 +379,9 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
         output_root=_path(outputs["output_root"], "outputs.output_root", base_dir),  # type: ignore[arg-type]
         category_prompt=_path(prompts["category"], "prompts.category", base_dir),
         screening_policy=screening_policy,
-        stage1_prompt=_path(prompts["stage1"], "prompts.stage1", base_dir),  # type: ignore[arg-type]
+        admission_prompt=_path(prompts["admission"], "prompts.admission", base_dir),  # type: ignore[arg-type]
         challenge_prompt=_path(prompts["challenge"], "prompts.challenge", base_dir),  # type: ignore[arg-type]
-        stage2_prompt=_path(optional_stage2["prompt"], "optional_stage2.prompt", base_dir, optional=True),
-        stage2_enabled=optional_stage2["enabled"],
+        quality_annotation_prompt=_path(prompts["quality_annotation"], "prompts.quality_annotation", base_dir),
         quality=QualityRunConfig(
             workers=workers,
             max_retries=max_retries,
@@ -500,10 +483,10 @@ def apply_pipeline_overrides(
             if "output_root" in values
             else config.output_root
         ),
-        stage1_prompt=(
-            _path(values["stage1_prompt"], "--stage1-prompt", base_dir)  # type: ignore[arg-type]
-            if "stage1_prompt" in values
-            else config.stage1_prompt
+        admission_prompt=(
+            _path(values["admission_prompt"], "--admission-prompt", base_dir)  # type: ignore[arg-type]
+            if "admission_prompt" in values
+            else config.admission_prompt
         ),
         category_prompt=(_path(values["category_prompt"], "--category-prompt", base_dir) if "category_prompt" in values else config.category_prompt),
         challenge_prompt=(
@@ -511,11 +494,10 @@ def apply_pipeline_overrides(
             if "challenge_prompt" in values
             else config.challenge_prompt
         ),
-        stage2_enabled=values.get("stage2_enabled", config.stage2_enabled),
-        stage2_prompt=(
-            _path(values["stage2_prompt"], "--stage2-prompt", base_dir)  # type: ignore[arg-type]
-            if "stage2_prompt" in values
-            else config.stage2_prompt
+        quality_annotation_prompt=(
+            _path(values["quality_annotation_prompt"], "--quality-annotation-prompt", base_dir)
+            if "quality_annotation_prompt" in values
+            else config.quality_annotation_prompt
         ),
         quality=quality,
         index=index,

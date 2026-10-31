@@ -16,7 +16,7 @@ class QualityResponseError(ValueError):
     """A provider response or frozen result violates its contract."""
 
 
-STAGE1_FIELDS = frozenset({"stage1"})
+ADMISSION_FIELDS = frozenset({"admission"})
 FEATURE_FIELDS = frozenset({
     "intent_label", "intent_reason", "open_points", "dependencies",
 })
@@ -29,7 +29,7 @@ REASON_ORDER = (
     "undetermined_intent", "missing_material", "missing_context", "unknown_dependency",
     "runtime_unavailable", "route_disabled", "category_not_provided", "category_partial", "category_mismatch",
 )
-STAGE1_BLOCKING_ISSUES = REASON_ORDER
+ADMISSION_BLOCKING_ISSUES = REASON_ORDER
 DEFAULT_POLICY = {
     "version": 2,
     "allowed_routes": ["direct", "clarification"],
@@ -71,7 +71,7 @@ def validate_policy(value: Any) -> dict:
 
 
 def validate_features(value: Any) -> dict:
-    _keys(value, FEATURE_FIELDS, "Stage1 features")
+    _keys(value, FEATURE_FIELDS, "准入评估 features")
     _enum(value["intent_label"], INTENT_LABELS, "intent_label")
     _string(value["intent_reason"], "intent_reason")
     for field, keys in (("open_points", {"kind", "description"}),
@@ -146,37 +146,37 @@ def screen(features: Mapping[str, Any], category: Mapping[str, Any], policy: Map
     }
 
 
-def build_stage1_result(features: Any, category: Any, policy: Any = None) -> dict:
+def build_admission_result(features: Any, category: Any, policy: Any = None) -> dict:
     features = validate_features(features)
     category = validate_category(category)
     policy = validate_policy(DEFAULT_POLICY if policy is None else policy)
-    return {"stage1": {"features": features, "category": category, "policy": policy, "screening": screen(features, category, policy)}}
+    return {"admission": {"features": features, "category": category, "policy": policy, "screening": screen(features, category, policy)}}
 
 
-def validate_stage1_result(value: Any) -> dict:
-    _keys(value, STAGE1_FIELDS, "Stage1 result")
-    inner = value["stage1"]
-    _keys(inner, {"features", "category", "policy", "screening"}, "Stage1 result")
-    expected = build_stage1_result(inner["features"], inner["category"], inner["policy"])
+def validate_admission_result(value: Any) -> dict:
+    _keys(value, ADMISSION_FIELDS, "准入评估 result")
+    inner = value["admission"]
+    _keys(inner, {"features", "category", "policy", "screening"}, "准入评估 result")
+    expected = build_admission_result(inner["features"], inner["category"], inner["policy"])
     if value != expected or type(inner["screening"].get("admitted")) is not bool:
-        raise QualityResponseError("Stage1 筛选结果与冻结策略不一致")
+        raise QualityResponseError("准入评估 筛选结果与冻结策略不一致")
     return expected
 
 
-def stage1_passes(value: Mapping[str, Any]) -> bool:
-    return validate_stage1_result(dict(value))["stage1"]["screening"]["admitted"]
+def admission_passes(value: Mapping[str, Any]) -> bool:
+    return validate_admission_result(dict(value))["admission"]["screening"]["admitted"]
 
 
-def stage1_usable(value: Mapping[str, Any]) -> bool:
-    return value["stage1"]["screening"]["route"] != "excluded"
+def admission_usable(value: Mapping[str, Any]) -> bool:
+    return value["admission"]["screening"]["route"] != "excluded"
 
 
 def category_fit(value: Mapping[str, Any]) -> str:
-    return value["stage1"]["category"]["fit"] or "not_provided"
+    return value["admission"]["category"]["fit"] or "not_provided"
 
 
 def admission_group(value: Mapping[str, Any]) -> str:
-    inner = validate_stage1_result(dict(value))["stage1"]
+    inner = validate_admission_result(dict(value))["admission"]
     if not inner["screening"]["admitted"]:
         return "excluded"
     features = inner["features"]
@@ -185,22 +185,22 @@ def admission_group(value: Mapping[str, Any]) -> str:
     return "task_clarification" if inner["screening"]["route"] == "clarification" else "task_direct"
 
 
-def stage1_issue_summary(results: Sequence[Mapping[str, Any]]) -> dict:
-    values = [validate_stage1_result(dict(v))["stage1"] for v in results]
+def admission_issue_summary(results: Sequence[Mapping[str, Any]]) -> dict:
+    values = [validate_admission_result(dict(v))["admission"] for v in results]
     counts = Counter(reason for v in values for reason in v["screening"]["reasons"])
     rejected = Counter("/".join(v["screening"]["reasons"]) for v in values if not v["screening"]["admitted"])
-    groups = Counter(admission_group({"stage1": v}) for v in values)
+    groups = Counter(admission_group({"admission": v}) for v in values)
     intents = Counter(v["features"]["intent_label"] for v in values)
     return {
-        "stage1_admission_groups": {key: groups[key] for key in ADMISSION_GROUPS},
-        "stage1_intent_counts": {key: intents[key] for key in sorted(INTENT_LABELS)},
-        "stage1_blocking_counts": {key: counts[key] for key in REASON_ORDER},
-        "stage1_route_counts": {route: sum(v["screening"]["route"] == route for v in values) for route in ("direct", "clarification", "excluded")},
-        "stage1_admitted_route_counts": {route: sum(v["screening"]["admitted"] and v["screening"]["route"] == route for v in values) for route in ("direct", "clarification")},
-        "stage1_route_admission_rates": {
+        "admission_groups": {key: groups[key] for key in ADMISSION_GROUPS},
+        "admission_intent_counts": {key: intents[key] for key in sorted(INTENT_LABELS)},
+        "admission_blocking_counts": {key: counts[key] for key in REASON_ORDER},
+        "admission_route_counts": {route: sum(v["screening"]["route"] == route for v in values) for route in ("direct", "clarification", "excluded")},
+        "admission_admitted_route_counts": {route: sum(v["screening"]["admitted"] and v["screening"]["route"] == route for v in values) for route in ("direct", "clarification")},
+        "admission_route_admission_rates": {
             route: _route_rate(values, route) for route in ("direct", "clarification")
         },
-        "stage1_rejection_combinations": dict(sorted(rejected.items())),
+        "admission_rejection_combinations": dict(sorted(rejected.items())),
     }
 
 

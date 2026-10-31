@@ -89,7 +89,7 @@ def _record_count(payload: Mapping[str, Any]) -> int:
     sets = payload.get("sets")
     if isinstance(sets, Mapping):
         return sum(len(value) for value in sets.values() if isinstance(value, list))
-    for key in ("results", "stage1_results", "files", "quotas"):
+    for key in ("results", "admission_results", "files", "quotas"):
         value = payload.get(key)
         if isinstance(value, Mapping):
             return len(value)

@@ -1,8 +1,9 @@
-"""Deterministic screened-to-labeled v8 export."""
+"""Stage2 deterministic downstream_labeled_v1 export (fixed v4 filenames)."""
 
 from __future__ import annotations
 
 import math
+import copy
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -16,22 +17,24 @@ from .screened import (
 )
 
 
-LABELED_MAPPING_VERSION = 9
-LABELED_SCHEMA_NAME = "labeled_v8"
+LABELED_MAPPING_VERSION = 10
+LABELED_SCHEMA_NAME = "downstream_labeled_v1"
 LABELED_SET_VALUES = {
     "P0": "P0_smoke",
     "P1": "P1_benchmark",
     "P2": "P2_adversarial",
 }
 LABELED_FILENAMES = {
-    "P0": Path("P0-冒烟集") / "P0_smoke_set_v8_labeled.jsonl",
-    "P1": Path("P1-基准集") / "P1_benchmark_set_v8_labeled.jsonl",
-    "P2": Path("P2-对抗集") / "P2_adversarial_set_v8_labeled.jsonl",
+    "P0": Path("P0-冒烟集") / "P0_smoke_set_v4_labeled.jsonl",
+    "P1": Path("P1-基准集") / "P1_benchmark_set_v4_labeled.jsonl",
+    "P2": Path("P2-对抗集") / "P2_adversarial_set_v4_labeled.jsonl",
 }
 LABELED_FIELDS = (
-    "text", "context_text", "target_query", "turn_count", "L1", "L2",
-    "cluster_id", "cluster_prob", "frequency", "session_id", "set",
-    "intent_label", "executable", "stage1",
+    "text", "raw_text", "context_text", "target_query", "turn_count", "sample_type",
+    "L1", "L2", "cluster_id", "cluster_prob", "prob_band", "frequency", "freq_band",
+    "norm_freq", "relevance", "length_bin", "complexity", "formality", "session_id", "set",
+    "quality_category_fit", "quality_validity", "quality_intent_clarity",
+    "quality_issue_types", "quality_overall_score", "intent_label", "executable", "stage1", "provenance",
 )
 
 
@@ -42,7 +45,8 @@ class LabeledExportError(ValueError):
 def labeled_fields(set_name: str) -> tuple[str, ...]:
     if set_name not in LABELED_SET_VALUES:
         raise LabeledExportError(f"未知数据集: {set_name}")
-    return LABELED_FIELDS
+    relevance = "relevance_p2" if set_name == "P2" else "relevance_p0"
+    return tuple(relevance if field == "relevance" else field for field in LABELED_FIELDS)
 
 
 def map_screened_to_labeled(record: Mapping[str, Any]) -> JsonObject:
@@ -68,15 +72,17 @@ def validate_labeled_record(
     *,
     canonical_record: Mapping[str, Any] | None = None,
 ) -> None:
-    """Independently check the 14-field order, types, and source mapping."""
-    from ..quality.stage1 import validate_stage1_result, mapped_intent_label
-    validate_stage1_result({"stage1": record.get("stage1")})
+    """Independently check all 29 fields, types, enums and frozen source mapping."""
+    from ..quality.admission import validate_admission_result, mapped_intent_label
+    if not isinstance(record.get("stage1"), Mapping) or set(record["stage1"]) != {"admission", "selection", "challenge"}:
+        raise LabeledExportError("stage1 透传必须包含 admission、selection、challenge")
+    validate_admission_result({"admission": record["stage1"]["admission"]})
     if tuple(record) != labeled_fields(set_name):
-        raise LabeledExportError("labeled 字段名称或顺序不符合当前 labeled_v8")
+        raise LabeledExportError("labeled 字段名称或顺序不符合 downstream_labeled_v1")
     if any(value is None for value in record.values()):
         raise LabeledExportError("labeled 必需字段不得为 null")
     for field in (
-        "text", "context_text", "target_query", "L1", "L2", "session_id",
+        "text", "raw_text", "context_text", "target_query", "L1", "L2", "session_id",
         "set", "intent_label",
     ):
         value = record[field]
@@ -104,13 +110,31 @@ def validate_labeled_record(
     expected_turns = 1 if not record["context_text"] else record["context_text"].count(" | ") + 2
     if record["turn_count"] != expected_turns:
         raise LabeledExportError("labeled turn_count 与会话字段不一致")
-    stage1 = validate_stage1_result({"stage1": record["stage1"]})["stage1"]
-    if record["intent_label"] != mapped_intent_label(stage1["features"]):
-        raise LabeledExportError("labeled intent_label 必须映射自 Stage1")
-    if (not stage1["screening"]["admitted"] or not stage1["policy"]["require_category_exact"]
-            or stage1["category"] != {"status": "reviewed", "fit": "exact"}):
+    from ..quality.annotation import QUALITY_FIELDS, validate_quality_annotation
+    from ..candidate.contract import PROBABILITY_BANDS, FREQUENCY_BANDS, LENGTH_BANDS, COMPLEXITY_LEVELS
+    validate_quality_annotation({key: record[key] for key in QUALITY_FIELDS})
+    for field, choices in (("prob_band", PROBABILITY_BANDS), ("freq_band", FREQUENCY_BANDS),
+                           ("length_bin", LENGTH_BANDS), ("complexity", COMPLEXITY_LEVELS),
+                           ("formality", {"formal", "mixed", "colloquial"})):
+        if record[field] not in choices:
+            raise LabeledExportError(f"{field} 枚举非法")
+    relevance = "relevance_p2" if set_name == "P2" else "relevance_p0"
+    for field in ("norm_freq", relevance):
+        if not _is_number(record[field]) or not 0 <= record[field] <= 1 or record[field] != round(record[field], 4):
+            raise LabeledExportError(f"{field} 必须是四位小数精度的0～1数值")
+    if record["sample_type"] != ("multi_turn" if record["turn_count"] > 1 else "single_turn"):
+        raise LabeledExportError("sample_type 与轮数不一致")
+    admission = validate_admission_result({"admission": record["stage1"]["admission"]})["admission"]
+    if record["quality_category_fit"] != admission["category"]["fit"]:
+        raise LabeledExportError("quality_category_fit 必须来自类别核验")
+    if not isinstance(record["provenance"], Mapping) or not record["provenance"].get("run_id"):
+        raise LabeledExportError("provenance 缺少运行来源")
+    if record["intent_label"] != mapped_intent_label(admission["features"]):
+        raise LabeledExportError("labeled intent_label 必须映射自 准入评估")
+    if (not admission["screening"]["admitted"] or not admission["policy"]["require_category_exact"]
+            or admission["category"] != {"status": "reviewed", "fit": "exact"}):
         raise LabeledExportError("交付包含未准入或未核验类别的样本")
-    if record["executable"] and (stage1["screening"]["route"] != "direct"
+    if record["executable"] and (admission["screening"]["route"] != "direct"
             or record["turn_count"] != 1 or len(record["target_query"]) <= 2):
         raise LabeledExportError("executable 不符合单轮直接测试条件")
     if canonical_record is not None:
@@ -122,23 +146,39 @@ def validate_labeled_record(
 def _labeled_values(record: Mapping[str, Any]) -> JsonObject:
     """Project canonical fields for export and recorded-output validation."""
     candidate = record["candidate"]
+    from ..quality.annotation import validate_quality_annotation
+    if "downstream_quality" not in record:
+        raise LabeledExportError("Stage2 下游质量标注未完成，不得导出")
+    annotation = validate_quality_annotation(record["downstream_quality"])
     conversation = candidate["conversation"]
     set_name = str(record["set"])
     direct = {
         "text": " | ".join([*conversation["context_turns"], conversation["target_query"]]),
+        "raw_text": candidate["source"]["raw_text"],
         "context_text": " | ".join(conversation["context_turns"]),
         "target_query": conversation["target_query"],
         "turn_count": len(conversation["context_turns"]) + 1,
+        "sample_type": conversation["sample_type"],
         "L1": candidate["taxonomy"]["l1"],
         "L2": candidate["taxonomy"]["l2"],
         "cluster_id": candidate["taxonomy"]["cluster_id"],
         "cluster_prob": candidate["signals"]["cluster_probability"],
+        "prob_band": candidate["features"]["probability_band"],
         "frequency": candidate["signals"]["frequency"],
+        "freq_band": candidate["features"]["frequency_band"],
+        "norm_freq": round(candidate["features"]["normalized_frequency"], 4),
+        ("relevance_p2" if set_name == "P2" else "relevance_p0"): round(record["sampling_scores"]["p2" if set_name == "P2" else "p0"], 4),
+        "length_bin": candidate["features"]["length_band"],
+        "complexity": candidate["features"]["complexity"],
+        "formality": candidate["features"]["formality"],
         "session_id": candidate["source"]["session_id"],
         "set": LABELED_SET_VALUES[set_name],
         "intent_label": record["quality"]["intent_label"],
         "executable": record["delivery_labels"]["executable"],
-        "stage1": record["quality"]["stage1"],
+        "quality_category_fit": record["quality"]["admission"]["category"]["fit"],
+        **annotation,
+        "stage1": copy.deepcopy({"admission": record["quality"]["admission"], "selection": record["selection"], "challenge": record["challenge"]}),
+        "provenance": copy.deepcopy(record["provenance"]),
     }
     return {field: direct[field] for field in labeled_fields(set_name)}
 
@@ -167,7 +207,7 @@ def export_labeled_branch(
             "origin": selection["origin"],
             "round_id": selection["round_id"],
             "candidate_task_id": selection["candidate_task_id"],
-            "stage1_task_id": selection["stage1_task_id"],
+            "admission_task_id": selection["admission_task_id"],
             "labeled_mapping_version": LABELED_MAPPING_VERSION,
         })
     write_jsonl(canonical_path, records)
@@ -183,7 +223,7 @@ def export_labeled_branch(
         "fields": list(labeled_fields(set_name)),
         "null_values": 0,
         "lossy_enum_mappings": 0,
-        "rounded_numeric_fields": [],
+        "rounded_numeric_fields": ["norm_freq", "relevance_p2" if set_name == "P2" else "relevance_p0"],
         "files": {
             "canonical": canonical_path.name,
             "labeled": labeled_path.name,

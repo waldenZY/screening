@@ -10,17 +10,18 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from ..quality.stage1 import stage1_usable, category_fit
+from ..quality.admission import admission_usable, category_fit
+from ..quality.annotation import quality_report
 from .eligibility import REASON_ORDER as EXECUTABLE_REASONS
 from ..candidate.p2_adaptive import P2_ALGORITHM, P2_SOURCE_NAMES
 from ..quality.runner import CHALLENGE_TYPES
-from ..quality.stage1 import (STAGE1_FIELDS, STAGE1_BLOCKING_ISSUES, ADMISSION_GROUPS, INTENT_LABELS, stage1_issue_summary, validate_stage1_result, stage1_passes)
+from ..quality.admission import (ADMISSION_FIELDS, ADMISSION_BLOCKING_ISSUES, ADMISSION_GROUPS, INTENT_LABELS, admission_issue_summary, validate_admission_result, admission_passes)
 from ..shared.json_io import JsonObject, write_json
 from ..shared.taxonomy import TaxonomyMappings
 from .screened import validate_screened_canonical_record
 
 
-RUN_REPORT_SCHEMA_VERSION = 13
+RUN_REPORT_SCHEMA_VERSION = 14
 RUN_REPORT_JSON = "screening_run_report.json"
 RUN_REPORT_MARKDOWN = "screening_run_report.md"
 SET_NAMES = ("P0", "P1", "P2")
@@ -42,8 +43,8 @@ def _ratio(numerator: int, denominator: int) -> JsonObject:
     }
 
 
-def _is_usable(stage1: Mapping[str, Any]) -> bool:
-    return stage1_usable(stage1)
+def _is_usable(admission: Mapping[str, Any]) -> bool:
+    return admission_usable(admission)
 
 
 def _l1_for_l2(taxonomy: TaxonomyMappings, l2_key: str) -> str:
@@ -62,34 +63,34 @@ def _l2_name(l1: str, l2_key: str) -> str:
 
 def _empty_counts() -> dict[str, Any]:
     return {
-        "stage1_evaluated": 0,
+        "admission_evaluated": 0,
         "usable_queries": 0,
         "category_exact_among_usable": 0,
-        "stage1_pass": 0,
+        "admission_pass": 0,
         "final_count": 0,
         "category_fit": Counter(),
     }
 
 
-def _add_stage1(counts: dict[str, Any], result: Mapping[str, Any]) -> None:
-    counts["stage1_evaluated"] += 1
+def _add_admission(counts: dict[str, Any], result: Mapping[str, Any]) -> None:
+    counts["admission_evaluated"] += 1
     counts["category_fit"][category_fit(result)] += 1
     usable = _is_usable(result)
     if usable:
         counts["usable_queries"] += 1
         if category_fit(result) == "exact":
             counts["category_exact_among_usable"] += 1
-    if stage1_passes(result):
-        counts["stage1_pass"] += 1
+    if admission_passes(result):
+        counts["admission_pass"] += 1
 
 
 def _finalize_counts(counts: Mapping[str, Any]) -> JsonObject:
-    evaluated = int(counts["stage1_evaluated"])
+    evaluated = int(counts["admission_evaluated"])
     usable = int(counts["usable_queries"])
     exact = int(counts["category_exact_among_usable"])
-    passed = int(counts["stage1_pass"])
+    passed = int(counts["admission_pass"])
     return {
-        "stage1_evaluated": evaluated,
+        "admission_evaluated": evaluated,
         "usable_queries": usable,
         "query_usability_rate": _ratio(usable, evaluated),
         "category_fit_distribution": {
@@ -98,8 +99,8 @@ def _finalize_counts(counts: Mapping[str, Any]) -> JsonObject:
         },
         "category_exact_among_usable": exact,
         "semantic_label_fit_rate": _ratio(exact, usable),
-        "stage1_pass": passed,
-        "stage1_admission_rate": _ratio(passed, evaluated),
+        "admission_pass": passed,
+        "admission_rate": _ratio(passed, evaluated),
         "final_count": int(counts["final_count"]),
     }
 
@@ -127,13 +128,13 @@ def _p1_diagnostics(build_summary: Mapping[str, Any]) -> JsonObject:
             l2_totals[key]["requested"] += int(count)
         for batch in batches:
             for key, row in batch["l2"].items():
-                for metric in ("sampled", "evaluated", "usable", "exact", "stage1_pass", "admitted"):
+                for metric in ("sampled", "evaluated", "usable", "exact", "admission_pass", "admitted"):
                     l2_totals[key][metric] += int(row[metric])
                 round_usable += int(row["usable"])
                 round_exact += int(row["exact"])
             for row in batch["clusters"]:
                 key = (str(row["l2_key"]), row["cluster_id"])
-                for metric in ("sampled", "evaluated", "usable", "exact", "stage1_pass", "admitted"):
+                for metric in ("sampled", "evaluated", "usable", "exact", "admission_pass", "admitted"):
                     cluster_totals[key][metric] += int(row[metric])
         if sum(int(batch["sampled"]) for batch in batches) != int(round_row["sampled"]):
             raise RunReportError("P1 补采小批与轮次抽样数不守恒")
@@ -145,7 +146,7 @@ def _p1_diagnostics(build_summary: Mapping[str, Any]) -> JsonObject:
             "evaluated": int(round_row["after_dedup"]),
             "usable": round_usable,
             "exact": round_exact,
-            "stage1_pass": int(round_row["stage1_pass"]),
+            "admission_pass": int(round_row["admission_pass"]),
             "admitted": int(round_row["admitted"]),
             "stop_reason": round_row["stop"],
         })
@@ -161,14 +162,14 @@ def _p1_diagnostics(build_summary: Mapping[str, Any]) -> JsonObject:
             "candidate_remaining": int(remaining[key]),
             "stop_reason": stops[key],
             **{metric: int(l2_totals[key][metric]) for metric in
-               ("requested", "sampled", "evaluated", "usable", "exact", "stage1_pass", "admitted")},
+               ("requested", "sampled", "evaluated", "usable", "exact", "admission_pass", "admitted")},
         }
         for key in sorted(quotas)
     ]
     cluster_rows = [
         {"l2_key": key[0], "cluster_id": key[1],
          **{metric: int(counts[metric]) for metric in
-            ("sampled", "evaluated", "usable", "exact", "stage1_pass", "admitted")}}
+            ("sampled", "evaluated", "usable", "exact", "admission_pass", "admitted")}}
         for key, counts in cluster_totals.items()
     ]
     deficit_rows = [row for row in l2_rows if row["deficit"] > 0]
@@ -259,7 +260,7 @@ def build_run_report(
     taxonomy: TaxonomyMappings,
     evaluated_candidates: Mapping[str, Sequence[Mapping[str, Any]]],
     evaluation_rounds: Mapping[str, Mapping[str, int]],
-    stage1_results: Mapping[str, Mapping[str, Any]],
+    admission_results: Mapping[str, Mapping[str, Any]],
     final_records: Mapping[str, Sequence[Mapping[str, Any]]],
     p1_target_quotas: Mapping[str, int],
     build_summary: Mapping[str, Any],
@@ -295,15 +296,15 @@ def build_run_report(
                 raise RunReportError(f"{set_name} 报告候选 L2 不在 taxonomy")
             if taxonomy_value["l1"] != l2_to_l1[l2_key]:
                 raise RunReportError(f"{set_name} 报告候选 L1/L2 不一致")
-            result = validate_stage1_result(dict(stage1_results[identity]))
+            result = validate_admission_result(dict(admission_results[identity]))
             round_id = evaluation_rounds[set_name].get(identity)
             if isinstance(round_id, bool) or not isinstance(round_id, int) or round_id < 0:
                 raise RunReportError(f"{set_name} 报告候选缺少合法轮次")
             if set_name == "P0" and round_id != 0:
                 raise RunReportError(f"{set_name} 不得出现补采轮次")
-            _add_stage1(set_counts, result)
-            _add_stage1(node_counts[l2_key], result)
-            _add_stage1(wave_counts[round_id], result)
+            _add_admission(set_counts, result)
+            _add_admission(node_counts[l2_key], result)
+            _add_admission(wave_counts[round_id], result)
 
         final_round_counts: Counter[int] = Counter()
         intent_labels: Counter[str] = Counter()
@@ -325,10 +326,10 @@ def build_run_report(
             round_id = int(record["selection"]["round_id"])
             final_round_counts[round_id] += 1
             quality = record["quality"]
-            validate_stage1_result(
+            validate_admission_result(
                 {
                     key: quality[key]
-                    for key in STAGE1_FIELDS
+                    for key in ADMISSION_FIELDS
                 }
             )
             intent_labels[quality["intent_label"]] += 1
@@ -340,7 +341,7 @@ def build_run_report(
         } if set_name == "P1" else {
             key
             for key, value in node_counts.items()
-            if int(value["stage1_evaluated"]) > 0
+            if int(value["admission_evaluated"]) > 0
         }
         covered_l2 = {key for key, count in final_l2_counts.items() if count > 0}
         covered_l1 = {l2_to_l1[key] for key in covered_l2}
@@ -381,10 +382,10 @@ def build_run_report(
             children = [row for row in l2_rows if row["l1"] == l1]
             l1_counts = _empty_counts()
             for child in children:
-                l1_counts["stage1_evaluated"] += child["stage1_evaluated"]
+                l1_counts["admission_evaluated"] += child["admission_evaluated"]
                 l1_counts["usable_queries"] += child["usable_queries"]
                 l1_counts["category_exact_among_usable"] += child["category_exact_among_usable"]
-                l1_counts["stage1_pass"] += child["stage1_pass"]
+                l1_counts["admission_pass"] += child["admission_pass"]
                 l1_counts["final_count"] += child["final_count"]
                 l1_counts["category_fit"].update(child["category_fit_distribution"])
             target_children = [row for row in children if row["in_coverage_scope"]]
@@ -441,10 +442,15 @@ def build_run_report(
             wave_rows.append(values)
 
         set_report = {
-            "coverage_scope": "p1_target_quota_l2" if set_name == "P1" else "stage1_evaluated_l2",
+            "downstream_quality": quality_report([
+                {"source_identity_sha256": r["candidate"]["source_identity_sha256"],
+                 "task_id": r["provenance"]["quality_annotation_task_id"], "result": r["downstream_quality"]}
+                for r in final_records[set_name]
+            ]),
+            "coverage_scope": "p1_target_quota_l2" if set_name == "P1" else "admission_evaluated_l2",
             **_finalize_counts(set_counts),
-            **stage1_issue_summary([
-                stage1_results[candidate["source_identity_sha256"]]
+            **admission_issue_summary([
+                admission_results[candidate["source_identity_sha256"]]
                 for candidate in evaluated_candidates[set_name]
             ]),
             "taxonomy_l1_coverage_rate": _ratio(
@@ -480,17 +486,17 @@ def build_run_report(
         ),
         "metric_definitions": {
             "query_usability_rate": (
-                "direct or clarification text route / all completed stage1 candidates"
+                "direct or clarification text route / all completed admission candidates"
             ),
             "semantic_label_fit_rate": (
                 "category_fit=exact among direct or clarification text route candidates"
             ),
-            "stage1_admission_rate": (
-                "policy admitted / all completed stage1 candidates"
+            "admission_rate": (
+                "policy admitted / all completed admission candidates"
             ),
             "scope_l2_coverage_rate": (
                 "final covered L2 / reporting scope L2; P1 uses frozen quota L2, "
-                "P0/P2 use stage1-evaluated L2"
+                "P0/P2 use admission-evaluated L2"
             ),
             "p1_quota_fulfillment_rate": (
                 "sum(min(final L2 count, frozen quota)) / sum(frozen L2 quota)"
@@ -586,10 +592,10 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         raise RunReportError("P1 补采诊断结构非法")
     if (
         sum(int(row["evaluated"]) for row in diagnostics["rounds"])
-        != sum(int(row["stage1_evaluated"]) for row in report["sets"]["P1"]["waves"]
+        != sum(int(row["admission_evaluated"]) for row in report["sets"]["P1"]["waves"]
            if int(row["round_id"]) > 0)
     ):
-        raise RunReportError("P1 补采诊断与 Stage1 波次数量不守恒")
+        raise RunReportError("P1 补采诊断与 准入评估 波次数量不守恒")
     p2_diagnostics = report["p2_diagnostics"]
     if not isinstance(p2_diagnostics, Mapping) or not isinstance(p2_diagnostics.get("rounds"), list):
         raise RunReportError("P2 自适应诊断结构非法")
@@ -716,7 +722,7 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
             phase_duration = batch.get("phase_duration_ms")
             if (
                 not isinstance(phase_duration, Mapping)
-                or set(phase_duration) != {"planning", "stage1", "challenge", "selection"}
+                or set(phase_duration) != {"planning", "admission", "challenge", "selection"}
                 or any(type(value) is not int or value < 0 for value in phase_duration.values())
             ):
                 raise RunReportError("P2 批次阶段耗时结构非法")
@@ -724,7 +730,7 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
                 ("requested", "requested_by_source"),
                 ("sampled", "sampled_by_source"),
                 ("after_dedup", "after_dedup_by_source"),
-                ("stage1_pass", "stage1_pass_by_source"),
+                ("admission_pass", "admission_pass_by_source"),
                 ("judge_pass", "judge_pass_by_source"),
             ):
                 values = batch.get(by_source)
@@ -737,17 +743,17 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
     phase_duration_ms = p2_diagnostics.get("phase_duration_ms")
     if (
         not isinstance(phase_duration_ms, Mapping)
-        or set(phase_duration_ms) != {"planning", "stage1", "challenge", "selection"}
+        or set(phase_duration_ms) != {"planning", "admission", "challenge", "selection"}
         or any(type(value) is not int or value < 0 for value in phase_duration_ms.values())
         or phase_duration_ms != {
             phase: sum(int(batch["phase_duration_ms"][phase]) for batch in batches)
-            for phase in ("planning", "stage1", "challenge", "selection")
+            for phase in ("planning", "admission", "challenge", "selection")
         }
     ):
         raise RunReportError("P2 阶段耗时与批次不守恒")
     funnel_fields = {
         "candidate_capacity", "requested", "actual_sampled", "after_dedup",
-        "stage1_pass", "judge_pass", "final",
+        "admission_pass", "judge_pass", "final",
     }
     for source in P2_SOURCE_NAMES:
         row = source_funnel[source]
@@ -759,7 +765,7 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
                 row["candidate_capacity"] >= row["actual_sampled"]
                 and row["requested"] >= row["actual_sampled"]
                 and row["actual_sampled"] >= row["after_dedup"]
-                >= row["stage1_pass"] >= row["judge_pass"] >= row["final"]
+                >= row["admission_pass"] >= row["judge_pass"] >= row["final"]
             )
         ):
             raise RunReportError(f"P2 来源池 {source} 漏斗数量非法")
@@ -767,7 +773,7 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
             "requested": sum(int(batch.get("requested_by_source", {}).get(source, 0)) for batch in batches),
             "actual_sampled": sum(int(batch.get("sampled_by_source", {}).get(source, 0)) for batch in batches),
             "after_dedup": sum(int(batch.get("after_dedup_by_source", {}).get(source, 0)) for batch in batches),
-            "stage1_pass": sum(int(batch.get("stage1_pass_by_source", {}).get(source, 0)) for batch in batches),
+            "admission_pass": sum(int(batch.get("admission_pass_by_source", {}).get(source, 0)) for batch in batches),
             "judge_pass": sum(int(batch.get("judge_pass_by_source", {}).get(source, 0)) for batch in batches),
         }
         if any(int(row[key]) != value for key, value in expected.items()):
@@ -788,42 +794,50 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         set_report = report["sets"][set_name]
         if not isinstance(set_report, Mapping):
             raise RunReportError(f"{set_name} 报告必须是对象")
-        blockers = set_report.get("stage1_blocking_counts")
-        evaluated = set_report.get("stage1_evaluated", 0)
-        groups = set_report.get("stage1_admission_groups")
-        intents = set_report.get("stage1_intent_counts")
+        downstream = set_report.get("downstream_quality")
+        scores = downstream.get("score_distribution") if isinstance(downstream, Mapping) else None
+        if (not isinstance(scores, Mapping) or set(scores) != {str(x) for x in range(1, 6)}
+                or any(type(x) is not int or x < 0 for x in scores.values())
+                or sum(scores.values()) != set_report.get("final_count")
+                or downstream.get("evaluated") != set_report.get("final_count")
+                or downstream.get("quality_rubric_version") != 1):
+            raise RunReportError(f"{set_name} Stage2质量分布不守恒")
+        blockers = set_report.get("admission_blocking_counts")
+        evaluated = set_report.get("admission_evaluated", 0)
+        groups = set_report.get("admission_groups")
+        intents = set_report.get("admission_intent_counts")
         if (not isinstance(groups, Mapping) or set(groups) != set(ADMISSION_GROUPS)
                 or any(type(v) is not int or v < 0 for v in groups.values())
                 or sum(groups.values()) != evaluated
-                or groups["excluded"] != evaluated - set_report.get("stage1_pass", 0)
+                or groups["excluded"] != evaluated - set_report.get("admission_pass", 0)
                 or not isinstance(intents, Mapping) or set(intents) != INTENT_LABELS
                 or any(type(v) is not int or v < 0 for v in intents.values())
                 or sum(intents.values()) != evaluated):
-            raise RunReportError(f"{set_name} Stage1 目标类型或五组统计不守恒")
-        if (not isinstance(blockers, Mapping) or set(blockers) != set(STAGE1_BLOCKING_ISSUES)
+            raise RunReportError(f"{set_name} 准入评估 目标类型或五组统计不守恒")
+        if (not isinstance(blockers, Mapping) or set(blockers) != set(ADMISSION_BLOCKING_ISSUES)
                 or any(type(count) is not int or not 0 <= count <= evaluated for count in blockers.values())):
-            raise RunReportError(f"{set_name} Stage1 阻断统计非法；多原因计数允许重叠")
-        routes = set_report.get("stage1_route_counts")
-        admitted_routes = set_report.get("stage1_admitted_route_counts")
+            raise RunReportError(f"{set_name} 准入评估 阻断统计非法；多原因计数允许重叠")
+        routes = set_report.get("admission_route_counts")
+        admitted_routes = set_report.get("admission_admitted_route_counts")
         if (not isinstance(routes, Mapping) or set(routes) != {"direct", "clarification", "excluded"}
                 or any(type(v) is not int or v < 0 for v in routes.values()) or sum(routes.values()) != evaluated
                 or not isinstance(admitted_routes, Mapping) or set(admitted_routes) != {"direct", "clarification"}
                 or any(type(v) is not int or not 0 <= v <= routes[k] for k, v in admitted_routes.items())
-                or sum(admitted_routes.values()) != set_report.get("stage1_pass", 0)):
-            raise RunReportError(f"{set_name} Stage1 route 统计不守恒")
-        if set_report.get("stage1_route_admission_rates") != {
+                or sum(admitted_routes.values()) != set_report.get("admission_pass", 0)):
+            raise RunReportError(f"{set_name} 准入评估 route 统计不守恒")
+        if set_report.get("admission_route_admission_rates") != {
             route: _ratio(admitted_routes[route], routes[route]) for route in ("direct", "clarification")
         }:
-            raise RunReportError(f"{set_name} Stage1 分类型准入率不一致")
+            raise RunReportError(f"{set_name} 准入评估 分类型准入率不一致")
         if (groups["task_clarification"] != admitted_routes["clarification"]
                 or sum(groups[k] for k in ("dialogue_without_open_points", "dialogue_with_open_points", "task_direct")) != admitted_routes["direct"]):
-            raise RunReportError(f"{set_name} Stage1 五组与路线统计不一致")
-        rejections = set_report.get("stage1_rejection_combinations")
+            raise RunReportError(f"{set_name} 准入评估 五组与路线统计不一致")
+        rejections = set_report.get("admission_rejection_combinations")
         if (not isinstance(rejections, Mapping)
-                or any(not isinstance(key, str) or not key or any(x not in STAGE1_BLOCKING_ISSUES for x in key.split("/"))
+                or any(not isinstance(key, str) or not key or any(x not in ADMISSION_BLOCKING_ISSUES for x in key.split("/"))
                        or type(count) is not int or count <= 0 for key, count in rejections.items())
-                or sum(rejections.values()) != evaluated - set_report.get("stage1_pass", 0)):
-            raise RunReportError(f"{set_name} Stage1 策略拒绝原因不守恒")
+                or sum(rejections.values()) != evaluated - set_report.get("admission_pass", 0)):
+            raise RunReportError(f"{set_name} 准入评估 策略拒绝原因不守恒")
         final_count = set_report["final_count"]
         zero_reasons = set_report.get("executable_zero_reasons")
         if (not isinstance(zero_reasons, Mapping) or set(zero_reasons) != set(EXECUTABLE_REASONS)
@@ -832,7 +846,7 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
         for metric in (
             "query_usability_rate",
             "semantic_label_fit_rate",
-            "stage1_admission_rate",
+            "admission_rate",
             "taxonomy_l1_coverage_rate",
             "taxonomy_l2_coverage_rate",
             "scope_l2_coverage_rate",
@@ -873,17 +887,17 @@ def validate_run_report(report: Mapping[str, Any]) -> None:
             l2_rows.extend(l1_row["l2"])
         if len(l2_rows) != report["taxonomy"]["l2_count"]:
             raise RunReportError(f"{set_name} 语义树 L2 数量非法")
-        if sum(int(row["stage1_evaluated"]) for row in l2_rows) != set_report["stage1_evaluated"]:
+        if sum(int(row["admission_evaluated"]) for row in l2_rows) != set_report["admission_evaluated"]:
             raise RunReportError(f"{set_name} L2 候选统计不守恒")
         if sum(int(row["final_count"]) for row in l2_rows) != set_report["final_count"]:
             raise RunReportError(f"{set_name} L2 最终统计不守恒")
-        if sum(int(row["stage1_evaluated"]) for row in tree) != set_report["stage1_evaluated"]:
+        if sum(int(row["admission_evaluated"]) for row in tree) != set_report["admission_evaluated"]:
             raise RunReportError(f"{set_name} L1 候选统计不守恒")
         if sum(int(row["final_count"]) for row in tree) != set_report["final_count"]:
             raise RunReportError(f"{set_name} L1 最终统计不守恒")
-        if sum(int(value) for value in set_report["category_fit_distribution"].values()) != set_report["stage1_evaluated"]:
+        if sum(int(value) for value in set_report["category_fit_distribution"].values()) != set_report["admission_evaluated"]:
             raise RunReportError(f"{set_name} category_fit 分布不守恒")
-        if sum(int(row["stage1_evaluated"]) for row in set_report["waves"]) != set_report["stage1_evaluated"]:
+        if sum(int(row["admission_evaluated"]) for row in set_report["waves"]) != set_report["admission_evaluated"]:
             raise RunReportError(f"{set_name} 波次候选统计不守恒")
         if sum(int(row["final_count"]) for row in set_report["waves"]) != set_report["final_count"]:
             raise RunReportError(f"{set_name} 波次最终统计不守恒")
@@ -910,20 +924,20 @@ def render_run_report(report: Mapping[str, Any]) -> str:
         "# Screening v4 批跑报告",
         "",
         f"> Run ID：`{_cell(report['run_id'])}`  ",
-        "> 语义标签一致率由 Stage1 LLM 判断得到，是自动评估指标，不等同于人工金标准确率。",
+        "> 语义标签一致率由 准入评估 LLM 判断得到，是自动评估指标，不等同于人工金标准确率。",
         "",
         "## 核心汇报指标",
         "",
-        "| 集合 | Stage1 候选 | Query 基础可用率 | 语义标签一致率 | Stage1 准入率 | 最终数量 | 目标范围 L2 覆盖率 | P1 配额完成率 |",
+        "| 集合 | 准入评估 候选 | Query 基础可用率 | 语义标签一致率 | 准入评估 准入率 | 最终数量 | 目标范围 L2 覆盖率 | P1 配额完成率 |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for set_name in SET_NAMES:
         value = report["sets"][set_name]
         lines.append(
-            f"| {set_name} | {value['stage1_evaluated']} | "
+            f"| {set_name} | {value['admission_evaluated']} | "
             f"{_pct(value['query_usability_rate'])} | "
             f"{_pct(value['semantic_label_fit_rate'])} | "
-            f"{_pct(value['stage1_admission_rate'])} | "
+            f"{_pct(value['admission_rate'])} | "
             f"{value['final_count']} | "
             f"{_pct(value['scope_l2_coverage_rate'])} | "
             f"{_pct(value['p1_quota_fulfillment_rate'])} |"
@@ -934,10 +948,10 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             "",
             "## 指标口径",
             "",
-            "- Query 基础可用率：Stage1 候选中可进入直接测试或澄清测试的比例，独立于类别核验。",
+            "- Query 基础可用率：准入评估 候选中可进入直接测试或澄清测试的比例，独立于类别核验。",
             "- 语义标签一致率：基础可用 Query 中 category_fit=exact 的比例。",
-            "- Stage1 准入率：冻结筛选策略允许纳入的样本占全部 Stage1 候选的比例。",
-            "- P1 的目标范围为冻结配额大于 0 的 L2；P0/P2 的目标范围为实际进入 Stage1 的 L2。",
+            "- 准入评估 准入率：冻结筛选策略允许纳入的样本占全部 准入评估 候选的比例。",
+            "- P1 的目标范围为冻结配额大于 0 的 L2；P0/P2 的目标范围为实际进入 准入评估 的 L2。",
             "- 最终集 category_fit=exact 为准入约束，不作为独立准确率结论。",
         ]
     )
@@ -972,7 +986,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
         lines.extend(
             [
                 "",
-                "| L1 | Taxonomy population | L2 数 | 目标 L2 | 已覆盖目标 L2 | Stage1 候选 | 基础可用率 | 标签一致率 | Stage1 通过 | 最终数量 |",
+                "| L1 | Taxonomy population | L2 数 | 目标 L2 | 已覆盖目标 L2 | 准入评估 候选 | 基础可用率 | 标签一致率 | 准入评估 通过 | 最终数量 |",
                 "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
@@ -980,24 +994,24 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             lines.append(
                 f"| {_cell(l1_row['l1'])} | {l1_row['taxonomy_population']} | "
                 f"{l1_row['taxonomy_l2_count']} | {l1_row['coverage_scope_l2_count']} | "
-                f"{l1_row['covered_scope_l2_count']} | {l1_row['stage1_evaluated']} | "
+                f"{l1_row['covered_scope_l2_count']} | {l1_row['admission_evaluated']} | "
                 f"{_pct(l1_row['query_usability_rate'])} | "
                 f"{_pct(l1_row['semantic_label_fit_rate'])} | "
-                f"{l1_row['stage1_pass']} | {l1_row['final_count']} |"
+                f"{l1_row['admission_pass']} | {l1_row['final_count']} |"
             )
 
         relevant_l2 = [
             row
             for l1_row in value["semantic_tree"]
             for row in l1_row["l2"]
-            if row["stage1_evaluated"] or row["final_count"] or row["in_coverage_scope"]
+            if row["admission_evaluated"] or row["final_count"] or row["in_coverage_scope"]
         ]
         lines.extend(
             [
                 "",
                 "### L2 明细",
                 "",
-                "| L1 | L2 | Population | 配额 | Stage1 候选 | 基础可用 | exact（可用中） | 标签一致率 | Stage1 通过 | 最终数量 | 缺口 |",
+                "| L1 | L2 | Population | 配额 | 准入评估 候选 | 基础可用 | exact（可用中） | 标签一致率 | 准入评估 通过 | 最终数量 | 缺口 |",
                 "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
@@ -1006,9 +1020,9 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             deficit = "—" if row["deficit"] is None else row["deficit"]
             lines.append(
                 f"| {_cell(row['l1'])} | {_cell(row['l2'])} | "
-                f"{row['taxonomy_population']} | {quota} | {row['stage1_evaluated']} | "
+                f"{row['taxonomy_population']} | {quota} | {row['admission_evaluated']} | "
                 f"{row['usable_queries']} | {row['category_exact_among_usable']} | "
-                f"{_pct(row['semantic_label_fit_rate'])} | {row['stage1_pass']} | "
+                f"{_pct(row['semantic_label_fit_rate'])} | {row['admission_pass']} | "
                 f"{row['final_count']} | {deficit} |"
             )
 
@@ -1017,16 +1031,16 @@ def render_run_report(report: Mapping[str, Any]) -> str:
                 "",
                 "### 波次统计",
                 "",
-                "| 来源 | 轮次 | Stage1 候选 | 基础可用率 | 标签一致率 | Stage1 通过 | 最终入选 |",
+                "| 来源 | 轮次 | 准入评估 候选 | 基础可用率 | 标签一致率 | 准入评估 通过 | 最终入选 |",
                 "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for wave in value["waves"]:
             lines.append(
-                f"| {wave['origin']} | {wave['round_id']} | {wave['stage1_evaluated']} | "
+                f"| {wave['origin']} | {wave['round_id']} | {wave['admission_evaluated']} | "
                 f"{_pct(wave['query_usability_rate'])} | "
                 f"{_pct(wave['semantic_label_fit_rate'])} | "
-                f"{wave['stage1_pass']} | {wave['final_count']} |"
+                f"{wave['admission_pass']} | {wave['final_count']} |"
             )
 
         category = value["category_fit_distribution"]
@@ -1035,9 +1049,10 @@ def render_run_report(report: Mapping[str, Any]) -> str:
                 "",
                 "### 质量摘要",
                 "",
-                f"- Stage1 category_fit：exact={category['exact']}，partial={category['partial']}，mismatch={category['mismatch']}。",
-                f"- Stage1 五组准入结果：{json.dumps(value['stage1_admission_groups'], ensure_ascii=False, sort_keys=True)}；目标类型={json.dumps(value['stage1_intent_counts'], ensure_ascii=False, sort_keys=True)}。",
-                f"- Stage1 阻断原因（多原因计数允许重叠）：{json.dumps(value['stage1_blocking_counts'], ensure_ascii=False, sort_keys=True)}；routes={json.dumps(value['stage1_route_counts'], ensure_ascii=False, sort_keys=True)}。",
+                f"- 准入评估 category_fit：exact={category['exact']}，partial={category['partial']}，mismatch={category['mismatch']}。",
+                f"- 准入评估五组结果：{json.dumps(value['admission_groups'], ensure_ascii=False, sort_keys=True)}；目标类型={json.dumps(value['admission_intent_counts'], ensure_ascii=False, sort_keys=True)}。",
+                f"- Stage2 下游质量评分：{json.dumps(value['downstream_quality']['score_distribution'], ensure_ascii=False, sort_keys=True)}；待复核信号={len(value['downstream_quality']['review_disagreements'])}。",
+                f"- 准入评估 阻断原因（多原因计数允许重叠）：{json.dumps(value['admission_blocking_counts'], ensure_ascii=False, sort_keys=True)}；routes={json.dumps(value['admission_route_counts'], ensure_ascii=False, sort_keys=True)}。",
                 f"- intent_label：{json.dumps(value['final_quality_distribution']['intent_label'], ensure_ascii=False, sort_keys=True)}。",
                 f"- executable 置零原因：{json.dumps(value['executable_zero_reasons'], ensure_ascii=False, sort_keys=True)}。",
                 f"- executable：{json.dumps(value['final_quality_distribution']['executable'], ensure_ascii=False, sort_keys=True)}。",
@@ -1052,7 +1067,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             f"- 尚有缺口的 L2：{report['p1_diagnostics']['l2_with_deficit']}；其中缺 1–2 条的 L2：{report['p1_diagnostics']['small_deficit_l2']}，合计缺口 {report['p1_diagnostics']['small_deficit_total']}。",
             "- 完整的逐批 L2 和 cluster 数据见 `P1/supplement_summary.json`。",
             "",
-            "| 轮次 | 小批数 | 计划请求 | 实际抽样 | Stage1 评估 | 基础可用 | 类别 exact | 通过 | 入集 | 停止原因 |",
+            "| 轮次 | 小批数 | 计划请求 | 实际抽样 | 准入评估 评估 | 基础可用 | 类别 exact | 通过 | 入集 | 停止原因 |",
             "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
         ]
     )
@@ -1060,7 +1075,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
         lines.append(
             f"| {row['round']} | {row['batch_count']} | {row['planned_request']} | "
             f"{row['sampled']} | {row['evaluated']} | {row['usable']} | {row['exact']} | "
-            f"{row['stage1_pass']} | {row['admitted']} | {row['stop_reason']} |"
+            f"{row['admission_pass']} | {row['admitted']} | {row['stop_reason']} |"
         )
     lines.extend(
         [
@@ -1082,7 +1097,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             "",
             "### 损耗最多的 cluster",
             "",
-            "| 原因 | L2 | cluster | Stage1 评估 | 基础可用 | exact |",
+            "| 原因 | L2 | cluster | 准入评估 评估 | 基础可用 | exact |",
             "| --- | --- | --- | ---: | ---: | ---: |",
         ]
     )
@@ -1125,7 +1140,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             "",
             "### 来源池漏斗",
             "",
-            "| 来源 | 候选容量 | 请求 | 实际抽取 | 去重后 | Stage1 通过 | Judge 通过 | 最终入集 |",
+            "| 来源 | 候选容量 | 请求 | 实际抽取 | 去重后 | 准入评估 通过 | Judge 通过 | 最终入集 |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -1133,7 +1148,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
         row = p2["source_funnel"][source]
         lines.append(
             f"| {source} | {row['candidate_capacity']} | {row['requested']} | "
-            f"{row['actual_sampled']} | {row['after_dedup']} | {row['stage1_pass']} | "
+            f"{row['actual_sampled']} | {row['after_dedup']} | {row['admission_pass']} | "
             f"{row['judge_pass']} | {row['final']} |"
         )
     runtime = p2.get("challenge_runtime", {})
@@ -1154,7 +1169,7 @@ def render_run_report(report: Mapping[str, Any]) -> str:
             "",
             "- “全面性”主要看 P1 的目标范围 L2 覆盖率、冻结配额完成率和逐 L2 缺口。",
             "- P0/P2 有各自的结构和困难样本门槛，不应以全 taxonomy L2 覆盖作为硬目标。",
-            "- “可用性”同时参考 Query 基础可用率、语义标签一致率和 Stage1 准入率。",
+            "- “可用性”同时参考 Query 基础可用率、语义标签一致率和 准入评估 准入率。",
             "- 如需对外声明真实标签准确率，应在此自动报告之外增加按 L2 分层的人工抽检。",
             "",
         ]
@@ -1176,7 +1191,7 @@ def write_run_report(
     taxonomy: TaxonomyMappings,
     evaluated_candidates: Mapping[str, Sequence[Mapping[str, Any]]],
     evaluation_rounds: Mapping[str, Mapping[str, int]],
-    stage1_results: Mapping[str, Mapping[str, Any]],
+    admission_results: Mapping[str, Mapping[str, Any]],
     final_records: Mapping[str, Sequence[Mapping[str, Any]]],
     p1_target_quotas: Mapping[str, int],
     build_summary: Mapping[str, Any],
@@ -1217,7 +1232,7 @@ def write_run_report(
         taxonomy=taxonomy,
         evaluated_candidates=evaluated_candidates,
         evaluation_rounds=evaluation_rounds,
-        stage1_results=stage1_results,
+        admission_results=admission_results,
         final_records=final_records,
         p1_target_quotas=p1_target_quotas,
         build_summary=build_summary,

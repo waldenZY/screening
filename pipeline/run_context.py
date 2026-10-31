@@ -27,8 +27,8 @@ from ..quality.runner import QUALITY_CONTRACT_VERSION
 from .checkpoints import CHECKPOINT_SCHEMA_VERSION
 
 
-PIPELINE_VERSION = 8
-MANIFEST_SCHEMA_VERSION = 8
+PIPELINE_VERSION = 9
+MANIFEST_SCHEMA_VERSION = 9
 _LOCK = threading.RLock()
 _RESUMABLE = {"created", "running", "incomplete", "partial_failed", "publish_failed"}
 _REUSABLE = {"completed", "published"}
@@ -60,7 +60,7 @@ def build_run_contract(
     build_config: BuildConfig,
     quality_config: QualityRunConfig,
     *,
-    stage1_prompt: str,
+    admission_prompt: str,
     category_prompt: str,
     screening_policy: Mapping[str, Any],
     challenge_prompt: str,
@@ -95,7 +95,7 @@ def build_run_contract(
         "quality_run_config": asdict(quality_config),
         "screening_policy": dict(screening_policy),
         "prompts": {
-            "stage1_sha256": _prompt_hash(stage1_prompt),
+            "admission_sha256": _prompt_hash(admission_prompt),
             "category_sha256": _prompt_hash(category_prompt),
             "challenge_sha256": _prompt_hash(challenge_prompt),
             **{f"{name}_sha256": _prompt_hash(prompt) for name, prompt in additional_prompts.items()},
@@ -139,7 +139,7 @@ def prepare_run_context(
     build_config: BuildConfig,
     quality_config: QualityRunConfig,
     *,
-    stage1_prompt: str,
+    admission_prompt: str,
     category_prompt: str,
     screening_policy: Mapping[str, Any],
     challenge_prompt: str,
@@ -164,7 +164,7 @@ def prepare_run_context(
         taxonomy_path,
         build_config,
         quality_config,
-        stage1_prompt=stage1_prompt,
+        admission_prompt=admission_prompt,
         category_prompt=category_prompt,
         screening_policy=screening_policy,
         challenge_prompt=challenge_prompt,
@@ -217,7 +217,7 @@ def prepare_run_context(
         prompt_root = run_root / "prompts"
         prompt_root.mkdir()
         (prompt_root / "category.md").write_text(category_prompt, encoding="utf-8", newline="\n")
-        (prompt_root / "stage1.md").write_text(stage1_prompt, encoding="utf-8", newline="\n")
+        (prompt_root / "admission.md").write_text(admission_prompt, encoding="utf-8", newline="\n")
         (prompt_root / "challenge.md").write_text(challenge_prompt, encoding="utf-8", newline="\n")
         for name, prompt in additional_prompts.items():
             (prompt_root / f"{name}.md").write_text(prompt, encoding="utf-8", newline="\n")
@@ -249,13 +249,16 @@ def prepare_run_context(
             },
             "contract": contract,
             "stages": {
+                "preprocessing": {"status": "completed"},
+                "stage1": {"status": "pending"},
+                "stage2": {"status": "pending"},
                 "canonical_index": {"status": "completed"},
                 "sampling_p0": {"status": "pending"},
                 "sampling_p1": {"status": "pending"},
                 "sampling_p2": {"status": "pending"},
-                "quality_stage1_initial": {"status": "pending"},
+                "quality_admission_initial": {"status": "pending"},
                 "p012_build": {"status": "pending"},
-                "quality_stage1": {"status": "pending"},
+                "quality_admission": {"status": "pending"},
                 "p1_supplement": {"status": "pending"},
                 "p2_supplement": {"status": "pending"},
                 "quality_p2_challenge": {"status": "pending"},

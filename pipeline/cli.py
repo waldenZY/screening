@@ -110,12 +110,12 @@ def _execute_pipeline_impl(
     publish_root: Path | None,
     replace: bool = False,
 ) -> int:
-    """Execute or resume A-E, then optionally publish the three labeled files."""
+    """Execute/resume Stage1 collection construction and Stage2 downstream delivery."""
     validate_canonical_source(index.metadata)
     update_manifest(
         context.run_root,
         status="running",
-        stages={"p012_build": {"status": "running", "error": None}},
+        stages={"p012_build": {"status": "running", "error": None}, "stage1": {"status": "running"}, "stage2": {"status": "pending"}},
     )
     build_started_ns = time.monotonic_ns()
     branch_publication: JsonObject = {}
@@ -169,7 +169,7 @@ def _execute_pipeline_impl(
         elif current_manifest.get("stages", {}).get("p1_supplement", {}).get("status") == "running":
             stage_name = "p1_supplement"
         else:
-            stage_name = "quality_stage1_initial"
+            stage_name = "quality_admission_initial"
         stages: JsonObject = {
             "p012_build": {"status": "incomplete", "error": str(exc)},
             stage_name: {
@@ -178,8 +178,8 @@ def _execute_pipeline_impl(
                 "engineering_failures": list(exc.failures),
             },
         }
-        if exc.stage in {"stage1", "stage1_features", "stage1_category"}:
-            stages["quality_stage1"] = {
+        if exc.stage in {"admission", "admission_features", "admission_category"}:
+            stages["quality_admission"] = {
                 "status": "incomplete",
                 "engineering_failure_count": len(exc.failures),
                 "engineering_failures": list(exc.failures),
@@ -199,6 +199,8 @@ def _execute_pipeline_impl(
             context.run_root,
             status=status,
             stages={
+                "stage1": {"status": "completed" if all((context.run_root / name / "stage1.frozen.jsonl").is_file() for name in ("P0", "P1", "P2")) else "incomplete"},
+                "stage2": {"status": "incomplete"},
                 "p012_build": {
                     "status": status,
                     "failed_branches": dict(outcome.errors),
@@ -227,8 +229,10 @@ def _execute_pipeline_impl(
         context.run_root,
         status="completed",
         stages={
+            "stage1": {"status": "completed"},
+            "stage2": {"status": "completed"},
             "p012_build": {"status": "completed", "error": None},
-            "quality_stage1": {"status": "completed", "error": None},
+            "quality_admission": {"status": "completed", "error": None},
             "p1_supplement": {
                 "status": "completed",
                 "summary": outcome.summary["p1_supplement"],
@@ -323,13 +327,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--new-run", action="store_true")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--stage1-prompt", type=Path, default=None)
+    parser.add_argument("--admission-prompt", type=Path, default=None)
     parser.add_argument("--category-prompt", type=Path, default=None)
     parser.add_argument("--challenge-prompt", type=Path, default=None)
-    parser.add_argument("--stage2-prompt", type=Path, default=None, help="可选 Stage2 Prompt；不隐式启用")
-    optional_stage2 = parser.add_mutually_exclusive_group()
-    optional_stage2.add_argument("--enable-stage2", dest="stage2_enabled", action="store_true", default=None)
-    optional_stage2.add_argument("--disable-stage2", dest="stage2_enabled", action="store_false")
+    parser.add_argument("--quality-annotation-prompt", type=Path, default=None, help="Stage2 下游质量标注 Prompt")
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--max-retries", type=int, default=None)
     parser.add_argument("--sleep", type=float, default=None)
@@ -390,11 +391,10 @@ def main(
                 "taxonomy": args.taxonomy,
                 "risk_keywords": args.risk_keywords,
                 "output_root": args.output_root,
-                "stage1_prompt": args.stage1_prompt,
+                "admission_prompt": args.admission_prompt,
                 "category_prompt": args.category_prompt,
                 "challenge_prompt": args.challenge_prompt,
-                "stage2_prompt": args.stage2_prompt,
-                "stage2_enabled": args.stage2_enabled,
+                "quality_annotation_prompt": args.quality_annotation_prompt,
                 "workers": args.workers,
                 "max_retries": args.max_retries,
                 "sleep_seconds": args.sleep,
@@ -422,12 +422,10 @@ def main(
         build_config = effective.build
         quality_config = effective.quality
         category_prompt = effective.category_prompt.read_text(encoding="utf-8")
-        stage1_prompt = effective.stage1_prompt.read_text(encoding="utf-8")
+        admission_prompt = effective.admission_prompt.read_text(encoding="utf-8")
         challenge_prompt = effective.challenge_prompt.read_text(encoding="utf-8")
-        additional_stages = {}
-        if effective.stage2_enabled:
-            from ..quality.optional_stage2 import stage_definition
-            additional_stages["stage2"] = stage_definition(effective.enabled_stage2_prompt.read_text(encoding="utf-8"))
+        from ..quality.annotation import stage_definition
+        additional_stages = {"quality_annotation": stage_definition(effective.quality_annotation_prompt.read_text(encoding="utf-8"))}
         additional_prompts = {name: definition.prompt for name, definition in additional_stages.items()}
         llm_config = llm_config_override or load_llm_config()
         validate_llm_dependency()
@@ -435,7 +433,7 @@ def main(
         llm_call = llm_call_override or llm_config.bind()
         preflight = run_preflight(
             effective,
-            prompts={"stage1": stage1_prompt, "category": category_prompt, "challenge": challenge_prompt, **additional_prompts},
+            prompts={"admission": admission_prompt, "category": category_prompt, "challenge": challenge_prompt, **additional_prompts},
             llm_config=llm_config, llm_call=llm_call, replace=args.replace, logger=logger,
         )
         taxonomy_sha256 = sha256_file(effective.taxonomy)
@@ -466,7 +464,7 @@ def main(
             index,
             build_config,
             quality_config,
-            stage1_prompt=stage1_prompt,
+            admission_prompt=admission_prompt,
             category_prompt=category_prompt,
             screening_policy=effective.screening_policy,
             challenge_prompt=challenge_prompt,
@@ -492,7 +490,7 @@ def main(
         )
         runner = QualityRunner(
             context.run_root / "quality",
-            stage1_prompt=stage1_prompt,
+            admission_prompt=admission_prompt,
             category_prompt=category_prompt,
             screening_policy=effective.screening_policy,
             challenge_prompt=challenge_prompt,

@@ -10,7 +10,7 @@ context_turns
 target_query
 L1
 L2
-stage1_features
+admission_features
 ```
 
 多轮样本必须结合 `context_turns + target_query` 判断。不得使用输入之外的信息。
@@ -32,7 +32,7 @@ stage1_features
 - 轻微口语、常见省略或不影响理解的 ASR 偏差；
 - 不可恢复的必要背景、材料缺失、无需求锚点的碎片或类别错误。
 
-stage1_features 包含 intent_label、intent_reason、open_points、dependencies。结合原始会话理解需求和信息缺口。dialogue 有澄清点也可直接使用，task 可能需要先澄清；澄清本身不等于 Challenge。纯主题或实体、低频本身不是 Challenge。不得借特征或类别补造任务，不改变原有挑战类型与优先级。
+admission_features 包含 intent_label、intent_reason、open_points、dependencies。结合原始会话理解需求和信息缺口。dialogue 有澄清点也可直接使用，task 可能需要先澄清；澄清本身不等于 Challenge。纯主题或实体、低频本身不是 Challenge。不得借特征或类别补造任务，不改变原有挑战类型与优先级。
 
 `challenge_types` 可以包含 1～3 个类型。`primary_challenge` 选择“如果移除，最能降低
 样本难度”的类型。无法区分时按以下优先级选择：

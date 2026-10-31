@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..quality.stage1 import stage1_usable, category_fit, validate_features, validate_category, build_stage1_result
+from ..quality.admission import admission_usable, category_fit, validate_features, validate_category, build_admission_result
 from ..candidate.index import (
     CanonicalIndexHandle,
     validate_canonical_database,
@@ -43,8 +43,8 @@ from .screened import (
     stable_record_sha256,
     validate_screened_canonical_records,
 )
-from ..quality.runner import (CHALLENGE_FIELDS, CHALLENGE_TYPES, QUALITY_CONTRACT_VERSION, stage1_quality_input, stage1_input_sha256, stage1_task_key, validate_challenge_result)
-from ..quality.stage1 import (STAGE1_FIELDS, stage1_passes, stage1_issue_summary, validate_stage1_result)
+from ..quality.runner import (CHALLENGE_FIELDS, CHALLENGE_TYPES, QUALITY_CONTRACT_VERSION, admission_quality_input, admission_input_sha256, admission_task_key, validate_challenge_result)
+from ..quality.admission import (ADMISSION_FIELDS, admission_passes, admission_issue_summary, validate_admission_result)
 
 
 class PublicationError(ValueError):
@@ -148,48 +148,42 @@ def _jsonl_metadata(path: Path, run_root: Path, records: list[JsonObject]) -> Js
     }
 
 
-def _optional_annotations(run_root: Path, set_name: str, records, manifest, quality_contract) -> JsonObject:
-    enabled = "stage2_sha256" in manifest["contract"]["prompts"]
-    if quality_contract.get("additional_stages") != (["stage2"] if enabled else []):
-        raise PublicationError("附加标注启用状态与冻结契约不一致")
-    if not enabled:
-        if ((run_root / set_name / "optional_annotations").exists()
-                or any((run_root / "quality").glob("stage2_*"))):
-            raise PublicationError("禁用附加标注的 run 包含 Stage2 产物")
-        return {}
-    from ..quality.optional_stage2 import validate_branch
+def _quality_annotations(run_root: Path, set_name: str, records, manifest, quality_contract) -> JsonObject:
+    from ..quality.annotation import validate_branch
     try:
-        return validate_branch(run_root, set_name, records)
+        if any(record["provenance"]["run_id"] != manifest["run_id"] for record in records):
+            raise ValueError("provenance run_id 与本次运行不一致")
+        return validate_branch(run_root, set_name, records, manifest, quality_contract)
     except (ValueError, OSError, KeyError, TypeError) as exc:
-        raise PublicationError("可选 Stage2 标注复验失败") from exc
+        raise PublicationError("Stage2 下游质量标注或 Stage1 冻结产物复验失败") from exc
 
 
 def _task_maps(
     run_root: Path,
 ) -> tuple[dict[str, JsonObject], dict[str, JsonObject], dict[str, JsonObject], dict[str, JsonObject]]:
     quality_root = run_root / "quality"
-    stage1_task_rows = load_jsonl(quality_root / "stage1_tasks.jsonl")
+    admission_task_rows = load_jsonl(quality_root / "admission_tasks.jsonl")
     challenge_task_rows = load_jsonl(quality_root / "challenge_tasks.jsonl")
-    stage1_result_rows = load_jsonl(quality_root / "stage1_results.jsonl")
+    admission_result_rows = load_jsonl(quality_root / "admission_results.jsonl")
     challenge_result_rows = load_jsonl(quality_root / "challenge_results.jsonl")
-    stage1_tasks = {row.get("cache_key"): row for row in stage1_task_rows}
+    admission_tasks = {row.get("cache_key"): row for row in admission_task_rows}
     challenge_tasks = {row.get("cache_key"): row for row in challenge_task_rows}
-    stage1_results = {row.get("cache_key"): row.get("result") for row in stage1_result_rows}
+    admission_results = {row.get("cache_key"): row.get("result") for row in admission_result_rows}
     challenge_results = {row.get("cache_key"): row.get("result") for row in challenge_result_rows}
-    if None in stage1_tasks or len(stage1_tasks) != len(stage1_task_rows):
-        raise PublicationError("第一阶段任务账本存在重复 ID")
+    if None in admission_tasks or len(admission_tasks) != len(admission_task_rows):
+        raise PublicationError("准入评估任务账本存在重复 ID")
     if None in challenge_tasks or len(challenge_tasks) != len(challenge_task_rows):
         raise PublicationError("Challenge 任务账本存在重复 ID")
-    if None in stage1_results or len(stage1_results) != len(stage1_result_rows):
-        raise PublicationError("第一阶段结果账本存在非法或重复 ID")
+    if None in admission_results or len(admission_results) != len(admission_result_rows):
+        raise PublicationError("准入评估结果账本存在非法或重复 ID")
     if None in challenge_results or len(challenge_results) != len(challenge_result_rows):
         raise PublicationError("Challenge 结果账本存在非法或重复 ID")
-    if any(row.get("stage") != "stage1" for row in [*stage1_task_rows, *stage1_result_rows]):
-        raise PublicationError("第一阶段账本 stage 标记非法")
+    if any(row.get("stage") != "admission" for row in [*admission_task_rows, *admission_result_rows]):
+        raise PublicationError("准入评估账本 stage 标记非法")
     if any(row.get("stage") != "challenge" for row in [*challenge_task_rows, *challenge_result_rows]):
         raise PublicationError("Challenge 账本 stage 标记非法")
     for stage, task_map in (
-        ("stage1", stage1_tasks),
+        ("admission", admission_tasks),
         ("challenge", challenge_tasks),
     ):
         cache_hit_rows = load_jsonl(quality_root / f"{stage}_cache_hits.jsonl")
@@ -209,64 +203,64 @@ def _task_maps(
                 or not set(identities).issubset(set(task.get("source_identities", [])))
             ):
                 raise PublicationError(f"{stage} 缓存命中账本内容非法")
-    for result in stage1_results.values():
-        validate_stage1_result(result)
+    for result in admission_results.values():
+        validate_admission_result(result)
     for result in challenge_results.values():
         validate_challenge_result(result)
-    return stage1_tasks, challenge_tasks, stage1_results, challenge_results
+    return admission_tasks, challenge_tasks, admission_results, challenge_results
 
 
-def _validate_stage1_components(quality_root: Path, contract: Mapping[str, Any], tasks: Mapping[str, JsonObject], results: Mapping[str, JsonObject], *, require_complete: bool = True) -> None:
+def _validate_admission_components(quality_root: Path, contract: Mapping[str, Any], tasks: Mapping[str, JsonObject], results: Mapping[str, JsonObject], *, require_complete: bool = True) -> None:
     """Recompute aggregate admission from independently recorded provider results."""
     hashes = contract.get("prompt_hashes", {})
     options = contract.get("options_sha256")
     policy = contract.get("screening_policy")
-    expected_hash = stable_hash({"features": hashes.get("stage1_features"), "category": hashes.get("stage1_category"), "policy": policy})
-    if hashes.get("stage1") != expected_hash or set(tasks) != set(results):
-        raise PublicationError("Stage1 聚合契约或终态不一致")
+    expected_hash = stable_hash({"features": hashes.get("admission_features"), "category": hashes.get("admission_category"), "policy": policy})
+    if hashes.get("admission") != expected_hash or set(tasks) != set(results):
+        raise PublicationError("准入评估 聚合契约或终态不一致")
     components = {}
-    for stage in ("stage1_features", "stage1_category"):
+    for stage in ("admission_features", "admission_category"):
         task_rows = load_jsonl(quality_root / f"{stage}_tasks.jsonl")
         result_rows = load_jsonl(quality_root / f"{stage}_results.jsonl")
         tm = {r.get("cache_key"): r for r in task_rows}
         rm = {r.get("cache_key"): r.get("result") for r in result_rows}
         if None in tm or None in rm or len(tm) != len(task_rows) or len(rm) != len(result_rows):
-            raise PublicationError("Stage1 子任务账本不一致")
+            raise PublicationError("准入评估 子任务账本不一致")
         if not require_complete:
-            field = "feature_task_id" if stage == "stage1_features" else "category_task_id"
+            field = "feature_task_id" if stage == "admission_features" else "category_task_id"
             required = {task.get(field) for task in tasks.values()}
             tm = {key: value for key, value in tm.items() if key in required}
             rm = {key: value for key, value in rm.items() if key in required}
             if set(tm) != required:
-                raise PublicationError("分支缺少 Stage1 子任务")
+                raise PublicationError("分支缺少 准入评估 子任务")
         if set(tm) != set(rm):
-            raise PublicationError("Stage1 子任务缺少合法终态")
+            raise PublicationError("准入评估 子任务缺少合法终态")
         snapshot = quality_root / f"{stage}_prompt.md"
         if not snapshot.is_file() or stable_hash(snapshot.read_text(encoding="utf-8")) != hashes.get(stage):
-            raise PublicationError("Stage1 子任务 Prompt 不一致")
+            raise PublicationError("准入评估 子任务 Prompt 不一致")
         if any(r.get("stage") != stage for r in result_rows):
-            raise PublicationError("Stage1 子任务结果 stage 非法")
+            raise PublicationError("准入评估 子任务结果 stage 非法")
         for key in rm:
             task = tm[key]
             expected = stable_hash({"stage": stage, "prompt": hashes[stage], "options": options, "input_sha256": task.get("input_sha256")})
             if (key != expected or task.get("stage") != stage or task.get("prompt_sha256") != hashes[stage]
                     or task.get("options_sha256") != options):
-                raise PublicationError("Stage1 子任务身份不一致")
-            (validate_features if stage == "stage1_features" else validate_category)(rm[key])
+                raise PublicationError("准入评估 子任务身份不一致")
+            (validate_features if stage == "admission_features" else validate_category)(rm[key])
         components[stage] = (tm, rm)
     for key, task in tasks.items():
         ids = task.get("source_identities", [])
         linked = []
-        for stage, field in (("stage1_features", "feature_task_id"), ("stage1_category", "category_task_id")):
+        for stage, field in (("admission_features", "feature_task_id"), ("admission_category", "category_task_id")):
             tm, rm = components[stage]
             component_id = task.get(field)
             if (component_id not in tm or component_id not in rm or not ids
                     or not set(ids).issubset(set(tm[component_id].get("source_identities", [])))):
-                raise PublicationError("Stage1 子任务关联不一致")
+                raise PublicationError("准入评估 子任务关联不一致")
             linked.append(rm[component_id])
-        expected = build_stage1_result(linked[0], linked[1], policy)
+        expected = build_admission_result(linked[0], linked[1], policy)
         if results[key] != expected or task.get("policy_sha256") != stable_hash(policy):
-            raise PublicationError("Stage1 结果不能由子任务和冻结策略重建")
+            raise PublicationError("准入评估 结果不能由子任务和冻结策略重建")
 
 
 def _validate_challenge_binding(record: Mapping[str, Any], tasks: Mapping[str, JsonObject], results: Mapping[str, JsonObject], contract: Mapping[str, Any]) -> None:
@@ -277,10 +271,10 @@ def _validate_challenge_binding(record: Mapping[str, Any], tasks: Mapping[str, J
     hashes = contract["prompt_hashes"]
     options = contract["options_sha256"]
     from ..quality.runner import challenge_quality_input
-    features = record["quality"]["stage1"]["features"]
+    features = record["quality"]["admission"]["features"]
     expected_id = stable_hash({"stage": "challenge", "prompt": hashes["challenge"], "options": options,
         "conversation_sha256": candidate["conversation_sha256"], "l1": candidate["taxonomy"]["l1"],
-        "l2": candidate["taxonomy"]["l2"], "stage1_features": features})
+        "l2": candidate["taxonomy"]["l2"], "admission_features": features})
     payload = challenge_quality_input(candidate, features)
     if (task_id != expected_id or not isinstance(task, Mapping) or task.get("stage") != "challenge"
             or task.get("prompt_sha256") != hashes["challenge"] or task.get("options_sha256") != options
@@ -290,28 +284,28 @@ def _validate_challenge_binding(record: Mapping[str, Any], tasks: Mapping[str, J
         raise PublicationError("Challenge 与输入特征或结果账本不一致")
 
 
-def _validate_stage1_binding(
+def _validate_admission_binding(
     record: Mapping[str, Any],
     tasks: Mapping[str, JsonObject],
     results: Mapping[str, JsonObject],
     quality_contract: Mapping[str, Any],
 ) -> None:
-    """Verify admitted members against the actual Stage1 payload and ledger."""
+    """Verify admitted members against the actual 准入评估 payload and ledger."""
     candidate = record["candidate"]
-    task_id = record["selection"]["stage1_task_id"]
+    task_id = record["selection"]["admission_task_id"]
     task = tasks.get(task_id)
     prompt_hashes = quality_contract.get("prompt_hashes")
     options_hash = quality_contract.get("options_sha256")
     if (quality_contract.get("quality_contract_version") != QUALITY_CONTRACT_VERSION
             or not isinstance(prompt_hashes, Mapping)
-            or not isinstance(prompt_hashes.get("stage1"), str)
+            or not isinstance(prompt_hashes.get("admission"), str)
             or not isinstance(options_hash, str)):
-        raise PublicationError("Stage1 质量运行契约非法")
-    prompt_hash = prompt_hashes["stage1"]
-    if (task_id != stage1_task_key(candidate, prompt_sha256=prompt_hash, options_sha256=options_hash)
-            or not isinstance(task, Mapping) or task.get("stage") != "stage1"
-            or task.get("input_sha256") != stage1_input_sha256(candidate)
-            or task.get("candidate_category_sha256") != stable_hash(stage1_quality_input(candidate)["candidate_category"])
+        raise PublicationError("准入评估 质量运行契约非法")
+    prompt_hash = prompt_hashes["admission"]
+    if (task_id != admission_task_key(candidate, prompt_sha256=prompt_hash, options_sha256=options_hash)
+            or not isinstance(task, Mapping) or task.get("stage") != "admission"
+            or task.get("input_sha256") != admission_input_sha256(candidate)
+            or task.get("candidate_category_sha256") != stable_hash(admission_quality_input(candidate)["candidate_category"])
             or task.get("prompt_sha256") != prompt_hash
             or task.get("options_sha256") != options_hash or "taxonomy_sha256" in task
             or not isinstance(task.get("source_identities"), list)
@@ -319,15 +313,18 @@ def _validate_stage1_binding(
             or candidate["source_identity_sha256"] not in task.get("source_identities", [])
             or candidate["source"]["source_line"] not in task.get("source_lines", [])
             or task_id not in results):
-        raise PublicationError("Stage1 输入哈希或任务关联不一致")
-    result = validate_stage1_result(results[task_id])
-    feature_input = {key: stage1_quality_input(candidate)[key] for key in ("sample_type", "conversation_turns")}
-    for stage, payload, field in (("stage1_features", feature_input, "feature_task_id"), ("stage1_category", stage1_quality_input(candidate), "category_task_id")):
+        raise PublicationError("准入评估 输入哈希或任务关联不一致")
+    result = validate_admission_result(results[task_id])
+    feature_input = {key: admission_quality_input(candidate)[key] for key in ("sample_type", "conversation_turns")}
+    for stage, payload, field in (("admission_features", feature_input, "feature_task_id"), ("admission_category", admission_quality_input(candidate), "category_task_id")):
         expected_component = stable_hash({"stage": stage, "prompt": prompt_hashes[stage], "options": options_hash, "input_sha256": stable_hash(payload)})
         if task.get(field) != expected_component:
-            raise PublicationError("Stage1 子任务与实际输入不一致")
-    if not stage1_passes(result) or result != {key: record["quality"][key] for key in STAGE1_FIELDS}:
-        raise PublicationError("Stage1 准入标签与结果账本不一致")
+            raise PublicationError("准入评估 子任务与实际输入不一致")
+        selection_field = "admission_feature_task_id" if stage == "admission_features" else "admission_category_task_id"
+        if record["selection"].get(selection_field) != expected_component:
+            raise PublicationError("透传的准入子任务ID与实际输入不一致")
+    if not admission_passes(result) or result != {key: record["quality"][key] for key in ADMISSION_FIELDS}:
+        raise PublicationError("准入评估 准入标签与结果账本不一致")
 
 
 def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
@@ -351,22 +348,22 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
     aggregate_export = _load_object(run_root / "labeled_export_report.json")
     if aggregate_export.get("labeled_mapping_version") != LABELED_MAPPING_VERSION:
         raise PublicationError("labeled mapping version 不一致")
-    stage1_tasks, challenge_tasks, stage1_results, challenge_results = _task_maps(run_root)
+    admission_tasks, challenge_tasks, admission_results, challenge_results = _task_maps(run_root)
     quality_contract = _load_object(run_root / "quality" / "quality_run_contract.json")
     if quality_contract.get("screening_policy") != manifest["contract"].get("screening_policy"):
         raise PublicationError("筛选策略与 manifest 不一致")
-    _validate_stage1_components(run_root / "quality", quality_contract, stage1_tasks, stage1_results)
-    stage1_by_identity: dict[str, JsonObject] = {}
-    for task_id, task in stage1_tasks.items():
-        result = stage1_results.get(task_id)
+    _validate_admission_components(run_root / "quality", quality_contract, admission_tasks, admission_results)
+    admission_by_identity: dict[str, JsonObject] = {}
+    for task_id, task in admission_tasks.items():
+        result = admission_results.get(task_id)
         if result is None:
-            raise PublicationError("第一阶段任务缺少合法终态")
-        validated = validate_stage1_result(result)
+            raise PublicationError("准入评估任务缺少合法终态")
+        validated = validate_admission_result(result)
         for identity in task.get("source_identities", []):
-            previous = stage1_by_identity.get(str(identity))
+            previous = admission_by_identity.get(str(identity))
             if previous is not None and previous != validated:
-                raise PublicationError("同一源 identity 对应多个第一阶段结果")
-            stage1_by_identity[str(identity)] = validated
+                raise PublicationError("同一源 identity 对应多个准入评估结果")
+            admission_by_identity[str(identity)] = validated
     if set(challenge_results) != set(challenge_tasks):
         raise PublicationError("Challenge 任务与结果账本不一致")
     challenge_by_identity: dict[str, JsonObject] = {}
@@ -374,10 +371,10 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         validated = validate_challenge_result(challenge_results[task_id])
         identities = [str(value) for value in task.get("source_identities", [])]
         if not identities or any(
-            identity not in stage1_by_identity or not stage1_passes(stage1_by_identity[identity])
+            identity not in admission_by_identity or not admission_passes(admission_by_identity[identity])
             for identity in identities
         ):
-            raise PublicationError("Challenge 任务包含未通过 Stage1 的样本")
+            raise PublicationError("Challenge 任务包含未通过 准入评估 的样本")
         for identity in identities:
             previous = challenge_by_identity.get(identity)
             if previous is not None and previous != validated:
@@ -437,7 +434,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             if normalized in seen_texts:
                 raise PublicationError(f"{set_name} has duplicate normalized text at row {index}")
             seen_texts.add(normalized)
-            expected_labels = delivery_labels(canonical_row["candidate"], {"stage1": quality["stage1"]}, risk_snapshot)
+            expected_labels = delivery_labels(canonical_row["candidate"], {"admission": quality["admission"]}, risk_snapshot)
             if canonical_row["delivery_labels"] != expected_labels:
                 raise PublicationError(f"{set_name} 第 {index} 条下游标签不一致")
             validate_labeled_record(set_name, labeled_row, canonical_record=canonical_row)
@@ -453,13 +450,13 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
                 "origin": selection["origin"],
                 "round_id": selection["round_id"],
                 "candidate_task_id": selection["candidate_task_id"],
-                "stage1_task_id": selection["stage1_task_id"],
+                "admission_task_id": selection["admission_task_id"],
                 "labeled_mapping_version": LABELED_MAPPING_VERSION,
             }
             if provenance_row != expected_provenance:
                 raise PublicationError(f"{set_name} 第 {index} 条 provenance 不一致")
             for stage, tasks, results in (
-                ("stage1", stage1_tasks, stage1_results),
+                ("admission", admission_tasks, admission_results),
             ):
                 task_id = selection[f"{stage}_task_id"]
                 task = tasks.get(task_id)
@@ -467,10 +464,10 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
                     raise PublicationError(f"{set_name} 第 {index} 条缺少 {stage} 合法终态")
                 if identity not in task.get("source_identities", []):
                     raise PublicationError(f"{set_name} 第 {index} 条无法关联 {stage} 任务")
-            expected_stage1 = {key: canonical_row["quality"][key] for key in STAGE1_FIELDS}
-            stage1_value = validate_stage1_result(stage1_results[selection["stage1_task_id"]])
-            _validate_stage1_binding(canonical_row, stage1_tasks, stage1_results, quality_contract)
-            if stage1_value != expected_stage1:
+            expected_admission = {key: canonical_row["quality"][key] for key in ADMISSION_FIELDS}
+            admission_value = validate_admission_result(admission_results[selection["admission_task_id"]])
+            _validate_admission_binding(canonical_row, admission_tasks, admission_results, quality_contract)
+            if admission_value != expected_admission:
                 raise PublicationError(f"{set_name} 第 {index} 条质量标签与结果账本不一致")
             if set_name == "P2":
                 _validate_challenge_binding(canonical_row, challenge_tasks, challenge_results, quality_contract)
@@ -531,14 +528,14 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
                 ):
                     raise PublicationError("P2 candidate 来源归因非法")
                 candidate_source[identity] = str(sampled_from)
-            stage1_pass_ids = {
+            admission_pass_ids = {
                 identity for identity in candidate_source
-                if stage1_passes(stage1_by_identity[identity])
+                if admission_passes(admission_by_identity[identity])
             }
-            if set(challenge_by_identity) != stage1_pass_ids:
-                raise PublicationError("P2 Stage1 通过样本与 Challenge 账本不一致")
+            if set(challenge_by_identity) != admission_pass_ids:
+                raise PublicationError("P2 准入评估 通过样本与 Challenge 账本不一致")
             judge_pass_ids = {
-                identity for identity in stage1_pass_ids
+                identity for identity in admission_pass_ids
                 if challenge_by_identity[identity]["is_challenge"] is True
             }
             final_ids = {
@@ -559,7 +556,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
                 }
                 expected = {
                     "after_dedup": len(source_ids),
-                    "stage1_pass": len(source_ids & stage1_pass_ids),
+                    "admission_pass": len(source_ids & admission_pass_ids),
                     "judge_pass": len(source_ids & judge_pass_ids),
                     "final": len(source_ids & final_ids),
                 }
@@ -588,7 +585,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             or report.get("records") != len(canonical)
                 or report.get("field_count") != len(labeled_fields(set_name))
                 or report.get("fields") != list(labeled_fields(set_name))
-                or report.get("rounded_numeric_fields") != []
+                or report.get("rounded_numeric_fields") != ["norm_freq", "relevance_p2" if set_name == "P2" else "relevance_p0"]
             or report.get("null_values") != 0
             or report.get("lossy_enum_mappings") != 0
         ):
@@ -596,7 +593,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         if aggregate_export.get("sets", {}).get(set_name) != report:
             raise PublicationError(f"{set_name} 分支导出报告与总报告不一致")
         files[set_name] = {
-            "optional_annotations": _optional_annotations(run_root, set_name, canonical, manifest, quality_contract),
+            "quality_annotations": _quality_annotations(run_root, set_name, canonical, manifest, quality_contract),
             "canonical": _jsonl_metadata(canonical_path, run_root, canonical),
             "labeled": _jsonl_metadata(labeled_path, run_root, labeled),
             "provenance": _jsonl_metadata(provenance_path, run_root, provenance),
@@ -652,7 +649,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
     for set_name in ("P0", "P1", "P2"):
         set_report = run_report["sets"][set_name]
         candidate_rows = candidate_rows_by_set[set_name]
-        if set_report.get("stage1_evaluated") != len(candidate_rows):
+        if set_report.get("admission_evaluated") != len(candidate_rows):
             raise PublicationError(f"{set_name} 批跑报告候选数量不一致")
         if set_report.get("final_count") != files[set_name]["canonical"]["records"]:
             raise PublicationError(f"{set_name} 批跑报告最终数量不一致")
@@ -664,24 +661,32 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         candidate_l2 = Counter()
         for task in candidate_rows:
             identity = str(task.get("source_identity_sha256", ""))
-            result = stage1_by_identity.get(identity)
+            result = admission_by_identity.get(identity)
             if result is None:
-                raise PublicationError(f"{set_name} 候选无法关联第一阶段结果")
+                raise PublicationError(f"{set_name} 候选无法关联准入评估结果")
             category[category_fit(result)] += 1
-            is_usable = stage1_usable(result)
+            is_usable = admission_usable(result)
             if is_usable:
                 usable += 1
                 if category_fit(result) == "exact":
                     exact_usable += 1
-            if stage1_passes(result):
+            if admission_passes(result):
                 passed += 1
             candidate_l2[str(task["l2_key"])] += 1
-        expected_issues = stage1_issue_summary([
-            stage1_by_identity[str(task["source_identity_sha256"])] for task in candidate_rows
+        expected_issues = admission_issue_summary([
+            admission_by_identity[str(task["source_identity_sha256"])] for task in candidate_rows
         ])
         if any(set_report.get(key) != value for key, value in expected_issues.items()):
-            raise PublicationError(f"{set_name} Stage1 阻断统计与账本不一致")
+            raise PublicationError(f"{set_name} 准入评估 阻断统计与账本不一致")
         final_rows = load_jsonl(run_root / set_name / "screened.canonical.jsonl")
+        from ..quality.annotation import quality_report
+        expected_quality = quality_report([
+            {"source_identity_sha256": row["candidate"]["source_identity_sha256"],
+             "task_id": row["provenance"]["quality_annotation_task_id"], "result": row["downstream_quality"]}
+            for row in final_rows
+        ])
+        if set_report.get("downstream_quality") != expected_quality:
+            raise PublicationError("Stage2 质量统计或复核分歧与逐条结果不一致")
         zero_reasons = Counter(reason for row in final_rows for reason in row["delivery_labels"]["executable_reasons"])
         from .eligibility import REASON_ORDER as executable_reason_order
         if set_report.get("executable_zero_reasons") != {reason: zero_reasons[reason] for reason in executable_reason_order}:
@@ -693,7 +698,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         if (
             set_report.get("usable_queries") != usable
             or set_report.get("category_exact_among_usable") != exact_usable
-            or set_report.get("stage1_pass") != passed
+            or set_report.get("admission_pass") != passed
         ):
             raise PublicationError(f"{set_name} 批跑报告质量指标不一致")
         report_l2 = {
@@ -702,7 +707,7 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
             for row in l1_row["l2"]
         }
         if any(
-            int(report_l2[key]["stage1_evaluated"]) != count
+            int(report_l2[key]["admission_evaluated"]) != count
             for key, count in candidate_l2.items()
         ) or any(
             int(report_l2[key]["final_count"]) != count
@@ -725,10 +730,10 @@ def collect_and_validate_artifacts(run_root: Path) -> JsonObject:
         raise PublicationError("labeled 总导出报告数量或枚举映射不一致")
     quality_files: JsonObject = {}
     for filename in (
-        "quality_run_contract.json", "stage1_tasks.jsonl", "stage1_attempts.jsonl",
-        "stage1_cache_hits.jsonl", "stage1_results.jsonl", "challenge_tasks.jsonl",
+        "quality_run_contract.json", "admission_tasks.jsonl", "admission_attempts.jsonl",
+        "admission_cache_hits.jsonl", "admission_results.jsonl", "challenge_tasks.jsonl",
         "challenge_attempts.jsonl", "challenge_cache_hits.jsonl", "challenge_results.jsonl",
-        *[f"{stage}_{suffix}.jsonl" for stage in ("stage1_features", "stage1_category", *quality_contract.get("additional_stages", [])) for suffix in ("tasks", "results", "attempts", "cache_hits")],
+        *[f"{stage}_{suffix}.jsonl" for stage in ("admission_features", "admission_category", *quality_contract.get("additional_stages", [])) for suffix in ("tasks", "results", "attempts", "cache_hits")],
     ):
         path = run_root / "quality" / filename
         metadata: JsonObject = {
@@ -776,18 +781,17 @@ def validate_manifest_inputs(run_root: Path, manifest: Mapping[str, Any]) -> Non
     prompts = contract.get("prompts")
     if not isinstance(prompts, Mapping):
         raise PublicationError("manifest 缺少 Prompt 哈希")
-    if (set(prompts) - {"stage1_sha256", "category_sha256", "challenge_sha256", "stage2_sha256"}
-            or not {"stage1_sha256", "category_sha256", "challenge_sha256"}.issubset(prompts)):
+    if set(prompts) != {"admission_sha256", "category_sha256", "challenge_sha256", "quality_annotation_sha256"}:
         raise PublicationError("manifest Prompt 集合非法")
     for key in prompts:
         stage = key.removesuffix("_sha256")
         path = run_root / "prompts" / f"{stage}.md"
         if not path.is_file() or sha256_file(path) != prompts.get(f"{stage}_sha256"):
             raise PublicationError(f"冻结的 {stage} Prompt 缺失或已变化")
-    for component, original in (("stage1_features", "stage1"), ("stage1_category", "category")):
+    for component, original in (("admission_features", "admission"), ("admission_category", "category")):
         snapshot = run_root / "quality" / f"{component}_prompt.md"
         if not snapshot.is_file() or sha256_file(snapshot) != prompts[f"{original}_sha256"]:
-            raise PublicationError("Stage1 组件 Prompt 与 manifest 不一致")
+            raise PublicationError("准入评估 组件 Prompt 与 manifest 不一致")
 
 
 def _transactional_publish(files: list[tuple[Path, Path]]) -> None:
@@ -855,7 +859,7 @@ def publish_labeled(
     if manifest.get("pipeline_version") != PIPELINE_VERSION:
         raise PublicationError("仅允许发布当前 screening run")
     required_stages = (
-        "canonical_index", "p012_build", "quality_stage1", "p1_supplement",
+        "canonical_index", "p012_build", "quality_admission", "p1_supplement",
         "p2_supplement", "quality_p2_challenge",
         "screened_export", "labeled_export", "batch_report",
     )
@@ -948,19 +952,19 @@ def publish_labeled_branch(
     quality_contract = _load_object(run_root / "quality" / "quality_run_contract.json")
     if quality_contract.get("screening_policy") != manifest["contract"].get("screening_policy"):
         raise PublicationError("筛选策略与 manifest 不一致")
-    stage1_task_rows = load_jsonl(run_root / "quality" / "stage1_tasks.jsonl")
-    stage1_result_rows = load_jsonl(run_root / "quality" / "stage1_results.jsonl")
-    stage1_tasks = {row.get("cache_key"): row for row in stage1_task_rows}
-    stage1_results = {row.get("cache_key"): row.get("result") for row in stage1_result_rows}
-    if (None in stage1_tasks or len(stage1_tasks) != len(stage1_task_rows)
-            or None in stage1_results or len(stage1_results) != len(stage1_result_rows)
-            or any(row.get("stage") != "stage1" for row in [*stage1_task_rows, *stage1_result_rows])):
-        raise PublicationError("Stage1 任务或结果账本非法")
+    admission_task_rows = load_jsonl(run_root / "quality" / "admission_tasks.jsonl")
+    admission_result_rows = load_jsonl(run_root / "quality" / "admission_results.jsonl")
+    admission_tasks = {row.get("cache_key"): row for row in admission_task_rows}
+    admission_results = {row.get("cache_key"): row.get("result") for row in admission_result_rows}
+    if (None in admission_tasks or len(admission_tasks) != len(admission_task_rows)
+            or None in admission_results or len(admission_results) != len(admission_result_rows)
+            or any(row.get("stage") != "admission" for row in [*admission_task_rows, *admission_result_rows])):
+        raise PublicationError("准入评估 任务或结果账本非法")
     branch_ids = {row["source_identity_sha256"] for row in load_jsonl(branch_root / "candidate_tasks.jsonl")}
-    branch_tasks = {key: task for key, task in stage1_tasks.items() if branch_ids.intersection(task.get("source_identities", []))}
-    branch_results = {key: value for key, value in stage1_results.items() if key in branch_tasks}
-    _validate_stage1_components(run_root / "quality", quality_contract, branch_tasks, branch_results, require_complete=False)
-    _optional_annotations(run_root, set_name, canonical, manifest, quality_contract)
+    branch_tasks = {key: task for key, task in admission_tasks.items() if branch_ids.intersection(task.get("source_identities", []))}
+    branch_results = {key: value for key, value in admission_results.items() if key in branch_tasks}
+    _validate_admission_components(run_root / "quality", quality_contract, branch_tasks, branch_results, require_complete=False)
+    _quality_annotations(run_root, set_name, canonical, manifest, quality_contract)
     risk = _load_object(run_root / "risk_keywords.json")
     validate_risk_snapshot(risk)
     challenge_tasks, challenge_results = {}, {}
@@ -974,8 +978,8 @@ def publish_labeled_branch(
     for index, (canonical_row, labeled_row, provenance_row) in enumerate(
         zip(canonical, labeled, provenance), start=1
     ):
-        _validate_stage1_binding(canonical_row, stage1_tasks, stage1_results, quality_contract)
-        if canonical_row["delivery_labels"] != delivery_labels(canonical_row["candidate"], {"stage1": canonical_row["quality"]["stage1"]}, risk):
+        _validate_admission_binding(canonical_row, admission_tasks, admission_results, quality_contract)
+        if canonical_row["delivery_labels"] != delivery_labels(canonical_row["candidate"], {"admission": canonical_row["quality"]["admission"]}, risk):
             raise PublicationError("分支 executable 与冻结规则不一致")
         if set_name == "P2":
             _validate_challenge_binding(canonical_row, challenge_tasks, challenge_results, quality_contract)
@@ -999,24 +1003,24 @@ def publish_labeled_branch(
     ):
         raise PublicationError(f"{set_name} 分支报告不一致")
     evaluated_ids = {str(row["source_identity_sha256"]) for row in load_jsonl(branch_root / "candidate_tasks.jsonl")}
-    branch_stage1: dict[str, JsonObject] = {}
-    for task_id, task in stage1_tasks.items():
+    branch_admission: dict[str, JsonObject] = {}
+    for task_id, task in admission_tasks.items():
         identities = evaluated_ids.intersection(task.get("source_identities", []))
         if not identities:
             continue
-        if task_id not in stage1_results:
-            raise PublicationError(f"{set_name} Stage1 候选缺少合法终态")
-        result = validate_stage1_result(stage1_results[task_id])
+        if task_id not in admission_results:
+            raise PublicationError(f"{set_name} 准入评估 候选缺少合法终态")
+        result = validate_admission_result(admission_results[task_id])
         for identity in identities:
-            if identity in branch_stage1 and branch_stage1[identity] != result:
-                raise PublicationError(f"{set_name} Stage1 同一候选结果冲突")
-            branch_stage1[identity] = result
-    if set(branch_stage1) != evaluated_ids:
-        raise PublicationError(f"{set_name} Stage1 审计候选无法关联结果")
+            if identity in branch_admission and branch_admission[identity] != result:
+                raise PublicationError(f"{set_name} 准入评估 同一候选结果冲突")
+            branch_admission[identity] = result
+    if set(branch_admission) != evaluated_ids:
+        raise PublicationError(f"{set_name} 准入评估 审计候选无法关联结果")
     audit = branch_report.get("audit", {})
     if (audit != _load_object(branch_root / "branch_audit.json")
             or branch_report.get("evaluated") != len(evaluated_ids)
-            or any(audit.get(key) != value for key, value in stage1_issue_summary(list(branch_stage1.values())).items())
+            or any(audit.get(key) != value for key, value in admission_issue_summary(list(branch_admission.values())).items())
 ):
         raise PublicationError(f"{set_name} 分支质量审计与账本不一致")
     destination = publish_root / LABELED_FILENAMES[set_name]

@@ -19,14 +19,14 @@ from ..shared.json_io import JsonObject, load_jsonl, try_parse_json, write_jsonl
 from ..shared.challenge import CHALLENGE_TYPES
 from ..shared.llm import LlmCall
 from ..candidate.contract import parse_conversation
-from .stage1 import (stable_hash as _stable_hash)
-from .stage1 import (DEFAULT_POLICY, QualityResponseError, validate_features, validate_category, validate_category_response, validate_policy, build_stage1_result, validate_stage1_result)
+from .admission import (stable_hash as _stable_hash)
+from .admission import (DEFAULT_POLICY, QualityResponseError, validate_features, validate_category, validate_category_response, validate_policy, build_admission_result, validate_admission_result)
 
 CHALLENGE_FIELDS = frozenset(
     {"is_challenge", "primary_challenge", "challenge_types"}
 )
 CHALLENGE_TYPE_SET = frozenset(CHALLENGE_TYPES)
-QUALITY_CONTRACT_VERSION = 13
+QUALITY_CONTRACT_VERSION = 14
 
 
 class QualityStageIncomplete(RuntimeError):
@@ -156,7 +156,7 @@ def challenge_quality_input(candidate: Mapping[str, Any], features: Mapping[str,
         "target_query": conversation["target_query"],
         "L1": taxonomy["l1"],
         "L2": taxonomy["l2"],
-        "stage1_features": dict(features),
+        "admission_features": dict(features),
     }
 
 
@@ -172,7 +172,7 @@ def conversation_quality_input(candidate: Mapping[str, Any]) -> JsonObject:
     }
 
 
-def stage1_quality_input(candidate: Mapping[str, Any]) -> JsonObject:
+def admission_quality_input(candidate: Mapping[str, Any]) -> JsonObject:
     """Preserve every turn; isolate the candidate category used only for checking."""
     payload = conversation_quality_input(candidate)
     taxonomy = candidate["taxonomy"]
@@ -182,16 +182,16 @@ def stage1_quality_input(candidate: Mapping[str, Any]) -> JsonObject:
     }
 
 
-def stage1_input_sha256(candidate: Mapping[str, Any]) -> str:
-    return _stable_hash(stage1_quality_input(candidate))
+def admission_input_sha256(candidate: Mapping[str, Any]) -> str:
+    return _stable_hash(admission_quality_input(candidate))
 
 
-def stage1_task_key(
+def admission_task_key(
     candidate: Mapping[str, Any], *, prompt_sha256: str, options_sha256: str,
 ) -> str:
     return _stable_hash({
-        "stage": "stage1", "prompt": prompt_sha256, "options": options_sha256,
-        "input_sha256": stage1_input_sha256(candidate),
+        "stage": "admission", "prompt": prompt_sha256, "options": options_sha256,
+        "input_sha256": admission_input_sha256(candidate),
     })
 
 
@@ -237,9 +237,9 @@ def challenge_passes(value: Mapping[str, Any]) -> bool:
 
 @dataclass(frozen=True)
 class AdditionalQualityStage:
-    """An opt-in annotation with no admission or delivery responsibilities."""
+    """A supplementary annotation with its own input and response contract."""
     prompt: str
-    input_builder: Callable[[Mapping[str, Any]], JsonObject]
+    input_builder: Callable[..., JsonObject]
     validator: Callable[[Any], JsonObject]
 
 
@@ -250,7 +250,7 @@ class QualityRunner:
         self,
         run_root: Path,
         *,
-        stage1_prompt: str,
+        admission_prompt: str,
         category_prompt: str | None = None,
         screening_policy: Mapping[str, Any] | None = None,
         challenge_prompt: str,
@@ -261,33 +261,39 @@ class QualityRunner:
         logger: logging.Logger | None = None,
         additional_stages: Mapping[str, AdditionalQualityStage] | None = None,
     ) -> None:
-        if stage1_prompt.count("{CANDIDATE_JSON}") != 1:
-            raise ValueError("第一阶段 Prompt 必须恰好包含一个 {CANDIDATE_JSON}")
+        if admission_prompt.count("{CANDIDATE_JSON}") != 1:
+            raise ValueError("准入文本特征 Prompt 必须恰好包含一个 {CANDIDATE_JSON}")
         if challenge_prompt.count("{CANDIDATE_JSON}") != 1:
             raise ValueError("Challenge Prompt 必须恰好包含一个 {CANDIDATE_JSON}")
         self.run_root = run_root
         self.run_root.mkdir(parents=True, exist_ok=True)
         if category_prompt is None:
-            category_prompt = (Path(__file__).resolve().parents[1] / "artifacts/prompts/quality_stage1_category.md").read_text(encoding="utf-8")
+            category_prompt = (Path(__file__).resolve().parents[1] / "artifacts/prompts/quality_admission_category.md").read_text(encoding="utf-8")
         if category_prompt.count("{CANDIDATE_JSON}") != 1:
             raise ValueError("类别 Prompt 必须恰好包含一个 {CANDIDATE_JSON}")
         self.screening_policy = validate_policy(dict(DEFAULT_POLICY if screening_policy is None else screening_policy))
-        self._stage1_by_identity: dict[str, JsonObject] = {}
+        self._admission_by_identity: dict[str, JsonObject] = {}
         self.prompts = {
-            "stage1_features": stage1_prompt,
-            "stage1_category": category_prompt,
+            "admission_features": admission_prompt,
+            "admission_category": category_prompt,
             "challenge": challenge_prompt,
         }
-        self.additional_stages = dict(additional_stages or {})
+        from .annotation import stage_definition
+        if additional_stages is None:
+            prompt = (Path(__file__).resolve().parents[1] / "artifacts/prompts/quality_annotation.md").read_text(encoding="utf-8")
+            additional_stages = {"quality_annotation": stage_definition(prompt)}
+        if set(additional_stages) != {"quality_annotation"}:
+            raise ValueError("完整链路必须配置下游质量标注")
+        self.additional_stages = dict(additional_stages)
         for name, definition in self.additional_stages.items():
-            if (not name.isidentifier() or not name.isascii() or name in {*self.prompts, "stage1"}
+            if (not name.isidentifier() or not name.isascii() or name in {*self.prompts, "admission"}
                     or definition.prompt.count("{CANDIDATE_JSON}") != 1):
                 raise ValueError("附加标注阶段名称或 Prompt 非法")
             self.prompts[name] = definition.prompt
         self.prompt_hashes = {key: _stable_hash(value) for key, value in self.prompts.items()}
-        self.prompt_hashes["stage1"] = _stable_hash({
-            "features": self.prompt_hashes["stage1_features"],
-            "category": self.prompt_hashes["stage1_category"],
+        self.prompt_hashes["admission"] = _stable_hash({
+            "features": self.prompt_hashes["admission_features"],
+            "category": self.prompt_hashes["admission_category"],
             "policy": self.screening_policy,
         })
         self.model = model
@@ -329,7 +335,7 @@ class QualityRunner:
                 newline="\n",
             )
         self._initialize_cache()
-        for stage in ("stage1", *self.prompts):
+        for stage in ("admission", *self.prompts):
             for suffix in ("tasks", "results", "attempts"):
                 path = self.run_root / f"{stage}_{suffix}.jsonl"
                 if not path.exists():
@@ -360,13 +366,13 @@ class QualityRunner:
         stage: str,
         candidate: Mapping[str, Any],
     ) -> str:
-        if stage == "stage1":
-            return stage1_task_key(
+        if stage == "admission":
+            return admission_task_key(
                 candidate, prompt_sha256=self.prompt_hashes[stage],
                 options_sha256=self.options_hash,
             )
-        if stage in {"stage1_features", "stage1_category"}:
-            payload = conversation_quality_input(candidate) if stage == "stage1_features" else stage1_quality_input(candidate)
+        if stage in {"admission_features", "admission_category"}:
+            payload = conversation_quality_input(candidate) if stage == "admission_features" else admission_quality_input(candidate)
             return _stable_hash({"stage": stage, "prompt": self.prompt_hashes[stage], "options": self.options_hash, "input_sha256": _stable_hash(payload)})
         if stage in self.additional_stages:
             return _stable_hash({"stage": stage, "prompt": self.prompt_hashes[stage],
@@ -380,7 +386,7 @@ class QualityRunner:
                 "conversation_sha256": candidate["conversation_sha256"],
                 "l1": taxonomy["l1"],
                 "l2": taxonomy["l2"],
-                "stage1_features": self._stage1_by_identity[candidate["source_identity_sha256"]]["stage1"]["features"],
+                "admission_features": self._admission_by_identity[candidate["source_identity_sha256"]]["admission"]["features"],
             }
         )
 
@@ -390,7 +396,7 @@ class QualityRunner:
         candidate: Mapping[str, Any],
     ) -> str:
         """Return the frozen task/cache identity recorded in the quality ledgers."""
-        if stage not in {"stage1", *self.prompts}:
+        if stage not in {"admission", *self.prompts}:
             raise ValueError(f"未知质量阶段: {stage}")
         return self._cache_key(stage, candidate)
 
@@ -667,18 +673,22 @@ class QualityRunner:
         return result_by_identity
 
     def _payload(self, stage: str, candidate: Mapping[str, Any]) -> JsonObject:
+        if stage == "quality_annotation":
+            return self.additional_stages[stage].input_builder(
+                candidate, self._admission_by_identity[candidate["source_identity_sha256"]]
+            )
         if stage in self.additional_stages:
             return self.additional_stages[stage].input_builder(candidate)
-        if stage == "stage1_features":
+        if stage == "admission_features":
             return conversation_quality_input(candidate)
-        if stage == "stage1_category":
-            return stage1_quality_input(candidate)
-        return challenge_quality_input(candidate, self._stage1_by_identity[candidate["source_identity_sha256"]]["stage1"]["features"])
+        if stage == "admission_category":
+            return admission_quality_input(candidate)
+        return challenge_quality_input(candidate, self._admission_by_identity[candidate["source_identity_sha256"]]["admission"]["features"])
 
     def _validate_response(self, stage: str, value: Any, candidate: Mapping[str, Any], *, cached: bool = False) -> JsonObject:
-        if stage == "stage1_features":
+        if stage == "admission_features":
             return validate_features(value)
-        if stage == "stage1_category":
+        if stage == "admission_category":
             return validate_category(value) if cached else validate_category_response(value)
         if stage == "challenge":
             return validate_challenge_result(value)
@@ -686,43 +696,43 @@ class QualityRunner:
             return self.additional_stages[stage].validator(value)
         raise ValueError(f"未知质量阶段: {stage}")
 
-    def bind_stage1(self, results: Mapping[str, JsonObject]) -> None:
+    def bind_admission(self, results: Mapping[str, JsonObject]) -> None:
         for identity, value in results.items():
-            self._stage1_by_identity[identity] = validate_stage1_result(value)
+            self._admission_by_identity[identity] = validate_admission_result(value)
 
-    def run_stage1(
+    def run_admission(
         self, candidates: Sequence[JsonObject], *, branch: str = "shared"
     ) -> dict[str, JsonObject]:
-        features = self._run("stage1_features", candidates, branch=branch)
-        categories = self._run("stage1_category", candidates, branch=branch)
+        features = self._run("admission_features", candidates, branch=branch)
+        categories = self._run("admission_category", candidates, branch=branch)
         results, tasks, rows = {}, [], []
         for candidate in candidates:
             identity = candidate["source_identity_sha256"]
-            result = build_stage1_result(features[identity], categories[identity], self.screening_policy)
-            key = self.task_id("stage1", candidate)
+            result = build_admission_result(features[identity], categories[identity], self.screening_policy)
+            key = self.task_id("admission", candidate)
             tasks.append({
-                "cache_key": key, "stage": "stage1", "source_lines": [int(candidate["source"]["source_line"])],
+                "cache_key": key, "stage": "admission", "source_lines": [int(candidate["source"]["source_line"])],
                 "source_identities": [identity], "conversation_sha256": candidate["conversation_sha256"],
-                "input_sha256": stage1_input_sha256(candidate),
-                "candidate_category_sha256": _stable_hash(stage1_quality_input(candidate)["candidate_category"]),
-                "prompt_sha256": self.prompt_hashes["stage1"], "options_sha256": self.options_hash,
-                "feature_task_id": self.task_id("stage1_features", candidate),
-                "category_task_id": self.task_id("stage1_category", candidate),
+                "input_sha256": admission_input_sha256(candidate),
+                "candidate_category_sha256": _stable_hash(admission_quality_input(candidate)["candidate_category"]),
+                "prompt_sha256": self.prompt_hashes["admission"], "options_sha256": self.options_hash,
+                "feature_task_id": self.task_id("admission_features", candidate),
+                "category_task_id": self.task_id("admission_category", candidate),
                 "policy_sha256": _stable_hash(self.screening_policy),
             })
-            rows.append({"cache_key": key, "stage": "stage1", "result": result})
+            rows.append({"cache_key": key, "stage": "admission", "result": result})
             results[identity] = result
         with self._ledger_lock:
-            _merge_task_ledger(self.run_root / "stage1_tasks.jsonl", tasks)
-            _merge_ledger(self.run_root / "stage1_results.jsonl", rows, "cache_key")
-        self.bind_stage1(results)
+            _merge_task_ledger(self.run_root / "admission_tasks.jsonl", tasks)
+            _merge_ledger(self.run_root / "admission_results.jsonl", rows, "cache_key")
+        self.bind_admission(results)
         return results
 
     def run_challenge(
-        self, candidates: Sequence[JsonObject], stage1: Mapping[str, JsonObject] | None = None, *, branch: str = "shared"
+        self, candidates: Sequence[JsonObject], admission: Mapping[str, JsonObject] | None = None, *, branch: str = "shared"
     ) -> dict[str, JsonObject]:
-        if stage1 is not None:
-            self.bind_stage1(stage1)
+        if admission is not None:
+            self.bind_admission(admission)
         return self._run("challenge", candidates, branch=branch)
 
     def run_additional_stage(

@@ -1,24 +1,24 @@
 # P2 Adaptive 技术方案（已实施）
 
 > 所属产品版本：Screening V4
-> Pipeline 配置版本：`config_version=10`
+> Pipeline 配置版本：`config_version=11`
 > P2 算法标识：`adaptive_challenge_batches_2`
-> 文档状态：当前已实施口径，核对于 2026-10-29；默认值以 [pipeline.default.json](../config/pipeline.default.json) 为准
+> 文档状态：当前已实施口径，核对于 2026-10-30；本文描述Stage1采样集构建中的P2分支，默认值以 [pipeline.default.json](../config/pipeline.default.json) 为准
 
 ## 1. 目标
 
-P2 正式目标为 1,000 条同时通过 Stage1 和 Challenge Judge 的样本。八类 `primary_challenge` 的软下限依次为 50、50、50、50、50、20、5、1，任一类型最多 350。候选不足或覆盖预算耗尽时允许带缺口交付。
+P2 正式目标为 1,000 条同时通过 准入评估 和 Challenge Judge 的样本。八类 `primary_challenge` 的软下限依次为 50、50、50、50、50、20、5、1，任一类型最多 350。候选不足或覆盖预算耗尽时允许带缺口交付。
 
-P0/P1 与 P2 独立并发构建，各自完成 Stage2、导出和分支校验后即可按配置发布，不等待 P2。当前 Stage1、Stage2 契约以
-[技术方案](screening_pipeline_technical_design_v4.md) 和实际 Prompt 为准；Stage2 只处理最终成员。
+P0/P1 与 P2 独立并发构建，各自完成 Stage1 成员冻结及 Stage2 标注、导出和分支校验后即可按配置发布，不等待其他分支。当前准入评估和下游质量标注契约以
+[技术方案](screening_pipeline_technical_design_v4.md) 和实际 Prompt 为准；Stage2 只处理最终成员，不修改集合。
 
 ## 2. 数据流
 
 ```text
 四类候选池
 → 30/30/20/20 分批抽样与集合内去重
-→ Stage1
-→ Stage1 PASS 进入 Challenge Judge
+→ 准入评估
+→ 准入评估 PASS 进入 Challenge Judge
 → 按 primary_challenge 建立合格池
 → 软下限、单类上限和总量选择
 → 最多三轮定向/探索补采
@@ -43,7 +43,7 @@ P0/P1 与 P2 独立并发构建，各自完成 Stage2、导出和分支校验后
 报告中的四个 `candidate_capacity` 是各来源池独立容量，重叠样本会同时计入多个池，
 因此四项不能相加当作候选并集大小；抽取后的漏斗只按唯一 `sampled_from` 归因。
 
-抽样按 L2、Cluster 两级平方根容量分配，层内用稳定身份哈希排序；候选规划在相同输入和配置下可复现，LLM 判定仍取决于模型响应。文本去重采用三个集合共用的规范化精确去重及近重复确认：同 L2、双字 Jaccard ≥ 0.45、IDF 加权 2/3-gram Jaccard ≥ 0.80、编辑相似度 ≥ 0.90。去重在 Stage1 前完成；仅召回达标、确认未达标的对保留并审计。
+抽样按 L2、Cluster 两级平方根容量分配，层内用稳定身份哈希排序；候选规划在相同输入和配置下可复现，LLM 判定仍取决于模型响应。文本去重采用三个集合共用的规范化精确去重及近重复确认：同 L2、双字 Jaccard ≥ 0.45、IDF 加权 2/3-gram Jaccard ≥ 0.80、编辑相似度 ≥ 0.90。去重在 准入评估 前完成；仅召回达标、确认未达标的对保留并审计。
 
 ## 4. Challenge Judge
 
@@ -55,7 +55,7 @@ context_turns
 target_query
 L1
 L2
-stage1_features
+admission_features
 ```
 
 不提供 probability、frequency 和候选来源。输出严格为：
@@ -96,7 +96,7 @@ boundary
 long_tail_expr
 ```
 
-类型必须兼容 Stage1：多轮样本在已提供上下文下完整；歧义可以结合上下文恢复，或需要有实质区分的澄清；多意图均与当前 L2 兼容；边界样本的当前 L2 仍为 exact。
+类型必须兼容 准入评估：多轮样本在已提供上下文下完整；歧义可以结合上下文恢复，或需要有实质区分的澄清；多意图均与当前 L2 兼容；边界样本的当前 L2 仍为 exact。
 
 ## 5. 配额与最终选择
 
@@ -136,11 +136,11 @@ long_tail_expr
 无进展批次上限     2
 ```
 
-初始轮使用固定 30/30/20/20。每批完成 Stage1 和 Challenge 后，立即更新来源总产出率、来源到 primary 的产出率、总量缺口和八类软下限缺口。产出率以来源池实际抽取数为分母，因此包含文本去重、Stage1 和 Challenge 三段损耗。补采按缺口及后验产出率路由，同时固定保留 20% exploration。
+初始轮使用固定 30/30/20/20。每批完成 准入评估 和 Challenge 后，立即更新来源总产出率、来源到 primary 的产出率、总量缺口和八类软下限缺口。产出率以来源池实际抽取数为分母，因此包含文本去重、准入评估 和 Challenge 三段损耗。补采按缺口及后验产出率路由，同时固定保留 20% exploration。
 
 每批输出可解析的 `P2 batch_progress` JSON，包含 `target_fill` 或 `coverage_tail` 模式、八类最终数量与缺口、三项预算状态和 `next_action`；结束时输出 `P2 adaptive_complete` JSON 及明确停止原因。
 
-初始轮为 `wave=0`，之后最多三轮补采，即 `wave=1..3`；轮数不是批数。`max_sampled` 统计实际抽中的唯一候选，包含随后被去重、Stage1 或 Challenge 拒绝者，不是 LLM 请求次数上限。尾部候选也占总预算，两个预算不相加。批前总量已满才进入 `coverage_tail`；刚填满目标的批次仍属于 `target_fill`。
+初始轮为 `wave=0`，之后最多三轮补采，即 `wave=1..3`；轮数不是批数。`max_sampled` 统计实际抽中的唯一候选，包含随后被去重、准入评估 或 Challenge 拒绝者，不是 LLM 请求次数上限。尾部候选也占总预算，两个预算不相加。批前总量已满才进入 `coverage_tail`；刚填满目标的批次仍属于 `target_fill`。
 
 停止条件为目标和软下限均满足、初始轮及最多三轮补采结束、相关候选耗尽、实际抽样达到 20,000、尾部抽样达到 1,000，或连续两个尾部批次没有缩小八类总缺口。任一尾部批次缩小总缺口会把连续计数归零；Challenge PASS 数量增长但最终类型总缺口不降，仍算无进展。预算或早停触发时允许 P2 带数量或类型缺口交付，继续 Stage2、导出和发布。
 
@@ -165,28 +165,28 @@ long_tail_expr
 - `adaptive_challenge_batches_2` 同时进入总 run contract 和 P012 构建契约，旧配置和旧检查点不会按新配额语义续跑。
 - 中断恢复复用已完成结果，不重复标注调用；启动仍有一次 LLM 预检。总状态为 `failed` 时须显式指定兼容的原 `--run-id`，其他状态的自动选择规则见 [配置手册](screening_pipeline_configuration_v4.md#23-严格续跑条件)。
 - 总预算、尾部预算和连续无进展批次数进入检查点，续跑不会重置。
-- `screened_schema_version=11`：P2 保存三个 Challenge 字段和 `challenge.challenge_task_id`；P0/P1 的 `challenge` 为 `null`。质量契约为13，报告契约为13，labeled_v8为14字段；其他版本见 [文档索引](README.md)。
-- P2 允许 `supplement_wave`；采样配额算法不因 v8 明细改变，Challenge 输入和缓存新增 Stage1 特征。
+- `screened_schema_version=12`：P2 保存三个 Challenge 字段和 `challenge.challenge_task_id`；P0/P1 的 `challenge` 为 `null`。质量契约为14，报告契约为14，downstream_labeled_v1为29字段；其他版本见 [文档索引](README.md)。
+- P2 允许 `supplement_wave`；采样配额算法不因 v8 明细改变，Challenge 输入和缓存新增 准入评估 特征。
 - P2 汇总写入 `P2/adaptive_summary.json`，总报告写入 `p2_diagnostics`。
 - 去重数值复验兼容 `1e-12` 以内的 0/1 边界误差，不放宽确认阈值、不改写旧审计或检查点；不升级规则或数据契约。
 
 ## 8. 报告指标
 
-- 四来源池的容量、计划请求、实际抽取、去重后、Stage1 通过、Judge 通过和最终入集；
+- 四来源池的容量、计划请求、实际抽取、去重后、准入评估 通过、Judge 通过和最终入集；
 - 每轮每批总产出率、来源产出率和来源到 primary 的产出率；
-- 每批候选规划、Stage1、Challenge 和最终重选的墙钟耗时及汇总；
+- 每批候选规划、准入评估、Challenge 和最终重选的墙钟耗时及汇总；
 - 八类最终数、软下限缺口、单类占比及停止原因；
 - 多标签分布和组合；
 - Judge 任务量、缓存命中、失败、重试和时延；
 - Judge PASS 但未入集的数量；
 - 最终数量、`target_gap` 和候选耗尽状态；
 - 总抽样与尾部预算的已用、剩余、批次上限、无进展批数和预算停止原因；
-- 如显式启用隔离模块，可从独立附加结果分析 Challenge 与语义复核信号；默认主报告不包含此项。
+- Stage2 必跑下游质量标注，可从主报告及各分支 stage2/quality_report.json 查看评分、问题分布和复核信号；低分不改变 P2 成员或 Challenge 标签。
 
 ## 9. 实现位置
 
 - `screening/candidate/p2_adaptive.py`：候选池、分层抽样、后验产出率和最终选择；
-- `screening/quality/runner.py`：Stage1/Challenge 及显式启用的附加标注共用缓存与重试；
+- `screening/quality/runner.py`：准入评估/Challenge 及必跑下游质量标注共用缓存与重试；
 - `screening/pipeline/orchestrator.py`：批次、补采、checkpoint 和最终重选；
 - `screening/delivery/screened.py`：canonical Challenge 契约；
 - `screening/delivery/report.py`：P2 诊断；

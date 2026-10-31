@@ -42,11 +42,11 @@ from ..delivery.screened import (
     validate_screened_canonical_records,
 )
 from ..quality.runner import (CHALLENGE_TYPES, QualityRunner, challenge_passes)
-from ..quality.stage1 import (stage1_passes, stage1_issue_summary)
+from ..quality.admission import (admission_passes, admission_issue_summary)
 from .checkpoints import CheckpointStore
 
 
-BUILD_CONFIG_VERSION = 8
+BUILD_CONFIG_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -253,7 +253,7 @@ def _passing(
 ) -> list[JsonObject]:
     return [
         candidate for candidate in candidates
-        if stage1_passes(results[candidate["source_identity_sha256"]])
+        if admission_passes(results[candidate["source_identity_sha256"]])
     ]
 
 
@@ -270,7 +270,7 @@ def _update_cluster_feedback(
         cluster = candidate["taxonomy"]["cluster_id"]
         counts = feedback.setdefault(cluster, [0, 0])
         counts[0] += 1
-        counts[1] += int(stage1_passes(results[candidate["source_identity_sha256"]]))
+        counts[1] += int(admission_passes(results[candidate["source_identity_sha256"]]))
 
 
 def _pass_rates(
@@ -305,18 +305,18 @@ def _branch_audit(
     sampled: int,
     deduplicated: int,
     candidates: Sequence[JsonObject],
-    stage1: Mapping[str, JsonObject],
+    admission: Mapping[str, JsonObject],
 ) -> JsonObject:
-    issues = stage1_issue_summary([
-        stage1[candidate["source_identity_sha256"]] for candidate in candidates
+    issues = admission_issue_summary([
+        admission[candidate["source_identity_sha256"]] for candidate in candidates
     ])
-    rejected = sum(issues["stage1_rejection_combinations"].values())
+    rejected = sum(issues["admission_rejection_combinations"].values())
     return {
         "set": set_name,
         "sampled": sampled,
         "after_dedup": deduplicated,
-        "stage1_pass": deduplicated - rejected,
-        "stage1_rejected": rejected,
+        "admission_pass": deduplicated - rejected,
+        "admission_rejected": rejected,
         **issues,
     }
 
@@ -375,11 +375,11 @@ def _run_quality(
     method_name: str,
     candidates: Sequence[JsonObject],
     branch: str,
-    stage1: Mapping[str, JsonObject] | None = None,
+    admission: Mapping[str, JsonObject] | None = None,
 ) -> dict[str, JsonObject]:
     """Use branch-aware scheduling when the supplied runner supports it."""
     method = getattr(runner, method_name)
-    args = (candidates,) if stage1 is None else (candidates, stage1)
+    args = (candidates,) if admission is None else (candidates, admission)
     if "branch" in inspect.signature(method).parameters:
         return method(*args, branch=branch)
     return method(*args)
@@ -487,7 +487,7 @@ def _run_adaptive_p2(
     logger: logging.Logger,
     idf_snapshot: Mapping[str, Any],
 ) -> JsonObject:
-    """Run resumable Stage1 -> Challenge batches and select official P2 members."""
+    """Run resumable 准入评估 -> Challenge batches and select official P2 members."""
     complete = checkpoints.load("p2_adaptive_complete")
     if complete is not None:
         p2_root = run_root / "P2"
@@ -498,7 +498,7 @@ def _run_adaptive_p2(
     p2_config = config.sampling.p2
     supplement = config.p2_supplement
     evaluated: list[JsonObject] = []
-    stage1_results: dict[str, JsonObject] = {}
+    admission_results: dict[str, JsonObject] = {}
     challenge_results: dict[str, JsonObject] = {}
     metadata: dict[str, JsonObject] = {}
     sampled_metadata: dict[str, JsonObject] = {}
@@ -610,7 +610,7 @@ def _run_adaptive_p2(
                 batch_id += 1
                 plan_name = f"p2_wave_{wave}_batch_{batch_id}_plan"
                 result_name = f"p2_wave_{wave}_batch_{batch_id}_result"
-                stage1_name = f"p2_wave_{wave}_batch_{batch_id}_stage1"
+                admission_name = f"p2_wave_{wave}_batch_{batch_id}_admission"
                 challenge_name = f"p2_wave_{wave}_batch_{batch_id}_challenge"
                 plan = checkpoints.load(plan_name)
                 if plan is None:
@@ -665,31 +665,31 @@ def _run_adaptive_p2(
                 )
                 result = checkpoints.load(result_name)
                 if result is None:
-                    saved_stage1 = checkpoints.load(stage1_name)
-                    if saved_stage1 is None:
-                        stage1_started = time.monotonic()
-                        batch_stage1 = (
-                            _run_quality(quality_runner, "run_stage1", new_candidates, "P2")
+                    saved_admission = checkpoints.load(admission_name)
+                    if saved_admission is None:
+                        admission_started = time.monotonic()
+                        batch_admission = (
+                            _run_quality(quality_runner, "run_admission", new_candidates, "P2")
                             if new_candidates else {}
                         )
-                        stage1_duration_ms = round((time.monotonic() - stage1_started) * 1000)
-                        checkpoints.save(stage1_name, {
-                            "results": batch_stage1,
-                            "duration_ms": stage1_duration_ms,
+                        admission_duration_ms = round((time.monotonic() - admission_started) * 1000)
+                        checkpoints.save(admission_name, {
+                            "results": batch_admission,
+                            "duration_ms": admission_duration_ms,
                         })
                     else:
-                        batch_stage1 = {
+                        batch_admission = {
                             str(key): dict(value)
-                            for key, value in saved_stage1["results"].items()
+                            for key, value in saved_admission["results"].items()
                         }
-                        stage1_duration_ms = int(saved_stage1.get("duration_ms", 0))
-                    stage1_passed = _passing(new_candidates, batch_stage1) if new_candidates else []
+                        admission_duration_ms = int(saved_admission.get("duration_ms", 0))
+                    admission_passed = _passing(new_candidates, batch_admission) if new_candidates else []
                     saved_challenge = checkpoints.load(challenge_name)
                     if saved_challenge is None:
                         challenge_started = time.monotonic()
                         batch_challenge = (
-                            _run_quality(quality_runner, "run_challenge", stage1_passed, "P2", batch_stage1)
-                            if stage1_passed else {}
+                            _run_quality(quality_runner, "run_challenge", admission_passed, "P2", batch_admission)
+                            if admission_passed else {}
                         )
                         challenge_duration_ms = round(
                             (time.monotonic() - challenge_started) * 1000
@@ -705,15 +705,15 @@ def _run_adaptive_p2(
                         }
                         challenge_duration_ms = int(saved_challenge.get("duration_ms", 0))
                     result = {
-                        "stage1_results": batch_stage1,
+                        "admission_results": batch_admission,
                         "challenge_results": batch_challenge,
-                        "stage1_duration_ms": stage1_duration_ms,
+                        "admission_duration_ms": admission_duration_ms,
                         "challenge_duration_ms": challenge_duration_ms,
                     }
                     checkpoints.save(result_name, result)
-                batch_stage1 = {str(key): dict(value) for key, value in result["stage1_results"].items()}
+                batch_admission = {str(key): dict(value) for key, value in result["admission_results"].items()}
                 batch_challenge = {str(key): dict(value) for key, value in result["challenge_results"].items()}
-                stage1_results.update(batch_stage1)
+                admission_results.update(batch_admission)
                 challenge_results.update(batch_challenge)
                 sampled_metadata.update(new_sampled_metadata)
                 metadata.update(new_metadata)
@@ -721,10 +721,10 @@ def _run_adaptive_p2(
                 evaluation_rounds.update({
                     str(candidate["source_identity_sha256"]): wave for candidate in new_candidates
                 })
-                stage1_passed = _passing(new_candidates, batch_stage1) if new_candidates else []
+                admission_passed = _passing(new_candidates, batch_admission) if new_candidates else []
                 challenge_passed = sum(
                     challenge_passes(batch_challenge[item["source_identity_sha256"]])
-                    for item in stage1_passed
+                    for item in admission_passed
                 )
                 sampled_by_source = Counter(
                     str(value["sampled_from"]) for value in new_sampled_metadata.values()
@@ -732,19 +732,19 @@ def _run_adaptive_p2(
                 after_dedup_by_source = Counter(
                     str(value["sampled_from"]) for value in new_metadata.values()
                 )
-                stage1_by_source = Counter(
+                admission_by_source = Counter(
                     new_metadata[item["source_identity_sha256"]]["sampled_from"]
-                    for item in stage1_passed
+                    for item in admission_passed
                 )
                 challenge_by_source = Counter(
                     new_metadata[item["source_identity_sha256"]]["sampled_from"]
-                    for item in stage1_passed
+                    for item in admission_passed
                     if challenge_passes(batch_challenge[item["source_identity_sha256"]])
                 )
                 primary_by_source: dict[str, Counter[str]] = {
                     source: Counter() for source in P2_SOURCE_NAMES
                 }
-                for item in stage1_passed:
+                for item in admission_passed:
                     identity = item["source_identity_sha256"]
                     result_value = batch_challenge[identity]
                     if challenge_passes(result_value):
@@ -796,8 +796,8 @@ def _run_adaptive_p2(
                     "sampled_by_source": dict(sampled_by_source),
                     "after_dedup": len(new_candidates),
                     "after_dedup_by_source": dict(after_dedup_by_source),
-                    "stage1_pass": len(stage1_passed),
-                    "stage1_pass_by_source": dict(stage1_by_source),
+                    "admission_pass": len(admission_passed),
+                    "admission_pass_by_source": dict(admission_by_source),
                     "judge_pass": challenge_passed,
                     "challenge_pass": challenge_passed,
                     "judge_pass_by_source": dict(challenge_by_source),
@@ -823,7 +823,7 @@ def _run_adaptive_p2(
                     "next_action": next_action,
                     "phase_duration_ms": {
                         "planning": int(plan.get("planning_duration_ms", 0)),
-                        "stage1": int(result.get("stage1_duration_ms", 0)),
+                        "admission": int(result.get("admission_duration_ms", 0)),
                         "challenge": int(result.get("challenge_duration_ms", 0)),
                         "selection": selection_duration_ms,
                     },
@@ -852,7 +852,7 @@ def _run_adaptive_p2(
                     **{
                         key: batch_summary[key]
                         for key in (
-                            "batch", "mode", "requested", "sampled", "stage1_pass",
+                            "batch", "mode", "requested", "sampled", "admission_pass",
                             "challenge_pass", "final", "target", "target_gap",
                             "selected_by_primary", "deficit_by_primary",
                             "sampled_budget", "tail_budget", "stalled_batches",
@@ -938,9 +938,9 @@ def _run_adaptive_p2(
             if value["sampled_from"] == source
         }
         source_ids = {identity for identity, value in metadata.items() if value["sampled_from"] == source}
-        stage1_ids = {identity for identity in source_ids if stage1_passes(stage1_results[identity])}
+        admission_ids = {identity for identity in source_ids if admission_passes(admission_results[identity])}
         judge_ids = {
-            identity for identity in stage1_ids
+            identity for identity in admission_ids
             if identity in challenge_results and challenge_passes(challenge_results[identity])
         }
         source_funnel[source] = {
@@ -951,7 +951,7 @@ def _run_adaptive_p2(
             ),
             "actual_sampled": len(sampled_source_ids),
             "after_dedup": len(source_ids),
-            "stage1_pass": len(stage1_ids),
+            "admission_pass": len(admission_ids),
             "judge_pass": len(judge_ids),
             "final": len(source_ids & final_ids),
         }
@@ -969,7 +969,7 @@ def _run_adaptive_p2(
             for round_value in rounds
             for batch in round_value["batches"]
         )
-        for phase in ("planning", "stage1", "challenge", "selection")
+        for phase in ("planning", "admission", "challenge", "selection")
     }
     diagnostic = {
         "algorithm": P2_ALGORITHM,
@@ -986,7 +986,7 @@ def _run_adaptive_p2(
         "phase_duration_ms": phase_duration_ms,
         "stop_reason": stop_reason,
         "evaluated": len(evaluated),
-        "stage1_pass": sum(stage1_passes(value) for value in stage1_results.values()),
+        "admission_pass": sum(admission_passes(value) for value in admission_results.values()),
         "judge_pass": sum(challenge_passes(value) for value in challenge_results.values()),
         "final": len(selected),
         "target": p2_config.target_n,
@@ -1009,7 +1009,7 @@ def _run_adaptive_p2(
     result: JsonObject = {
         "selected": selected,
         "evaluated_candidates": evaluated,
-        "stage1_results": stage1_results,
+        "admission_results": admission_results,
         "challenge_results": challenge_results,
         "metadata": metadata,
         "evaluation_rounds": evaluation_rounds,
@@ -1078,8 +1078,12 @@ def _set_branch_status(run_root: Path, set_name: str, status: str, **details: An
     from .run_context import update_manifest
 
     payload = {"status": status, **details}
+    step = str(details.get("stage", ""))
+    if step != "failed":
+        payload["phase"] = "stage2" if step.startswith("stage2") or step in {"export", "completed", "published"} else "stage1"
     payload.setdefault("error", None)
-    update_manifest(run_root, branches={set_name: payload})
+    stages = {"stage2": {"status": "running"}} if step.startswith("stage2") else {}
+    update_manifest(run_root, branches={set_name: payload}, stages=stages)
 
 
 def _restore_completed_branch(
@@ -1114,6 +1118,17 @@ def _restore_completed_branch(
     return complete
 
 
+def _resume_frozen_branch(set_name: str, run_root: Path, checkpoints: CheckpointStore, quality_runner: QualityRunner):
+    frozen = checkpoints.load("stage1_frozen")
+    if frozen is None:
+        return None
+    path = run_root / set_name / "stage1.frozen.jsonl"
+    if not path.is_file() or sha256_file(path) != frozen["sha256"] or load_jsonl(path) != frozen["records"]:
+        raise ValueError("Stage1 冻结产物与检查点不一致")
+    return _finalize_branch(set_name, run_root=run_root, checkpoints=checkpoints,
+                            quality_runner=quality_runner, **frozen["finalize_inputs"])
+
+
 def _finalize_branch(
     set_name: str,
     *,
@@ -1122,7 +1137,7 @@ def _finalize_branch(
     quality_runner: QualityRunner,
     selected: Sequence[JsonObject],
     evaluated: Sequence[JsonObject],
-    stage1: Mapping[str, JsonObject],
+    admission: Mapping[str, JsonObject],
     evaluation_rounds: Mapping[str, int],
     selection_rounds: Mapping[str, int],
     dedup_audit: Sequence[JsonObject],
@@ -1131,8 +1146,8 @@ def _finalize_branch(
     p2_metadata: Mapping[str, JsonObject] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> JsonObject:
-    if hasattr(quality_runner, "bind_stage1"):
-        quality_runner.bind_stage1(stage1)
+    if hasattr(quality_runner, "bind_admission"):
+        quality_runner.bind_admission(admission)
     branch_root = run_root / set_name
     complete = _restore_completed_branch(set_name, branch_root, checkpoints, run_root)
     if complete is not None:
@@ -1152,19 +1167,12 @@ def _finalize_branch(
     )
     write_jsonl(branch_root / "dedup_audit.jsonl", dedup_audit)
 
-    optional_artifacts = ()
-    if "stage2" in quality_runner.additional_stages:
-        from ..quality.optional_stage2 import annotate_branch
-        _set_branch_status(run_root, set_name, "running", stage="optional_annotations")
-        optional_artifacts = annotate_branch(quality_runner, selected, branch_root, set_name)
-
     risk_snapshot = json.loads((run_root / "risk_keywords.json").read_text(encoding="utf-8"))
     records = tuple(
         build_screened_canonical_record(
             set_name,
             candidate,
-            stage1[candidate["source_identity_sha256"]],
-            delivery_labels(candidate, stage1[candidate["source_identity_sha256"]], risk_snapshot),
+            admission[candidate["source_identity_sha256"]],
             challenge_result=(challenge_results[candidate["source_identity_sha256"]] if set_name == "P2" else None),
             challenge_task_id=(
                 _quality_task_id(quality_runner, "challenge", candidate)
@@ -1180,7 +1188,11 @@ def _finalize_branch(
                 f"{set_name}:{selection_rounds[candidate['source_identity_sha256']]}:"
                 f"{candidate['source_identity_sha256']}"
             ),
-            stage1_task_id=_quality_task_id(quality_runner, "stage1", candidate),
+            admission_task_id=_quality_task_id(quality_runner, "admission", candidate),
+            admission_feature_task_id=_quality_task_id(quality_runner, "admission_features", candidate),
+            admission_category_task_id=_quality_task_id(quality_runner, "admission_category", candidate),
+            run_id=run_root.name,
+            candidate_sources=p2_metadata.get(candidate["source_identity_sha256"], {}),
         )
         for candidate in selected
     )
@@ -1191,6 +1203,38 @@ def _finalize_branch(
     validate_screened_canonical_records(
         set_name, records, expected_candidate_tasks=tasks, expected_final_count=len(selected)
     )
+    freeze_path = branch_root / "stage1.frozen.jsonl"
+    freeze_report_path = branch_root / "stage1_freeze_report.json"
+    if freeze_path.exists():
+        if load_jsonl(freeze_path) != list(records):
+            raise ValueError("Stage1 冻结结果与续跑成员不一致")
+        if freeze_report_path.exists() and json.loads(freeze_report_path.read_text(encoding="utf-8")) != {
+            "stage": "stage1", "records": len(records), "sha256": sha256_file(freeze_path)
+        }:
+            raise ValueError("Stage1 冻结报告与成员哈希不一致")
+    else:
+        write_jsonl(freeze_path, records)
+    if not freeze_report_path.exists():
+        write_json(freeze_report_path, {"stage": "stage1", "records": len(records), "sha256": sha256_file(freeze_path)})
+    checkpoints.save("stage1_frozen", {
+        "records": list(records), "sha256": sha256_file(freeze_path),
+        "finalize_inputs": {
+            "selected": list(selected), "evaluated": list(evaluated), "admission": dict(admission),
+            "evaluation_rounds": dict(evaluation_rounds), "selection_rounds": dict(selection_rounds),
+            "dedup_audit": list(dedup_audit), "audit": audit,
+            "challenge_results": dict(challenge_results), "p2_metadata": dict(p2_metadata), "extra": extra,
+        },
+    })
+    _set_branch_status(run_root, set_name, "running", stage="stage2_quality_annotation")
+    from ..quality.annotation import annotate_branch
+    annotations, annotation_artifacts = annotate_branch(quality_runner, selected, branch_root, set_name)
+    records = tuple({
+        **record,
+        "delivery_labels": delivery_labels(record["candidate"], {"admission": record["quality"]["admission"]}, risk_snapshot),
+        "downstream_quality": annotations[record["candidate"]["source_identity_sha256"]],
+        "provenance": {**record["provenance"], "quality_annotation_task_id":
+            _quality_task_id(quality_runner, "quality_annotation", record["candidate"])},
+    } for record in records)
     _set_branch_status(run_root, set_name, "running", stage="export")
     export_report = export_labeled_branch(set_name, records, branch_root)
     final_audit = {
@@ -1216,7 +1260,7 @@ def _finalize_branch(
         "labeled_export_report.json",
         "branch_audit.json",
         "branch_report.json",
-        *optional_artifacts,
+        "stage1.frozen.jsonl", "stage1_freeze_report.json", *annotation_artifacts,
     )
     artifacts = {
         name: sha256_file(branch_root / name)
@@ -1227,7 +1271,7 @@ def _finalize_branch(
         "records": list(records),
         "selected": list(selected),
         "evaluated_candidates": list(evaluated),
-        "stage1_results": dict(stage1),
+        "admission_results": dict(admission),
         "evaluation_rounds": dict(evaluation_rounds),
         "selection_rounds": dict(selection_rounds),
         "dedup_audit": list(dedup_audit),
@@ -1264,6 +1308,9 @@ def _run_p0_branch(
     if complete is not None:
         return complete
     _set_branch_status(run_root, set_name, "running", stage="sampling")
+    frozen_result = _resume_frozen_branch(set_name, run_root, checkpoints, quality_runner)
+    if frozen_result is not None:
+        return frozen_result
     materialized: dict[str, JsonObject] = {}
     initial = checkpoints.load("initial")
     if initial is None:
@@ -1309,26 +1356,26 @@ def _run_p0_branch(
         branch_root / "candidate_tasks.jsonl",
         [_candidate_task(candidate, set_name, 0) for candidate in candidates],
     )
-    stage1_checkpoint = checkpoints.load("stage1")
-    if stage1_checkpoint is None:
-        _set_branch_status(run_root, set_name, "running", stage="stage1")
-        stage1 = _run_quality(quality_runner, "run_stage1", candidates, set_name)
-        checkpoints.save("stage1", {"results": stage1})
+    admission_checkpoint = checkpoints.load("admission")
+    if admission_checkpoint is None:
+        _set_branch_status(run_root, set_name, "running", stage="admission")
+        admission = _run_quality(quality_runner, "run_admission", candidates, set_name)
+        checkpoints.save("admission", {"results": admission})
     else:
-        stage1 = dict(stage1_checkpoint["results"])
-    selected = _passing(candidates, stage1)
+        admission = dict(admission_checkpoint["results"])
+    selected = _passing(candidates, admission)
     audit = _branch_audit(
-        set_name, len(initial["sampled_identities"]), len(candidates), candidates, stage1
+        set_name, len(initial["sampled_identities"]), len(candidates), candidates, admission
     )
     audit.update({
         "supplement_sampled": 0, "supplement_after_dedup": 0,
-        "supplement_stage1_pass": 0, "supplement_admitted": 0,
+        "supplement_admission_pass": 0, "supplement_admitted": 0,
         "backfill_gap": int(initial["backfill_gap"]),
     })
     return _finalize_branch(
         set_name, run_root=run_root, checkpoints=checkpoints,
         quality_runner=quality_runner, selected=selected, evaluated=candidates,
-        stage1=stage1,
+        admission=admission,
         evaluation_rounds={item["source_identity_sha256"]: 0 for item in candidates},
         selection_rounds={item["source_identity_sha256"]: 0 for item in selected},
         dedup_audit=initial["dedup_audit"], audit=audit,
@@ -1354,6 +1401,9 @@ def _run_p1_branch(
     if complete is not None:
         return complete
     _set_branch_status(run_root, set_name, "running", stage="sampling")
+    frozen_result = _resume_frozen_branch(set_name, run_root, checkpoints, quality_runner)
+    if frozen_result is not None:
+        return frozen_result
     materialized: dict[str, JsonObject] = {}
     initial = checkpoints.load("initial")
     if initial is None:
@@ -1375,13 +1425,13 @@ def _run_p1_branch(
         branch_root / "candidate_tasks.jsonl",
         [_candidate_task(candidate, set_name, 0) for candidate in initial_candidates],
     )
-    initial_stage1_checkpoint = checkpoints.load("stage1_initial")
-    if initial_stage1_checkpoint is None:
-        _set_branch_status(run_root, set_name, "running", stage="stage1")
-        stage1 = _run_quality(quality_runner, "run_stage1", initial_candidates, set_name)
-        checkpoints.save("stage1_initial", {"results": stage1})
+    initial_admission_checkpoint = checkpoints.load("admission_initial")
+    if initial_admission_checkpoint is None:
+        _set_branch_status(run_root, set_name, "running", stage="admission")
+        admission = _run_quality(quality_runner, "run_admission", initial_candidates, set_name)
+        checkpoints.save("admission_initial", {"results": admission})
     else:
-        stage1 = dict(initial_stage1_checkpoint["results"])
+        admission = dict(initial_admission_checkpoint["results"])
 
     quota_checkpoint = checkpoints.load("quotas")
     if quota_checkpoint is None:
@@ -1395,12 +1445,12 @@ def _run_p1_branch(
         quotas = {str(key): int(value) for key, value in quota_checkpoint["quotas"].items()}
     selected: list[JsonObject] = []
     selected_counts: Counter[str] = Counter()
-    for candidate in _passing(initial_candidates, stage1):
+    for candidate in _passing(initial_candidates, admission):
         key = candidate["taxonomy"]["l2_key"]
         if selected_counts[key] < quotas.get(key, 0):
             selected.append(candidate)
             selected_counts[key] += 1
-    initial_pass_count = len(_passing(initial_candidates, stage1))
+    initial_pass_count = len(_passing(initial_candidates, admission))
     initial_admitted_count = len(selected)
     evaluated = list(initial_candidates)
     evaluation_rounds = {item["source_identity_sha256"]: 0 for item in evaluated}
@@ -1412,7 +1462,7 @@ def _run_p1_branch(
     supplement_terminal: Counter[str] = Counter()
     supplement_pass: Counter[str] = Counter()
     feedback: dict[Any, list[int]] = {}
-    _update_cluster_feedback(feedback, initial_candidates, stage1)
+    _update_cluster_feedback(feedback, initial_candidates, admission)
     with CanonicalCandidateIndex(index) as readonly_index:
         cluster_remaining = readonly_index.available_counts("cluster")
         for cluster, count in readonly_index.cluster_counts_for_identities(processed).items():
@@ -1519,27 +1569,27 @@ def _run_p1_branch(
             result_name = f"round_{round_id}_batch_{batch_id}_result"
             result = checkpoints.load(result_name)
             if result is None:
-                batch_stage1 = (
-                    _run_quality(quality_runner, "run_stage1", new_candidates, set_name)
+                batch_admission = (
+                    _run_quality(quality_runner, "run_admission", new_candidates, set_name)
                     if new_candidates else {}
                 )
-                passed = _passing(new_candidates, batch_stage1) if new_candidates else []
+                passed = _passing(new_candidates, batch_admission) if new_candidates else []
                 result = {
-                    "stage1_results": batch_stage1,
+                    "admission_results": batch_admission,
                     "admitted_identities": [item["source_identity_sha256"] for item in passed],
                 }
                 checkpoints.save(result_name, result)
-            batch_stage1 = {str(key): dict(value) for key, value in result["stage1_results"].items()}
-            stage1.update(batch_stage1)
-            passed = _passing(new_candidates, batch_stage1) if new_candidates else []
+            batch_admission = {str(key): dict(value) for key, value in result["admission_results"].items()}
+            admission.update(batch_admission)
+            passed = _passing(new_candidates, batch_admission) if new_candidates else []
             selected.extend(passed)
             selection_rounds.update({item["source_identity_sha256"]: round_id for item in passed})
             supplement_terminal.update(_l2_counts(new_candidates))
             supplement_pass.update(_l2_counts(passed))
-            _update_cluster_feedback(feedback, new_candidates, batch_stage1)
+            _update_cluster_feedback(feedback, new_candidates, batch_admission)
             batch_summaries.append({
                 "batch": batch_id, "sampled": len(plan["sampled_identities"]),
-                "after_dedup": len(new_candidates), "stage1_pass": len(passed),
+                "after_dedup": len(new_candidates), "admission_pass": len(passed),
                 "admitted": len(passed), "l2": {}, "clusters": [],
             })
         remaining = {key: max(0, quota - _l2_counts(selected)[key]) for key, quota in quotas.items()}
@@ -1549,7 +1599,7 @@ def _run_p1_branch(
             "estimated_pass_rate_by_l2": rates,
             "sampled": sum(item["sampled"] for item in batch_summaries),
             "after_dedup": sum(item["after_dedup"] for item in batch_summaries),
-            "stage1_pass": sum(item["stage1_pass"] for item in batch_summaries),
+            "admission_pass": sum(item["admission_pass"] for item in batch_summaries),
             "admitted": sum(item["admitted"] for item in batch_summaries),
             "batches": batch_summaries, "stop": round_stop,
         })
@@ -1584,15 +1634,15 @@ def _run_p1_branch(
     }
     write_json(branch_root / "supplement_summary.json", supplement_summary)
     audit = _branch_audit(
-        set_name, len(initial["sampled_identities"]), len(evaluated), evaluated, stage1
+        set_name, len(initial["sampled_identities"]), len(evaluated), evaluated, admission
     )
     audit.update({
-        "initial_stage1_pass": initial_pass_count,
+        "initial_admission_pass": initial_pass_count,
         "initial_admitted": initial_admitted_count,
         "initial_pass_not_admitted": initial_pass_count - initial_admitted_count,
         "supplement_sampled": sum(item["sampled"] for item in rounds),
         "supplement_after_dedup": sum(item["after_dedup"] for item in rounds),
-        "supplement_stage1_pass": sum(item["stage1_pass"] for item in rounds),
+        "supplement_admission_pass": sum(item["admission_pass"] for item in rounds),
         "supplement_admitted": sum(item["admitted"] for item in rounds),
         "supplement_pass_not_admitted": 0,
         "target": config.sampling.p1.target_n,
@@ -1603,7 +1653,7 @@ def _run_p1_branch(
     return _finalize_branch(
         set_name, run_root=run_root, checkpoints=checkpoints,
         quality_runner=quality_runner, selected=selected, evaluated=evaluated,
-        stage1=stage1, evaluation_rounds=evaluation_rounds,
+        admission=admission, evaluation_rounds=evaluation_rounds,
         selection_rounds=selection_rounds, dedup_audit=dedup_audit, audit=audit,
         extra={"p1_target_quotas": quotas, "p1_supplement": supplement_summary},
     )
@@ -1627,6 +1677,9 @@ def _run_p2_branch(
     if complete is not None:
         return complete
     _set_branch_status(run_root, set_name, "running", stage="adaptive")
+    frozen_result = _resume_frozen_branch(set_name, run_root, checkpoints, quality_runner)
+    if frozen_result is not None:
+        return frozen_result
     state = _run_adaptive_p2(
         index, config, source_path=source_path, taxonomy=taxonomy,
         run_root=run_root, quality_runner=quality_runner, checkpoints=checkpoints,
@@ -1637,7 +1690,7 @@ def _run_p2_branch(
     audit = _branch_audit(
         set_name,
         sum(batch["sampled"] for wave in diagnostics["rounds"] for batch in wave["batches"]),
-        len(state["evaluated_candidates"]), state["evaluated_candidates"], state["stage1_results"],
+        len(state["evaluated_candidates"]), state["evaluated_candidates"], state["admission_results"],
     )
     audit.update({
         "supplement_sampled": sum(
@@ -1646,8 +1699,8 @@ def _run_p2_branch(
         "supplement_after_dedup": sum(
             batch["after_dedup"] for wave in diagnostics["rounds"][1:] for batch in wave["batches"]
         ),
-        "supplement_stage1_pass": sum(
-            batch["stage1_pass"] for wave in diagnostics["rounds"][1:] for batch in wave["batches"]
+        "supplement_admission_pass": sum(
+            batch["admission_pass"] for wave in diagnostics["rounds"][1:] for batch in wave["batches"]
         ),
         "supplement_admitted": sum(
             batch["judge_pass"] for wave in diagnostics["rounds"][1:] for batch in wave["batches"]
@@ -1658,7 +1711,7 @@ def _run_p2_branch(
     return _finalize_branch(
         set_name, run_root=run_root, checkpoints=checkpoints,
         quality_runner=quality_runner, selected=state["selected"],
-        evaluated=state["evaluated_candidates"], stage1=state["stage1_results"],
+        evaluated=state["evaluated_candidates"], admission=state["admission_results"],
         evaluation_rounds=state["evaluation_rounds"], selection_rounds=state["selection_rounds"],
         dedup_audit=state["dedup_audit"], audit=audit,
         challenge_results=state["challenge_results"], p2_metadata=state["metadata"],
@@ -1824,9 +1877,9 @@ def run_build(
     if not errors:
         evaluated = {name: results[name]["evaluated_candidates"] for name in ("P0", "P1", "P2")}
         evaluation_rounds = {name: results[name]["evaluation_rounds"] for name in ("P0", "P1", "P2")}
-        stage1: dict[str, JsonObject] = {}
+        admission: dict[str, JsonObject] = {}
         for name in ("P0", "P1", "P2"):
-            stage1.update(results[name]["stage1_results"])
+            admission.update(results[name]["admission_results"])
         if not (run_root / "screening_run_report.json").is_file():
             write_run_report(
                 run_root,
@@ -1834,7 +1887,7 @@ def run_build(
                 taxonomy=taxonomy,
                 evaluated_candidates=evaluated,
                 evaluation_rounds=evaluation_rounds,
-                stage1_results=stage1,
+                admission_results=admission,
                 final_records=output,
                 p1_target_quotas=results["P1"]["p1_target_quotas"],
                 build_summary=summary,

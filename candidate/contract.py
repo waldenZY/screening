@@ -13,8 +13,8 @@ from ..shared.json_io import JsonObject
 from ..shared.taxonomy import TaxonomyMappings
 
 
-CANONICAL_SCHEMA_VERSION = 2
-FEATURE_RULE_VERSION = 3
+CANONICAL_SCHEMA_VERSION = 3
+FEATURE_RULE_VERSION = 4
 MAX_SQLITE_INTEGER = 2**63 - 1
 
 PROBABILITY_BANDS = frozenset({"high", "mid", "boundary"})
@@ -48,6 +48,13 @@ _ACTIONS = re.compile(
     r"导航|翻译|截图|搜索|计算|定位|预约|订|买"
 )
 _CONNECTORS = re.compile(r"并且|同时|但是|另外|而且|或者|还是|然后|还有|因为|所以|如果|虽然")
+_PARTICLES = set("呢嘛吧啊哦哈啦呗呀哇咯撒咔咚嘞喽咧")
+_COLLOQUIAL_CHARS = set("啥咋俺咱整搁")
+_CASUAL_WORDS = re.compile(
+    r"(咋整|干哈|干啥|整啥|咋么|俺们|啥子|咋办|啥意思|整一下|咋样"
+    r"|麻了|离谱|裂开|烦死了|无语|救命|服了|没谁了|我靠|卧槽|尼玛)"
+)
+_BADWORDS = re.compile(r"(他妈的|他妈|操你|傻逼|煞笔|脑残|垃圾|废物|狗屁|cnm|rnm|tm的|sb)")
 
 
 class CanonicalContractError(ValueError):
@@ -64,10 +71,6 @@ class FixedFeatureConfig:
     probability_mid: float = 0.5
     frequency_hot_percentile: float = 0.8
     frequency_warm_percentile: float = 0.2
-    p0_probability_weight: float = 0.6
-    p0_frequency_weight: float = 0.4
-    p2_probability_weight: float = 0.5
-    p2_frequency_weight: float = 0.5
 
     def __post_init__(self) -> None:
         values = asdict(self)
@@ -83,12 +86,6 @@ class FixedFeatureConfig:
             raise ValueError("probability_mid 不能大于 probability_high")
         if self.frequency_warm_percentile > self.frequency_hot_percentile:
             raise ValueError("frequency_warm_percentile 不能大于 frequency_hot_percentile")
-        for label, total in (
-            ("P0", self.p0_probability_weight + self.p0_frequency_weight),
-            ("P2", self.p2_probability_weight + self.p2_frequency_weight),
-        ):
-            if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-12):
-                raise ValueError(f"{label} relevance 权重之和必须为 1")
 
     def as_dict(self) -> JsonObject:
         return asdict(self)
@@ -316,6 +313,28 @@ def _complexity(text: str) -> str:
     return "complex"
 
 
+def _formality(text: str) -> str:
+    """Restore the last pre-removal heuristic, including historical thresholds."""
+    cleaned = clean_text(text)
+    score = sum(1 for char in cleaned if char in _PARTICLES) * 0.25
+    score += sum(1 for char in cleaned if char in _COLLOQUIAL_CHARS) * 0.4
+    score += len(_CASUAL_WORDS.findall(cleaned)) * 0.6
+    if _BADWORDS.search(cleaned.lower()):
+        score += 1.0
+    if re.search(r"~~{1,}", cleaned):
+        score += 0.5
+    if re.search(r"！{2,}", cleaned):
+        score += 0.3
+    # Historical compatibility: this intentionally matches any three characters.
+    if re.search(r".{3,}", cleaned):
+        score += 0.3
+    if re.search(r"(.)\1{2,}", cleaned):
+        score += 0.5
+    if re.search(r"[\U0001F300-\U0001F9FF]|[;:][-~^]?[)D(p]", text):
+        score += 0.3
+    return "formal" if score <= 0.5 else "mixed" if score <= 1.5 else "colloquial"
+
+
 def compute_fixed_features(
     signals: Mapping[str, Any],
     conversation: Mapping[str, Any],
@@ -393,18 +412,9 @@ def compute_fixed_features(
         "probability_band": probability_band,
         "frequency_band": frequency_band,
         "normalized_frequency": normalized_frequency,
-        "relevance": {
-            "p0": (
-                rules.p0_probability_weight * float(probability)
-                + rules.p0_frequency_weight * normalized_frequency
-            ),
-            "p2": (
-                rules.p2_probability_weight * (1.0 - float(probability))
-                + rules.p2_frequency_weight * (1.0 - normalized_frequency)
-            ),
-        },
         "length_band": _length_band(full_text),
         "complexity": _complexity(full_text),
+        "formality": _formality(full_text),
     }
 
 
@@ -478,7 +488,7 @@ def build_canonical_candidate(
             "probability_band",
             "frequency_band",
             "normalized_frequency",
-            "relevance",
+            "formality",
             "length_band",
             "complexity",
         }
@@ -650,33 +660,21 @@ def validate_canonical_candidate(
     ):
         raise CanonicalContractError("canonical_invalid_signals", "frequency 非法")
 
-    selected_features = {"length_bin", "complexity"} if screened_features else {"length_band", "complexity"}
-    full_features = selected_features | {
-        "probability_band", "frequency_band", "normalized_frequency", "relevance"
+    full_features = {
+        "length_band", "complexity", "formality", "probability_band",
+        "frequency_band", "normalized_frequency",
     }
-    _require_exact_keys(features, selected_features if screened_features else full_features, "features")
+    _require_exact_keys(features, full_features, "features")
     enum_checks = [
-        ("length_bin" if screened_features else "length_band", LENGTH_BANDS),
+        ("length_band", LENGTH_BANDS),
         ("complexity", COMPLEXITY_LEVELS),
+        ("formality", {"formal", "mixed", "colloquial"}),
+        ("probability_band", PROBABILITY_BANDS),
+        ("frequency_band", FREQUENCY_BANDS),
     ]
-    if not screened_features:
-        enum_checks.extend((
-            ("probability_band", PROBABILITY_BANDS),
-            ("frequency_band", FREQUENCY_BANDS),
-        ))
     for key, allowed in enum_checks:
         if features.get(key) not in allowed:
             raise CanonicalContractError("canonical_invalid_feature", f"features.{key} 非法")
-    if screened_features:
-        return
     normalized = features.get("normalized_frequency")
     if not _is_number(normalized) or not 0 <= float(normalized) <= 1:
         raise CanonicalContractError("canonical_invalid_feature", "normalized_frequency 非法")
-    relevance = features.get("relevance")
-    if not isinstance(relevance, Mapping) or set(relevance) != {"p0", "p2"}:
-        raise CanonicalContractError("canonical_invalid_feature", "features.relevance 非法")
-    if not all(
-        _is_number(relevance.get(key)) and 0.0 <= float(relevance[key]) <= 1.0
-        for key in ("p0", "p2")
-    ):
-        raise CanonicalContractError("canonical_invalid_feature", "features.relevance 数值非法")

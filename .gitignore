@@ -7,3 +7,6 @@ __pycache__/
 *.py[cod]
 artifacts/config/llm_config.local.json
 module_tests/outputs/
+.screening_batch/
+batch_outputs/
+batch_publications/

@@ -1,5 +1,5 @@
 {
-  "config_version": 10,
+  "config_version": 11,
   "inputs": {
     "source": "",
     "taxonomy": "",
@@ -9,13 +9,10 @@
     "output_root": "../../outputs_v4"
   },
   "prompts": {
-    "stage1": "../prompts/quality_stage1.md",
+    "admission": "../prompts/quality_admission.md",
     "challenge": "../prompts/quality_challenge.md",
-    "category": "../prompts/quality_stage1_category.md"
-  },
-  "optional_stage2": {
-    "enabled": false,
-    "prompt": null
+    "category": "../prompts/quality_admission_category.md",
+    "quality_annotation": "../prompts/quality_annotation.md"
   },
   "quality": {
     "workers": 10,
