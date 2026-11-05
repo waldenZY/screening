@@ -83,3 +83,5 @@ JSONL 保存 admission_group，Excel 分列展示类型、原因、澄清点、�
 新版external删除stage1/provenance对象，不能单独重现完整质量模型输入。准入复测仍可用于观察文本，但质量复测请传internal/P0|P1|P2/stage1.frozen.jsonl或screened.canonical.jsonl。--stage1-from由生产入口执行，不等同于单模块复测。
 
 新增test_delivery_layout覆盖新目录、六文件对齐、全部映射档、报告和切片、缓存隔离、新旧v4来源、模型变更只补标、来源不变、失败恢复与篡改拒绝。测试使用moto、临时数据和模拟LLM。Windows受限环境可将TEMP/TMP设置到有写权限的临时目录；Git Bash需要正常的Windows进程/命名对象权限。
+
+索引单盘优化验收见tests/test_index_io.py：覆盖完整源频次总体、重复与冲突、扫描中断、旧查询索引续建、回填/建索引中断恢复、最终缓存复用，以及分阶段计时和IDF结果。它们验证结果与恢复正确性，不模拟生产服务器磁盘性能。

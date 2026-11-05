@@ -304,12 +304,6 @@ def _initialize(connection: sqlite3.Connection, source: Mapping[str, Any]) -> No
             complexity TEXT NOT NULL,
             formality TEXT NOT NULL
         ) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS candidates_l1_source
-            ON candidates(l1, source_line);
-        CREATE INDEX IF NOT EXISTS candidates_l2_source
-            ON candidates(l2_key, source_line);
-        CREATE INDEX IF NOT EXISTS candidates_cluster_source
-            ON candidates(cluster_json, source_line);
         """
     )
     connection.execute(
@@ -317,6 +311,25 @@ def _initialize(connection: sqlite3.Connection, source: Mapping[str, Any]) -> No
         (json.dumps(_initial_checkpoint(source), ensure_ascii=False, sort_keys=True),),
     )
     connection.commit()
+
+
+def _create_query_indexes(connection: sqlite3.Connection, logger: logging.Logger | None) -> None:
+    """Build read indexes once, after ingestion and feature updates.
+
+    Identity/duplicate constraints remain active during the entire scan. Existing
+    indexes from an older interrupted build are retained rather than dropped.
+    """
+    for name, columns in (
+        ("candidates_l1_source", "l1, source_line"),
+        ("candidates_l2_source", "l2_key, source_line"),
+        ("candidates_cluster_source", "cluster_json, source_line"),
+    ):
+        started = time.monotonic()
+        if logger:
+            logger.info("canonical query index start name=%s", name)
+        connection.execute(f"CREATE INDEX IF NOT EXISTS {name} ON candidates({columns})")
+        if logger:
+            logger.info("canonical query index complete name=%s seconds=%.2f", name, time.monotonic() - started)
 
 
 def _checkpoint(connection: sqlite3.Connection) -> JsonObject:
@@ -513,6 +526,21 @@ def _finalize_features(
 ) -> JsonObject:
     frequency_stats: JsonObject = {}
     cluster_count = 0
+    # This small lookup uses the already aggregated full-source frequencies.
+    # Apply it in one candidates-table pass, instead of scanning a cluster once
+    # for every distinct frequency. The persistent candidates schema is unchanged.
+    connection.execute("DROP TABLE IF EXISTS frequency_features")
+    connection.execute("""
+        CREATE TABLE frequency_features (
+            cluster_json TEXT NOT NULL,
+            frequency INTEGER NOT NULL,
+            less_count INTEGER NOT NULL,
+            total_count INTEGER NOT NULL,
+            band TEXT NOT NULL,
+            normalized REAL NOT NULL,
+            PRIMARY KEY(cluster_json, frequency)
+        ) WITHOUT ROWID
+    """)
     for cluster_json, counts in _frequency_groups(connection):
         cluster_count += 1
         total = sum(count for _, count in counts)
@@ -536,10 +564,9 @@ def _finalize_features(
             )
             connection.execute(
                 """
-                UPDATE candidates
-                SET frequency_less_count=?, cluster_frequency_count=?,
-                    frequency_band=?, normalized_frequency=?
-                WHERE cluster_json=? AND frequency=?
+                INSERT INTO frequency_features(
+                    less_count, total_count, band, normalized, cluster_json, frequency
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     less,
@@ -559,6 +586,22 @@ def _finalize_features(
         }
         if logger is not None and cluster_count % 1000 == 0:
             logger.info("canonical feature finalization clusters=%d", cluster_count)
+
+    started = time.monotonic()
+    if logger:
+        logger.info("canonical feature apply start clusters=%d", cluster_count)
+    connection.execute("""
+        UPDATE candidates
+        SET (frequency_less_count, cluster_frequency_count, frequency_band, normalized_frequency) = (
+            SELECT f.less_count, f.total_count, f.band, f.normalized
+            FROM frequency_features AS f
+            WHERE f.cluster_json=candidates.cluster_json AND f.frequency=candidates.frequency
+        )
+    """)
+    if logger:
+        logger.info("canonical feature apply complete seconds=%.2f", time.monotonic() - started)
+    connection.execute("DROP TABLE frequency_features")
+    _create_query_indexes(connection, logger)
 
     missing = connection.execute(
         """
@@ -642,12 +685,33 @@ def _scan(
 
         offset = int(checkpoint.get("scan_offset", 0))
         physical_line = int(checkpoint.get("physical_line", 0))
+        if offset:
+            logger.info("canonical resume prefix verification start bytes=%d", offset)
+        rehash_started = time.monotonic()
         digest = _rehash_prefix(source_path, offset)
+        if offset:
+            logger.info("canonical resume prefix verification complete seconds=%.2f", time.monotonic() - rehash_started)
         processed_since_commit = 0
         next_progress = int(checkpoint.get("total_rows", 0)) + progress_every
         started_at = time.monotonic()
+        last_progress_at = started_at
+        last_progress_offset = offset
+        last_progress_rows = int(checkpoint.get("total_rows", 0))
+        timings = {"read": 0.0, "sqlite": 0.0, "checkpoint": 0.0}
+        previous_timings = dict(timings)
+        existing_indexes = [row[1] for row in connection.execute("PRAGMA index_list(candidates)") if row[3] == "c"]
+        logger.info("canonical scan start offset=%d cache_mb=%d existing_query_indexes=%d", offset, cache_mb, len(existing_indexes))
+
+        def scan_execute(sql: str, parameters: tuple[Any, ...]) -> sqlite3.Cursor:
+            started = time.monotonic()
+            try:
+                return connection.execute(sql, parameters)
+            finally:
+                timings["sqlite"] += time.monotonic() - started
 
         def persist(status: str) -> None:
+            started = time.monotonic()
+            logger.info("canonical checkpoint start rows=%d status=%s", checkpoint["total_rows"], status)
             _save_checkpoint(connection, checkpoint)
             connection.commit()
             _write_audit(
@@ -659,9 +723,13 @@ def _scan(
                 feature_config=feature_config,
                 status=status,
             )
+            seconds = time.monotonic() - started
+            timings["checkpoint"] += seconds
+            logger.info("canonical checkpoint complete rows=%d seconds=%.2f", checkpoint["total_rows"], seconds)
 
         def finish_row() -> None:
             nonlocal processed_since_commit, next_progress
+            nonlocal last_progress_at, last_progress_offset, last_progress_rows, previous_timings
             processed_since_commit += 1
             if processed_since_commit >= batch_size:
                 persist("building")
@@ -671,21 +739,36 @@ def _scan(
                         "canonical 索引工作区剩余空间低于安全余量；已保存可恢复检查点"
                     )
             if int(checkpoint.get("total_rows", 0)) >= next_progress:
-                elapsed = max(time.monotonic() - started_at, 0.001)
+                now = time.monotonic()
+                elapsed = max(now - started_at, 0.001)
+                interval = max(now - last_progress_at, 0.001)
+                elapsed_by_stage = {key: value - previous_timings[key] for key, value in timings.items()}
                 logger.info(
-                    "canonical index rows=%d bytes=%d/%d throughput=%.2f MiB/s",
+                    "canonical index rows=%d bytes=%d/%d throughput=%.2f MiB/s "
+                    "interval_throughput=%.2f MiB/s rows_per_second=%.1f "
+                    "read_seconds=%.2f sqlite_seconds=%.2f checkpoint_seconds=%.2f other_seconds=%.2f",
                     checkpoint["total_rows"],
                     checkpoint["scan_offset"],
                     source_at_start["size"],
                     (int(checkpoint["scan_offset"]) - offset) / elapsed / (1024 * 1024),
+                    (int(checkpoint["scan_offset"]) - last_progress_offset) / interval / (1024 * 1024),
+                    (int(checkpoint["total_rows"]) - last_progress_rows) / interval,
+                    elapsed_by_stage["read"], elapsed_by_stage["sqlite"], elapsed_by_stage["checkpoint"],
+                    max(0.0, interval - sum(elapsed_by_stage.values())),
                 )
+                last_progress_at = now
+                last_progress_offset = int(checkpoint["scan_offset"])
+                last_progress_rows = int(checkpoint["total_rows"])
+                previous_timings = dict(timings)
                 next_progress += progress_every
 
         with source_path.open("rb") as source:
             source.seek(offset)
             while True:
                 byte_offset = source.tell()
+                read_started = time.monotonic()
                 raw_line = source.readline()
+                timings["read"] += time.monotonic() - read_started
                 if not raw_line:
                     break
                 digest.update(raw_line)
@@ -754,7 +837,7 @@ def _scan(
                         checkpoint.get("missing_frequency_defaulted", 0)
                     ) + 1
                 if frequency_for_stats is not None:
-                    connection.execute(
+                    scan_execute(
                         """
                         INSERT INTO frequency_counts(cluster_json, frequency, row_count) VALUES(?, ?, 1)
                         ON CONFLICT(cluster_json, frequency) DO UPDATE SET row_count=row_count+1
@@ -827,7 +910,7 @@ def _scan(
                     conversation_hash = conversation_sha256(conversation)
                     cluster_json = _cluster_json(cluster_id)
                     target_hash = hashlib.sha256(conversation["target_query"].encode("utf-8")).hexdigest()
-                    inserted = connection.execute(
+                    inserted = scan_execute(
                         """
                         INSERT OR IGNORE INTO seen(
                             source_identity_sha256, target_sha256, cluster_json, source_line
@@ -837,7 +920,7 @@ def _scan(
                     ).rowcount
                     if not inserted:
                         checkpoint["duplicate_rows"] = int(checkpoint.get("duplicate_rows", 0)) + 1
-                        existing = connection.execute(
+                        existing = scan_execute(
                             "SELECT target_sha256, cluster_json, source_line FROM seen WHERE source_identity_sha256=?",
                             (source_identity,),
                         ).fetchone()
@@ -870,7 +953,7 @@ def _scan(
                             feature_config,
                         )
                         l2 = l2_key[len(l1) + 1 :]
-                        connection.execute(
+                        scan_execute(
                             """
                             INSERT INTO candidates(
                                 source_identity_sha256, conversation_sha256,
@@ -904,6 +987,14 @@ def _scan(
                 finish_row()
 
         persist("finalizing")
+        elapsed = max(time.monotonic() - started_at, 0.001)
+        logger.info(
+            "canonical scan complete rows=%d bytes=%d/%d seconds=%.2f throughput=%.2f MiB/s "
+            "read_seconds=%.2f sqlite_seconds=%.2f checkpoint_seconds=%.2f",
+            checkpoint["total_rows"], checkpoint["scan_offset"], source_at_start["size"], elapsed,
+            (int(checkpoint["scan_offset"]) - offset) / elapsed / (1024 * 1024),
+            timings["read"], timings["sqlite"], timings["checkpoint"],
+        )
         logger.info("canonical feature finalization start")
         finalize_started = time.monotonic()
         population = _finalize_features(connection, feature_config, logger)
@@ -920,7 +1011,9 @@ def _scan(
             "INSERT OR REPLACE INTO build_state(key, value) VALUES('population', ?)",
             (json.dumps(population, ensure_ascii=False, sort_keys=True),),
         )
-        connection.executescript("DROP TABLE seen; DROP TABLE frequency_counts;")
+        # Keep the final checkpoint, population and cleanup in the same transaction.
+        connection.execute("DROP TABLE seen")
+        connection.execute("DROP TABLE frequency_counts")
         connection.commit()
         logger.info("canonical SQLite integrity check start")
         check_started = time.monotonic()

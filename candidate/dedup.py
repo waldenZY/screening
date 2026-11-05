@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import sqlite3
+import time
 import unicodedata
 from collections import Counter
 from contextlib import closing
@@ -80,13 +82,18 @@ class DedupConfig:
 
 def build_idf_snapshot(index: CanonicalIndexHandle, source_path: Path) -> dict[str, Any]:
     """Read every indexed source row once; order does not affect document frequency."""
+    logger = logging.getLogger(__name__)
+    started = time.monotonic()
+    logger.info("canonical dedup IDF start; preparing source-order query")
     counts: Counter[str] = Counter()
     total = 0
     uri = f"file:{index.database_path.as_posix()}?mode=ro"
     with closing(sqlite3.connect(uri, uri=True)) as database, source_path.open("rb") as source:
-        for offset, length, expected_hash in database.execute(
+        cursor = database.execute(
             "SELECT byte_offset, byte_length, record_sha256 FROM candidates ORDER BY source_line"
-        ):
+        )
+        logger.info("canonical dedup IDF ordering ready seconds=%.2f", time.monotonic() - started)
+        for offset, length, expected_hash in cursor:
             source.seek(offset)
             raw = source.read(length)
             if len(raw) != length or hashlib.sha256(raw).hexdigest() != expected_hash:
@@ -95,6 +102,9 @@ def build_idf_snapshot(index: CanonicalIndexHandle, source_path: Path) -> dict[s
             conversation = parse_conversation(row["text"])
             counts.update(character_grams(normalize_text(selection_text({"conversation": conversation}))))
             total += 1
+            if total % 100_000 == 0:
+                elapsed = max(time.monotonic() - started, 0.001)
+                logger.info("canonical dedup IDF documents=%d seconds=%.2f documents_per_second=%.1f", total, elapsed, total / elapsed)
     snapshot = {
         "rules_version": DEDUP_RULE_VERSION,
         "rules_sha256": RULES_SHA256,
@@ -103,6 +113,7 @@ def build_idf_snapshot(index: CanonicalIndexHandle, source_path: Path) -> dict[s
         "document_frequency": dict(sorted(counts.items())),
     }
     snapshot["content_sha256"] = stable_hash(snapshot)
+    logger.info("canonical dedup IDF complete documents=%d seconds=%.2f", total, time.monotonic() - started)
     return snapshot
 
 
