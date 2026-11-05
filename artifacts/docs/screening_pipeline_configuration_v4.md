@@ -28,8 +28,28 @@ external/evaluation-set-large总是生成，按固定v4文件名导出六个集�
 
 ## 索引性能日志与兼容性
 
-单盘优化保持配置版本12、候选schema3、索引版本4及特征规则4。cache_mb默认1024，batch_size默认50000，synchronous=FULL不变。扫描期始终维护去重约束，新的查询索引延后建立；频次回填改为一次候选表更新，不改统计总体或浮点公式。
+单盘优化保持配置版本12、候选schema3、索引版本4及特征规则4。配置项index.sqlite_cache_mb默认1024，index.batch_size默认50000，synchronous=FULL不变。扫描期始终维护去重约束，新的查询索引延后建立；频次回填改为一次候选表更新，不改统计总体或浮点公式。
 
 throughput为本次扫描平均速度，interval_throughput为上次进度日志到本次的速度；rows_per_second为区间行速率。read/sqlite/checkpoint/other_seconds分别为该区间源读取、数据库操作、保存进度及其他处理的耗时。前缀SHA校验发生在扫描计时之前，有独立日志。IDF的排序准备和文档读取另有日志。
 
 已完成缓存直接复用；同版本中断缓存继续使用原检查点。扫描中已有的旧查询索引不删除，最终特征及集合选择不变。建造索引、回填和最终清理中断后可以恢复。不要为尝试优化而删除旧缓存或改动正在运行的数据库文件。
+
+## 单盘运行的参数选择
+
+下列参数可放在完整配置的index对象中，也可由对应CLI参数覆盖。它们控制建索引的资源与记录频率，不改变采样或模型判断标准。
+
+| index配置项 | CLI参数 | 当前默认值 | 含义与建议 |
+| --- | --- | ---: | --- |
+| sqlite_cache_mb | --index-cache-mb | 1024 | SQLite缓存额度，单位MiB；常用数据库页可留在内存中。共享服务器可先试4096，默认值未改 |
+| batch_size | --index-batch-size | 50000 | 每处理这些源行提交并保存恢复进度，先保持默认 |
+| progress_every | --index-progress-every | 100000 | 每处理这些源记录打印扫描进度，先保持默认；不控制保存频率 |
+| min_free_space_gb | --index-min-free-space-gb | 10 | 建索引启动时的最低剩余空间，单位GiB |
+| reserve_free_space_gb | --index-reserve-free-space-gb | 8 | 扫描批次提交后检查的剩余空间安全线，单位GiB |
+
+例如，在原有完整启动命令末尾追加 `--index-cache-mb 4096`，会在下次启动时尝试约4 GiB的数据库缓存。缓存按需使用，不等于整个Python进程的内存上限；多个并行建索引进程分别占用资源。先确认该任务可使用的内存额度，整机有空闲内存不代表任务没有单独限额。Linux本身也会缓存文件，增加该值不保证等比例提速。
+
+先只调整缓存并比较相同阶段的日志。若checkpoint_seconds确实占很大比例，再单独试batch_size=100000；保存间隔越长，中断后可能需要重做的行数越多。若sqlite_seconds占主要时间，应优先继续减少数据库访问；若read_seconds占主要时间，应检查源文件所在盘的读取竞争。quality.workers只控制模型任务并发，不会并行加速候选索引构建。
+
+批跑脚本没有单独的索引参数区。需要批跑试用时，复制完整默认配置为一份专用配置，修改其中index.sqlite_cache_mb，并将脚本CONFIG_FILE指向该配置。配置内相对路径按配置文件所在目录解析，复制到其他目录时需同步核对Prompt等相对路径。不要在JSON中填写内部函数名cache_mb；有效键名是sqlite_cache_mb。
+
+10/8 GiB是空间检查阈值，不是“200GB输入只需10GB空闲”的容量保证；数据库、写入日志及排序临时文件还会占用空间。当前保留WAL写入方式、synchronous=FULL保存保护及temp_store=FILE；本轮未开放或修改这些设置。已在运行的旧进程不会自动获得新代码或参数，已完成缓存仍优先复用。离线冒烟步骤见[测试说明](../../module_tests/README.md#整体冒烟测试)。

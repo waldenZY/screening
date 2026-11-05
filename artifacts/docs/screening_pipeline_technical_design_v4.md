@@ -6,6 +6,8 @@
 
 Stage2保持quality_annotation四字段模型任务及评分契约，再由冻结的路线、概率档、规则复杂度计算三个交付维度。类别沿用Stage1。低分及差异不影响成员、intent_label或executable。所有映射输入必须合法，不填默认值。
 
+候选索引扫描期保留身份去重及冲突检查，三份供采样查询使用的索引在导入和频次回填后统一建立。频次特征先按完整源统计生成映射，再一次回填候选表；最终数据、计算公式及持久化schema不变。已存在的旧查询索引不强制删除，完成缓存保持兼容。扫描、提交、最终整理和IDF阶段分别记录耗时；参数及恢复边界见[配置说明](screening_pipeline_configuration_v4.md#索引性能日志与兼容性)。
+
 ## 内部事实与外部投影
 
 每次运行是<output-root>/<run-id>。internal保存不可变冻结结果、screened.canonical成品、模型账本、规则与Prompt、补采及审计。完整报告包含build_summary；export_validation集中三个集合的导出检查；manifest包含冻结摘要与交付索引。合并重复报告，Prompt只保存一份，外部文件不在内部重复复制。

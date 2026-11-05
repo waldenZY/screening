@@ -1,4 +1,36 @@
-# 单模块复测：准入评估与下游质量标注
+# 整体冒烟测试与单模块复测
+
+## 整体冒烟测试
+
+冒烟测试用少量数据检查整条链路能否跑通。现有离线测试会自动构造临时cluster、taxonomy和风险词表，用模拟模型运行真实流水线入口及批跑脚本，不读取生产大数据、不发送真实模型请求、不需要填写真实模型配置；测试结束后清理临时产物。
+
+先激活moto，再进入包含screening文件夹的上一级目录。Windows PowerShell示例：
+
+```powershell
+conda activate moto
+cd D:\wwc\project_1
+python -B -m unittest discover -s screening/module_tests/tests -p "test_*.py" -v
+```
+
+Linux上先进入实际部署的同级目录，再执行相同的conda和python命令。若当前已经位于screening目录，先执行 `cd ..`。依赖见项目requirements.txt；批跑测试另需Bash，Windows可使用Git Bash。
+
+覆盖范围：
+
+| 环节 | 检查内容 |
+| --- | --- |
+| 候选索引 | 读取、重复与冲突、完整源频次、缓存复用、扫描及最终整理中断恢复 |
+| Stage1 | P0/P1/P2构建、准入、补采、Challenge及冻结 |
+| Stage2与交付 | 模拟四字段标注、规则映射、六文件对齐、报告、30个切片及空可视化目录 |
+| 续跑与复用 | 标注失败恢复、兼容Stage1来源复用、来源不变及篡改拒绝 |
+| 批跑 | 脚本检查、多数据连续运行、失败继续、后台启动和状态汇总 |
+
+截至2026-11-05，本轮完整验收45项通过。后续用例数量可能变化，以实际发现的测试为准。最后汇总为 `OK` 且没有跳过所需用例才表示这些检查全部通过；`FAILED`/`ERROR` 表示失败。`skipped` 表示未执行：没有Bash时会跳过批跑测试；服务器上若没有未入库的本地参考文件，也会跳过该参考文件的格式核对，这不影响临时数据的整链路测试。故意测试非法配置时会出现预期失败日志，不要仅凭日志中的“failed”判断整套测试结果。
+
+批跑使用前，还可按[批跑说明](../artifacts/docs/screening_batch_runner.md)配置实际路径后运行 `bash screening/run_screening_batch.sh check`；该命令只检查环境、配置和输入，不跑流水线、不调用模型。
+
+离线通过不代表真实模型连通、模型判断准确或大文件吞吐达标。这些需要在部署环境另外验证。不要直接用默认生产配置做小规模现场冒烟：它会扫描传入的整个源文件，且默认P1/P2目标为6000/1000。现场验证应使用独立小输入和输出目录、单独配置采样与补采预算；直接运行生产入口会请求真实模型。临时测试产物会自动清理，不作为手动浏览用的交付包。
+
+## 单模块复测
 
 Python 使用 `moto`，从包含 screening/ 的项目根目录运行。离线验收不调用真实模型：
 
@@ -11,7 +43,7 @@ python -B -m unittest discover -s screening/module_tests/tests -p "test_*.py" -v
 
 准入工具支持 labeled JSONL、reference JSONL，以及新的 stage1.frozen.jsonl / screened.canonical.jsonl。文本记录需 context_text、非空 target_query；reference 的 conversation_turns、sample_type 必须与会话一致。提供 text、turn_count、平铺 L1/L2 或嵌套 candidate_category 时校验其一致性。类别要同时提供非空 L1/L2，或同时为空。原始标签不进入准入模型。
 
-新交付文件同时有raw_text和stage1时，从raw_text恢复实际有序模型输入，并核对清洗后的目标轮与交付字段一致，保留生产模型看到的多模态标记；不会仅凭清洗后的target_query重建。内部候选同样按源原文恢复并核对。
+带raw_text的交付样本从raw_text恢复实际有序模型输入，并核对清洗后的目标轮与交付字段一致，保留生产模型看到的多模态标记；不会仅凭清洗后的target_query重建。内部候选同样按源原文恢复并核对。新版external可用于准入复测，但不含Stage1准入依据，不能直接用于下游质量标注独立复测。
 
 无类别不是输入错误：只调用文本特征模型，category_review 为 not_provided。默认生产策略会因 category_not_provided 而不准入，但保留 direct/clarification/excluded 文本类型。不得把零准入误读成全部语义无效。原始行序、重复记录和来源字段保留。
 

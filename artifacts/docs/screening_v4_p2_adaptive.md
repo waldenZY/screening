@@ -9,7 +9,7 @@
 
 P2 正式目标为 1,000 条同时通过 准入评估 和 Challenge Judge 的样本。八类 `primary_challenge` 的软下限依次为 50、50、50、50、50、20、5、1，任一类型最多 350。候选不足或覆盖预算耗尽时允许带缺口交付。
 
-P0/P1 与 P2 独立并发构建，各自完成 Stage1 成员冻结及 Stage2 标注、导出和分支校验后即可保留；整包需全部集合及报告完成，不等待其他分支。当前准入评估和下游质量标注契约以
+P0/P1 与 P2 独立并发构建，各自完成 Stage1 成员冻结及 Stage2 标注、导出和分支校验后即可保留，无需等待其他分支；整包需全部集合及报告通过复验才标记完成。当前准入评估和下游质量标注契约以
 [技术方案](screening_pipeline_technical_design_v4.md) 和实际 Prompt 为准；Stage2 只处理最终成员，不修改集合。
 
 ## 2. 数据流
@@ -161,13 +161,13 @@ long_tail_expr
 
 ## 7. 产物与恢复
 
-- Challenge 有独立 Prompt 哈希及 `quality/challenge_*` 任务、attempts、缓存命中和结果账本；三个质量阶段共用本 run 的 `quality/llm_result_cache.sqlite`，P2 批级检查点位于 `P2/checkpoints/`。各分支保存自身任务引用，新 run 不自动共享旧 run 的 LLM 缓存。
+- Challenge 有独立 Prompt 哈希及 `internal/quality/challenge_*` 任务、attempts、缓存命中和结果账本；各类模型任务共用本 run 的 `internal/quality/llm_result_cache.sqlite`，P2 批级检查点位于 `internal/P2/checkpoints/`。各分支保存自身任务引用，普通新 run 不自动共享旧 run 的 LLM 缓存；显式使用 `--stage1-from` 时可导入通过兼容校验的四字段标注，详见[配置手册](screening_pipeline_configuration_v4.md)。
 - `adaptive_challenge_batches_2` 同时进入总 run contract 和 P012 构建契约，旧配置和旧检查点不会按新配额语义续跑。
 - 中断恢复复用已完成结果，不重复标注调用；启动仍有一次 LLM 预检。总状态为 `failed` 时须显式指定兼容的原 `--run-id`，其他状态的自动选择规则见 [配置手册](screening_pipeline_configuration_v4.md)。
 - 总预算、尾部预算和连续无进展批次数进入检查点，续跑不会重置。
 - `screened_schema_version=12`：P2 保存三个 Challenge 字段和 `challenge.challenge_task_id`；P0/P1 的 `challenge` 为 `null`。质量契约为14，报告契约为15，downstream_labeled_v2中P0/P1标注30字段、P2标注31字段；其他版本见 [文档索引](README.md)。
 - P2 允许 `supplement_wave`；采样配额算法不因交付格式改变，Challenge 输入和缓存新增 准入评估 特征。
-- P2 汇总写入 `P2/adaptive_summary.json`，总报告写入 `p2_diagnostics`。
+- P2 汇总写入 `internal/P2/adaptive_summary.json`，总报告写入 `p2_diagnostics`。
 - 去重数值复验兼容 `1e-12` 以内的 0/1 边界误差，不放宽确认阈值、不改写旧审计或检查点；不升级规则或数据契约。
 
 ## 8. 报告指标

@@ -51,13 +51,15 @@ python -m screening.run_pipeline --stage1-from D:/data/old-run --output-root D:/
 
 ## 文档与验收
 
-[字段字典](artifacts/docs/screening_downstream_labeled_v2_field_dictionary.md) · [配置与恢复](artifacts/docs/screening_pipeline_configuration_v4.md) · [批跑](artifacts/docs/screening_batch_runner.md) · [单模块复测](module_tests/README.md)
+[字段字典](artifacts/docs/screening_downstream_labeled_v2_field_dictionary.md) · [配置与恢复](artifacts/docs/screening_pipeline_configuration_v4.md) · [批跑](artifacts/docs/screening_batch_runner.md) · [整体冒烟与单模块复测](module_tests/README.md)
 
 ```powershell
 python -B -m unittest discover -s screening/module_tests/tests -p "test_*.py" -v
 ```
 
 工程验收使用临时数据和模拟 LLM，不代表真实模型准确率，不自动跑全量业务数据。原始下游需求材料保持原文，实际字段判据以本项目字典为准。
+
+上述命令从包含 screening/ 的上一级目录运行，Windows PowerShell 和 Linux Bash 均可使用；先激活 moto。测试覆盖真实流水线入口、三个集合、Stage2交付、恢复和批跑，临时产物自动清理，不需要真实模型配置。最终以 unittest 的 OK/FAILED 汇总为准；若出现 skipped，表示相应用例未执行。完整步骤与现场验证边界见[测试说明](module_tests/README.md#整体冒烟测试)。
 
 ## 单盘服务器的索引构建
 
@@ -74,3 +76,5 @@ python -B -m unittest discover -s screening/module_tests/tests -p "test_*.py" -v
 - other_seconds：解析、哈希、特征计算等剩余时间。
 
 续跑的前缀校验、频次回填、三份查询索引建立、完整性检查、IDF准备及进度分别计时。实际提速仍需在部署服务器相同负载下观察，离线小样本不能证明生产吞吐。
+
+当前默认缓存仍为1024 MiB（约1 GiB）、每50000行保存进度、每100000行打印扫描进度。共享服务器若给本任务留有足够内存，可在下次启动命令末尾追加 `--index-cache-mb 4096`，尝试约4 GiB缓存；这是可选试用值，尚未改成默认值，也不保证提速。参数含义、批跑设置方法与日志判断见[配置说明](artifacts/docs/screening_pipeline_configuration_v4.md#单盘运行的参数选择)。
