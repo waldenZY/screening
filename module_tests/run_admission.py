@@ -63,7 +63,7 @@ def build_admission_input(record: Any) -> dict[str, Any]:
     for key in ("L1", "L2"):
         if key in record and record[key] != category[key]:
             raise ValueError("两种类别字段不一致")
-    if isinstance(record.get("raw_text"), str) and isinstance(record.get("stage1"), dict):
+    if isinstance(record.get("raw_text"), str):
         from screening.candidate.contract import parse_conversation
         original = parse_conversation(record["raw_text"])
         if (original["context_turns"] != (context.split(" | ") if context else [])

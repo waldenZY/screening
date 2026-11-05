@@ -17,7 +17,7 @@ from screening.quality.admission import (DEFAULT_POLICY, QualityResponseError, b
 from screening.quality.runner import QUALITY_CONTRACT_VERSION, QualityRunner, QualityRunConfig, QualityStageIncomplete
 from screening.module_tests import run_admission as standalone
 from screening.delivery.eligibility import delivery_labels, executable_reasons
-from screening.delivery.publish import collect_and_validate_artifacts, validate_manifest_artifacts, PublicationError
+from screening.delivery.validation import collect_and_validate_artifacts, validate_manifest_artifacts, ArtifactValidationError
 from screening.delivery.screened import validate_screened_canonical_record, ScreenedCanonicalError
 from screening.delivery.labeled import map_screened_to_labeled, validate_labeled_record, LabeledExportError
 from screening.delivery.report import validate_run_report, RunReportError
@@ -384,30 +384,29 @@ class ProductionRoundTripTests(unittest.TestCase):
             errors = io.StringIO()
             output = io.StringIO()
             with contextlib.redirect_stdout(output),contextlib.redirect_stderr(errors):
-                code=pipeline_main(["--config",str(config_path),"--publish-root",str(root/"live-delivery")],llm_config_override=CONFIG,llm_call_override=client)
+                code=pipeline_main(["--config",str(config_path)],llm_config_override=CONFIG,llm_call_override=client)
             self.assertEqual(code,0, output.getvalue() + errors.getvalue()[-1200:])
-            run=next((root/"outputs/runs").iterdir());manifest=json.loads((run/"manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["status"],"published")
-            self.assertEqual(manifest["contract"]["labeled_mapping_version"],10)
+            run=next((root/"outputs").glob("*/internal"));manifest=json.loads((run/"manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"],"completed")
+            self.assertEqual(manifest["contract"]["labeled_mapping_version"],11)
             self.assertNotIn("legacy_mapping_version",manifest["contract"])
-            self.assertEqual(len(list((root/"live-delivery").rglob("*_v4_labeled.jsonl"))),3)
+            self.assertEqual(len(list((run.parent/"external").rglob("*_v4_labeled.jsonl"))),3)
             validate_manifest_artifacts(run,manifest)
             originals={r["session"]:r for r in (json.loads(line) for line in source.read_text(encoding="utf-8").splitlines())}
             all_records=[]
             for name in ("P0","P1","P2"):
                 rows=[json.loads(x) for x in (run/name/"screened.canonical.jsonl").read_text(encoding="utf-8").splitlines()]
                 self.assertTrue(rows);all_records+=rows
-                exported=next((run/name).glob("*_v4_labeled.jsonl"))
+                exported=next((run.parent/"external/evaluation-set-large").glob(name+"*/*_v4_labeled.jsonl"))
                 delivered=[json.loads(x) for x in exported.read_text(encoding="utf-8").splitlines()]
-                self.assertTrue(all(len(r)==29 and "stage1" in r and r["intent_label"]=={"dialogue":"qa","task":"task"}[r["stage1"]["admission"]["features"]["intent_label"]] for r in delivered))
+                self.assertTrue(all(len(r)==(31 if name=="P2" else 30) and "stage1" not in r for r in delivered))
                 for item,internal in zip(delivered,rows):
                     original=originals[item["session_id"]]
                     self.assertEqual(item["frequency"],original["frequency"])
                     self.assertEqual(item["cluster_prob"],original["cluster_prob"])
                     self.assertEqual(item["cluster_id"],original["cluster"])
-                    self.assertEqual(item["stage1"]["admission"],internal["quality"]["admission"])
-                    self.assertEqual(item["stage1"]["selection"],internal["selection"])
-                    self.assertEqual(item["provenance"]["run_id"],manifest["run_id"])
+                    self.assertEqual(item["intent_label"], internal["quality"]["intent_label"])
+                    self.assertNotIn("provenance",item)
                     self.assertEqual(item["raw_text"],original["text"])
             self.assertTrue(any(r["quality"]["admission"]["screening"]["route"]=="clarification" for r in all_records))
             self.assertTrue(any(r["quality"]["admission"]["features"]["intent_label"]=="dialogue" and r["quality"]["admission"]["features"]["open_points"] and r["delivery_labels"]["executable"]==1 for r in all_records))
@@ -415,33 +414,33 @@ class ProductionRoundTripTests(unittest.TestCase):
             wrong["quality"]["intent_label"]=wrong_intent;wrong["delivery_labels"]["intent_label"]=wrong_intent
             with self.assertRaises(ScreenedCanonicalError): validate_screened_canonical_record(wrong)
             wrong_export=map_screened_to_labeled(all_records[0]);wrong_export["intent_label"]=wrong_intent
-            with self.assertRaises(LabeledExportError): validate_labeled_record(all_records[0]["set"],wrong_export)
-            wrong_report=json.loads((run/"screening_run_report.json").read_text(encoding="utf-8"))
+            with self.assertRaises(LabeledExportError): validate_labeled_record(all_records[0]["set"],wrong_export,canonical_record=all_records[0])
+            wrong_report=json.loads((run/"reports/screening_run_report.json").read_text(encoding="utf-8"))
             wrong_report["sets"]["P0"]["admission_groups"]["task_direct"]+=1
             with self.assertRaises(RunReportError): validate_run_report(wrong_report)
             self.assertTrue(all(set(r["quality"])=={"admission","intent_label"} and "stage2_task_id" not in r["selection"] for r in all_records))
             schemas={tuple(row) for name in ("P0","P1","P2") for row in [map_screened_to_labeled(r) for r in all_records if r["set"]==name]}
             self.assertEqual(len(schemas),2)  # Only the P2 relevance field differs.
-            self.assertNotIn("quality_task_difficulty",next(iter(schemas)))
+            self.assertIn("quality_task_difficulty",next(iter(schemas)))
             self.assertTrue(any(p.startswith("# 下游质量补充标注") for p in calls))
             self.assertTrue((run/"quality/quality_annotation_tasks.jsonl").exists())
-            self.assertTrue((run/"prompts/quality_annotation.md").exists())
+            self.assertTrue((run/"snapshots/prompts/quality_annotation.md").exists())
             self.assertTrue(all((run/name/"stage1.frozen.jsonl").exists() for name in ("P0","P1","P2")))
             self.assertTrue(any(r["downstream_quality"]["quality_overall_score"]==2 and r["delivery_labels"]["executable"]==1 for r in all_records))
-            sidecar=run/"P0/stage2/quality_annotations.jsonl";before=sidecar.read_bytes()
+            sidecar=run/"P0/screened.canonical.jsonl";before=sidecar.read_bytes()
             bad=[json.loads(line) for line in before.decode("utf-8").splitlines()]
-            bad[0]["result"]={"quality_validity":"borderline","quality_intent_clarity":"vague","quality_overall_score":3,"quality_issue_types":["ambiguous_intent"]}
+            bad[0]["downstream_quality"]={"quality_validity":"borderline","quality_intent_clarity":"vague","quality_overall_score":3,"quality_issue_types":["ambiguous_intent"]}
             sidecar.write_text("".join(json.dumps(r,ensure_ascii=False)+"\n" for r in bad),encoding="utf-8")
-            with self.assertRaises((PublicationError,QualityResponseError)): collect_and_validate_artifacts(run)
+            with self.assertRaises((ArtifactValidationError,QualityResponseError)): collect_and_validate_artifacts(run)
             sidecar.write_bytes(before)
             count=len(calls)
             with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
-                code=pipeline_main(["--config",str(config_path),"--publish-root",str(root/"delivery")],llm_config_override=CONFIG,llm_call_override=client)
+                code=pipeline_main(["--config",str(config_path)],llm_config_override=CONFIG,llm_call_override=client)
             self.assertEqual(code,0);self.assertEqual(len(calls),count+1) # connectivity preflight only
-            self.assertEqual(len(list((root/"delivery").rglob("*_v4_labeled.jsonl"))),3)
+            self.assertEqual(len(list((run.parent/"external").rglob("*_v4_labeled.jsonl"))),3)
             feature_rows=run/"quality/admission_features_results.jsonl";original=feature_rows.read_text(encoding="utf-8")
             modified=[json.loads(x) for x in original.splitlines()];modified[0]["result"]["intent_label"]="undetermined";feature_rows.write_text("".join(json.dumps(r,ensure_ascii=False)+"\n" for r in modified),encoding="utf-8")
-            with self.assertRaises((PublicationError,QualityResponseError)): collect_and_validate_artifacts(run)
+            with self.assertRaises((ArtifactValidationError,QualityResponseError)): collect_and_validate_artifacts(run)
             feature_rows.write_text(original,encoding="utf-8")
             old=json.loads(config_path.read_text(encoding="utf-8"));old["config_version"]=9;config_path.write_text(json.dumps(old),encoding="utf-8")
             with contextlib.redirect_stderr(io.StringIO()): self.assertEqual(pipeline_main(["--config",str(config_path)],llm_config_override=CONFIG,llm_call_override=client),1)

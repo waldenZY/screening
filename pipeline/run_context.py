@@ -27,11 +27,11 @@ from ..quality.runner import QUALITY_CONTRACT_VERSION
 from .checkpoints import CHECKPOINT_SCHEMA_VERSION
 
 
-PIPELINE_VERSION = 9
-MANIFEST_SCHEMA_VERSION = 9
+PIPELINE_VERSION = 10
+MANIFEST_SCHEMA_VERSION = 10
 _LOCK = threading.RLock()
-_RESUMABLE = {"created", "running", "incomplete", "partial_failed", "publish_failed"}
-_REUSABLE = {"completed", "published"}
+_RESUMABLE = {"created", "running", "incomplete", "partial_failed"}
+_REUSABLE = {"completed"}
 
 
 @dataclass(frozen=True)
@@ -105,10 +105,11 @@ def build_run_contract(
 
 
 def _load_manifest(path: Path) -> JsonObject:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError("v4 manifest 必须是 JSON 对象")
-    return value
+    with _LOCK:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("v4 manifest 必须是 JSON 对象")
+        return value
 
 
 def _new_run_id(config_id: str) -> str:
@@ -125,7 +126,7 @@ def _validate_frozen_run(run_root: Path, manifest: Mapping[str, Any], contract: 
         raise ValueError("run 与当前输入、配置、Prompt 或模型不兼容")
     for key in contract["prompts"]:
         stage = key.removesuffix("_sha256")
-        path = run_root / "prompts" / f"{stage}.md"
+        path = run_root / "snapshots" / "prompts" / f"{stage}.md"
         expected = contract["prompts"][f"{stage}_sha256"]
         if not path.is_file() or sha256_file(path) != expected:
             raise ValueError(f"冻结的 {stage} Prompt 缺失或已变化")
@@ -174,7 +175,7 @@ def prepare_run_context(
         idf_snapshot=idf_snapshot,
     )
     config_id = stable_hash(contract)
-    runs_root = output_root / "runs"
+    runs_root = output_root
     runs_root.mkdir(parents=True, exist_ok=True)
     selected: tuple[Path, JsonObject] | None = None
     disposition = "created"
@@ -182,7 +183,7 @@ def prepare_run_context(
     if run_id:
         if not re.fullmatch(r"[0-9A-Za-z._-]+", run_id):
             raise ValueError("run ID 非法")
-        path = runs_root / run_id / "manifest.json"
+        path = runs_root / run_id / "internal" / "manifest.json"
         if not path.is_file():
             raise FileNotFoundError(f"找不到 v4 run: {run_id}")
         manifest = _load_manifest(path)
@@ -191,7 +192,7 @@ def prepare_run_context(
         disposition = "reused" if manifest.get("status") in _REUSABLE else "resumed"
     elif not new_run:
         candidates: list[tuple[Path, JsonObject]] = []
-        for path in runs_root.glob("*/manifest.json"):
+        for path in runs_root.glob("*/internal/manifest.json"):
             try:
                 manifest = _load_manifest(path)
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
@@ -212,17 +213,17 @@ def prepare_run_context(
 
     if selected is None:
         active_run_id = _new_run_id(config_id)
-        run_root = runs_root / active_run_id
+        run_root = runs_root / active_run_id / "internal"
         run_root.mkdir(parents=True, exist_ok=False)
-        prompt_root = run_root / "prompts"
-        prompt_root.mkdir()
+        prompt_root = run_root / "snapshots" / "prompts"
+        prompt_root.mkdir(parents=True)
         (prompt_root / "category.md").write_text(category_prompt, encoding="utf-8", newline="\n")
         (prompt_root / "admission.md").write_text(admission_prompt, encoding="utf-8", newline="\n")
         (prompt_root / "challenge.md").write_text(challenge_prompt, encoding="utf-8", newline="\n")
         for name, prompt in additional_prompts.items():
             (prompt_root / f"{name}.md").write_text(prompt, encoding="utf-8", newline="\n")
-        write_json(run_root / "risk_keywords.json", dict(risk_snapshot))
-        write_json(run_root / "dedup_idf.json", dict(idf_snapshot))
+        write_json(run_root / "snapshots" / "risk_keywords.json", dict(risk_snapshot))
+        write_json(run_root / "snapshots" / "dedup_idf.json", dict(idf_snapshot))
         now = utc_now()
         manifest: JsonObject = {
             "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
@@ -266,11 +267,9 @@ def prepare_run_context(
                 "screened_export": {"status": "pending"},
                 "labeled_export": {"status": "pending"},
                 "batch_report": {"status": "pending"},
-                "publish": {"status": "pending"},
             },
             "branches": {name: {"status": "pending"} for name in ("P0", "P1", "P2")},
             "artifacts": {},
-            "publication": {},
             "timing": {
                 "first_started_at": None,
                 "last_started_at": None,
@@ -283,12 +282,13 @@ def prepare_run_context(
             },
         }
         write_json(run_root / "manifest.json", manifest)
+        write_json(run_root / "snapshots" / "config.json", {"contract": contract})
         selected = (run_root, manifest)
 
     selected_root, manifest = selected
     _validate_frozen_run(selected_root, manifest, contract)
-    frozen_risk = json.loads((selected_root / "risk_keywords.json").read_text(encoding="utf-8"))
-    frozen_idf = json.loads((selected_root / "dedup_idf.json").read_text(encoding="utf-8"))
+    frozen_risk = json.loads((selected_root / "snapshots" / "risk_keywords.json").read_text(encoding="utf-8"))
+    frozen_idf = json.loads((selected_root / "snapshots" / "dedup_idf.json").read_text(encoding="utf-8"))
     validate_idf_snapshot(frozen_idf, index)
     if frozen_idf != dict(idf_snapshot):
         raise ValueError("Frozen dedup IDF differs from current source")
@@ -314,7 +314,8 @@ def update_manifest(
     stages: Mapping[str, Mapping[str, Any]] | None = None,
     branches: Mapping[str, Mapping[str, Any]] | None = None,
     artifacts: Mapping[str, Any] | None = None,
-    publication: Mapping[str, Any] | None = None,
+    frozen: Mapping[str, Any] | None = None,
+    exports: Mapping[str, Any] | None = None,
     effective_config: Mapping[str, Any] | None = None,
     preflight: Mapping[str, Any] | None = None,
 ) -> JsonObject:
@@ -323,16 +324,24 @@ def update_manifest(
         manifest = _load_manifest(path)
         if status is not None:
             manifest["status"] = status
+            if status != "completed":
+                manifest.setdefault("delivery", {})["status"] = "failed" if status == "failed" else "incomplete"
         for name, details in (stages or {}).items():
             manifest.setdefault("stages", {}).setdefault(name, {}).update(dict(details))
         for name, details in (branches or {}).items():
             manifest.setdefault("branches", {}).setdefault(name, {}).update(dict(details))
+        if frozen is not None:
+            manifest.setdefault("frozen", {}).update(dict(frozen))
+        if exports is not None:
+            manifest.setdefault("exports", {}).update(dict(exports))
         if artifacts is not None:
             manifest["artifacts"] = dict(artifacts)
-        if publication is not None:
-            manifest["publication"] = dict(publication)
         if effective_config is not None:
-            manifest["effective_config"] = dict(effective_config)
+            snapshot = json.loads((run_root / "snapshots/config.json").read_text(encoding="utf-8"))
+            manifest["last_invocation"] = dict(effective_config)
+            if "effective_config" not in snapshot:
+                snapshot["effective_config"] = dict(effective_config)
+                write_json(run_root / "snapshots/config.json", snapshot)
         if preflight is not None:
             manifest["preflight"] = dict(preflight)
         manifest["updated_at"] = utc_now()

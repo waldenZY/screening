@@ -260,6 +260,7 @@ class QualityRunner:
         config: QualityRunConfig | None = None,
         logger: logging.Logger | None = None,
         additional_stages: Mapping[str, AdditionalQualityStage] | None = None,
+        snapshot_root: Path | None = None,
     ) -> None:
         if admission_prompt.count("{CANDIDATE_JSON}") != 1:
             raise ValueError("准入文本特征 Prompt 必须恰好包含一个 {CANDIDATE_JSON}")
@@ -308,8 +309,10 @@ class QualityRunner:
         self._key_locks_guard = threading.Lock()
         self._key_locks: dict[str, threading.Lock] = {}
         self._request_gate = _FairRequestGate(self.config.workers)
+        self.snapshot_root = snapshot_root
         for stage, prompt in self.prompts.items():
-            snapshot = self.run_root / f"{stage}_prompt.md"
+            name = {"admission_features": "admission", "admission_category": "category"}.get(stage, stage)
+            snapshot = snapshot_root / f"{name}.md" if snapshot_root else self.run_root / f"{stage}_prompt.md"
             if snapshot.is_file() and snapshot.read_text(encoding="utf-8") != prompt:
                 raise ValueError(f"{stage} Prompt 与本次运行已冻结快照不一致")
             if not snapshot.is_file():
@@ -323,7 +326,7 @@ class QualityRunner:
             "screening_policy": self.screening_policy,
             "additional_stages": sorted(self.additional_stages),
         }
-        contract_path = self.run_root / "quality_run_contract.json"
+        contract_path = snapshot_root.parent / "quality_contract.json" if snapshot_root else self.run_root / "quality_run_contract.json"
         if contract_path.is_file():
             existing = json.loads(contract_path.read_text(encoding="utf-8"))
             if existing != run_contract:

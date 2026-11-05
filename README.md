@@ -1,68 +1,60 @@
-# Screening v4
+# Screening：采样与下游交付
 
-从 cluster JSONL、taxonomy 和风险词表构建 P0/P1/P2。链路统一为 **预处理 → Stage1：采样集构建 → Stage2：下游交付适配**。正式交付为 **27 个扁平业务字段 + stage1、provenance 两个对象**，数据契约为 downstream_labeled_v1，文件名按下游要求固定为 v4。详见[字段字典](artifacts/docs/screening_downstream_labeled_v1_field_dictionary.md)。
+链路为预处理 → Stage1 采样集构建 → Stage2 下游交付适配。Stage1 的采样、去重、准入、P1 补采和 P2 自适应 Challenge 选择规则保持不变；Stage2 保留已有四字段 LLM 标注，再通过规则补齐三个字段，不增加判断请求。
 
-## 三个阶段
+## 启动
 
-1. **预处理**：输入校验、会话解析、taxonomy 关联、风险词表冻结、候选索引和公共特征计算。公共特征为概率桶、簇内频次桶、归一化频次、长度、规则复杂度和 formality。
-2. **Stage1：采样集构建**：计算集合 relevance；P0/P1/P2 独立并发采样、集合内去重、准入评估；P1 按配额补采，P2 做 Challenge 判定及预算内补采。成员和全部判断先冻结，再进入 Stage2。
-3. **Stage2：下游交付适配**：对最终成员执行必跑的下游质量标注，计算与映射交付字段，复验并按需发布。低分照常交付，不改变成员、intent_label 或 executable。
+Python 使用 **moto**，从包含 screening/ 的项目根目录执行：
 
-原 Stage1 已改称“准入评估”，包括独立文本特征识别、类别核验，以及程序策略准入判断。原可选 Stage2 难度/语义障碍模块已经退出当前链路，见[归档](artifacts/archive/v4_pre_downstream/ARCHIVE.md)。当前不存在可选标注开关。
-
-准入评估只观察 intent_label、intent_reason、open_points、dependencies，并独立核验类别。程序按冻结策略决定 direct/clarification/excluded；生产要求 exact，direct 与 clarification 均可准入。dialogue→qa、task→task。executable=1 要求准入、direct、单轮、目标轮超过2字符且未命中冻结风险词；为0仍交付。
-
-## 配置和启动
-
-Python 操作使用 **moto** 环境，从包含 screening/ 的项目根目录执行：
-
-~~~powershell
+```powershell
 conda activate moto
-Copy-Item screening/artifacts/config/llm_config.example.json screening/artifacts/config/llm_config.local.json
-python -m screening.run_pipeline
-~~~
+python -m screening.run_pipeline --source D:/data/cluster.jsonl --taxonomy D:/data/taxonomy.json --risk-keywords D:/data/risk.xlsx --output-root D:/data/screening
+```
 
-填写[默认配置](artifacts/config/pipeline.default.json)中的 inputs.source、inputs.taxonomy、inputs.risk_keywords。配置版本为11，四份 Prompt 为 admission、category、challenge、quality_annotation；默认 publication.enabled=false。P1 默认目标6000、P2目标1000，LLM全局并发10、最大尝试轮数20，请求前等待1秒。采样规则和预算沿用当前设置。
+填写 `artifacts/config/llm_config.local.json`（参考 example），或使用项目现有模型配置。配置版本12，不再有 publication；`--publish-root`、`--no-publish`、`--replace` 已删除。交付总是生成在本次运行中，无需发布参数。
 
-~~~powershell
-python -m screening.run_pipeline --source D:/data/cluster.jsonl --taxonomy D:/data/taxonomy.json --risk-keywords D:/data/risk_keywords.xlsx --output-root D:/data/screening-runs --publish-root D:/data/261020-1026-7days/evaluation-set-large
-~~~
+## 输出
 
-可用 --admission-prompt、--category-prompt、--challenge-prompt、--quality-annotation-prompt 覆盖 Prompt。旧 --stage1-prompt、--stage2-prompt、--enable-stage2、--disable-stage2 已移除。只提供完整链路入口，不提供独立阶段运行命令。
+```text
+<output-root>/
+├── _canonical_cache/
+└── <run-id>/
+    ├── internal/
+    │   ├── manifest.json
+    │   ├── snapshots/           有效配置、契约、风险词、去重依据、唯一 Prompt 快照
+    │   ├── quality/             请求账本、结果、尝试和缓存
+    │   ├── reports/             完整报告、导出校验、字段使用说明
+    │   └── P0/、P1/、P2/        冻结成员、内部成品、审计、追溯和断点
+    └── external/evaluation-set-large/
+        ├── P0-冒烟集/           基础版与 labeled
+        ├── P1-基准集/           基础版与 labeled
+        ├── P2-对抗集/           基础版与 labeled
+        ├── sampling_report_v4.json
+        ├── 质量标注/reports/    八字段分布报告
+        ├── 质量标注/subsets/    每集合十个切片，零条仍建空文件
+        └── 可视化/             空目录
+```
 
-风险工作簿要求 Sheet1 第一行依次为“关键词”“风险级别”，后续两列均为非空文本；额外非空列和非法类型会启动失败。对最后一轮匹配核心词与原词，命中任一风险级别即置 executable=0，不剔除成员。风险词表和匹配规则随 run 冻结。
+操作者直接取走整个 evaluation-set-large。只有 internal/manifest.json 的 status 和 delivery.status 均为 completed 才表示整包完成；部分分支失败仍保留其他分支和断点。低分与 executable=0 不删行。
 
-## 产物、续跑和发布
+基础版 P0/P1 各22字段，P2为23字段；labeled逐行追加八个质量字段，分别30/30/31字段。P2同时提供 relevance_p0/relevance_p2。外部不透传 stage1/provenance 对象，来源留在 internal。
 
-每个分支保存：
+## 续跑与复用
 
-- stage1.frozen.jsonl、stage1_freeze_report.json 和 stage1_frozen 检查点：补标前的冻结成员与依据。
-- stage2/quality_annotations.jsonl、stage2/quality_report.json：四字段标注、评分分布及复核信号。
-- screened.canonical.jsonl：包含冻结 Stage1 与标注结果的内部交付记录。
-- *_v4_labeled.jsonl、export_provenance.jsonl、labeled_export_report.json：正式交付与逐条来源复验。
+兼容配置重跑自动恢复未完成运行或复用完成运行。`--run-id ID` 显式续跑，`--new-run` 新建。四字段补标失败后直接使用冻结 Stage1，不重复采样或准入。成功0、分支失败2、启动或整包校验失败1。
 
-run 根目录保存 manifest、冻结风险词表/去重统计、Prompt 快照、quality/ 请求和缓存账本、汇总报告。公共索引位于输出根目录的 _canonical_cache；不再保存 relevance 列。保留 run 及引用索引以便恢复与复验。
+```powershell
+python -m screening.run_pipeline --stage1-from D:/data/old-run --output-root D:/data/screening
+```
 
-同输入和兼容配置重跑可恢复或复用；--run-id 显式选择原 run，--new-run 新建。已冻结分支补标失败后续跑直接恢复 Stage1，不重新采样、准入或 Challenge；同 run 的成功标注可从缓存复用。Prompt、模型、规则或契约变化需要新 run，不支持跨 run 复用 Stage1。旧配置及旧 run 不迁移。
+`--stage1-from` 与 --run-id/--new-run 互斥，新建 run，仅运行 Stage2；支持改造前 v4 和新版完整冻结结果，不支持 v3。来源保持不变。需要源 JSONL、taxonomy、索引及必要依据仍可校验；风险词采用冻结快照，不要求原 Excel 仍存在。来源 Stage1 的配置和 Prompt 保持原值，Stage2 Prompt/模型可变。四字段成功结果仅在实际输入、Prompt、模型参数及质量契约完全一致时复用。
 
-发布路径：
+## 文档与验收
 
-~~~text
-P0-冒烟集/P0_smoke_set_v4_labeled.jsonl
-P1-基准集/P1_benchmark_set_v4_labeled.jsonl
-P2-对抗集/P2_adversarial_set_v4_labeled.jsonl
-~~~
+[字段字典](artifacts/docs/screening_downstream_labeled_v2_field_dictionary.md) · [配置与恢复](artifacts/docs/screening_pipeline_configuration_v4.md) · [批跑](artifacts/docs/screening_batch_runner.md) · [单模块复测](module_tests/README.md)
 
-publish_root 应指向下游对应周目录的 evaluation-set-large；不自动推断日期。不再额外导出14字段v8。各分支完成 Stage2 复验后可独立事务发布；其他分支失败不回滚成功发布。同哈希复用，不同内容默认拒绝，--replace 才替换；--no-publish 可临时关闭发布。成功退出0，分支失败2，启动或全量复验失败1。
-
-每次启动先校验四份 Prompt、目录写入及原子操作，并发送一次固定短文本连通性请求；不使用源 Query，失败不重试。这次请求在续跑和完成复用时仍发生，不计入标注账本。日志不打印密钥、服务地址、响应正文或原始 Query。
-
-## 标准与验证
-
-[当前文档](artifacts/docs/README.md) · [质量标准](artifacts/docs/screening_quality_judgment_standards.md) · [配置说明](artifacts/docs/screening_pipeline_configuration_v4.md) · [单模块复测](module_tests/README.md) · [多数据批跑](artifacts/docs/screening_batch_runner.md)
-
-~~~powershell
+```powershell
 python -B -m unittest discover -s screening/module_tests/tests -p "test_*.py" -v
-~~~
+```
 
-工程测试使用临时数据与模拟 LLM，覆盖阶段冻结、补标失败续跑、字段枚举、缓存隔离、独立发布和篡改检出；不代表真实模型准确率。真实模型边界复测单独执行，不自动运行全量数据或正式发布。下游需求原始记录由业务手动维护，本次未修改。
+工程验收使用临时数据和模拟 LLM，不代表真实模型准确率，不自动跑全量业务数据。原始下游需求材料保持原文，实际字段判据以本项目字典为准。

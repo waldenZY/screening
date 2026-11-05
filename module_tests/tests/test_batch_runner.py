@@ -78,12 +78,12 @@ class BatchRunnerTests(unittest.TestCase):
         with (run/"summary.tsv").open(encoding="utf-8",newline="") as handle:
             return run,list(csv.DictReader(handle,delimiter="\t"))
 
-    def test_syntax_and_read_only_check_uses_v11_four_prompts(self):
+    def test_syntax_and_read_only_check_uses_v12_four_prompts(self):
         syntax=subprocess.run([find_bash(),"-n",str(PACKAGE/"run_screening_batch.sh")],capture_output=True,text=True)
         self.assertEqual(syntax.returncode,0,syntax.stderr)
         result=self.run_bash("check")
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-        self.assertIn("Pipeline config v11",result.stdout)
+        self.assertIn("Pipeline config v12",result.stdout)
         self.assertIn("No pipeline or LLM request",result.stdout)
         self.assertFalse((self.package/".screening_batch").exists())
         self.assertFalse((self.package/"batch outputs").exists())
@@ -98,15 +98,16 @@ class BatchRunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         run,rows=self.summary()
         self.assertEqual([row["status"] for row in rows],["SUCCESS","SUCCESS"])
+        self.assertTrue(all(row["run_path"] and row["external_path"] and row["completion_status"]=="completed" for row in rows))
         self.assertEqual((run/"status").read_text().strip(),"SUCCESS")
         for tag in self.tags:
-            files=list((self.package/"batch_publications"/tag/"evaluation-set-large").rglob("*_v4_labeled.jsonl"))
+            files=list((self.package/"batch outputs"/tag).glob("*/external/evaluation-set-large/*/*_v4_labeled.jsonl"))
             self.assertEqual(len(files),3)
             for file in files:
                 records=[json.loads(line) for line in file.read_text(encoding="utf-8").splitlines()]
                 self.assertTrue(records)
-                self.assertTrue(all(len(row)==29 and "admission" in row["stage1"] for row in records))
-            self.assertTrue((self.package/"batch outputs"/tag/"runs").is_dir())
+                self.assertTrue(all(len(row) in (30,31) and "stage1" not in row for row in records))
+            self.assertEqual(len(list((self.package/"batch outputs"/tag).glob("*/internal/manifest.json"))),1)
         status=self.run_bash("status")
         self.assertEqual(status.returncode,0);self.assertIn("success=2 failed=0",status.stdout)
         self.assertFalse((self.package/".screening_batch/current.pid").exists())
@@ -118,7 +119,7 @@ class BatchRunnerTests(unittest.TestCase):
         run,rows=self.summary()
         self.assertEqual([row["status"] for row in rows],["FAILED_PIPELINE","SUCCESS"])
         self.assertEqual((run/"status").read_text().strip(),"PARTIAL_FAILED")
-        self.assertEqual(len(list((self.package/"batch_publications"/self.tags[1]/"evaluation-set-large").rglob("*_v4_labeled.jsonl"))),3)
+        self.assertEqual(len(list((self.package/"batch outputs"/self.tags[1]).glob("*/external/evaluation-set-large/*/*_v4_labeled.jsonl"))),3)
 
     def test_background_start_without_executable_bit_and_status(self):
         self.script.chmod(0o644)

@@ -55,3 +55,9 @@
 quality_category_fit直接来自准入类别核验，不由补标覆盖。dialogue→qa、task→task；executable按现有单轮direct等规则计算。评分低及跨阶段分歧照常交付，不修改成员、标签或executable。报告记录评分、问题分布和复核信号，不声称人工真值准确率。
 
 缺字段、非法枚举、字段矛盾或请求失败按工程失败重试；不以null、默认5分或none掩盖。失败分支不发布，同run可恢复冻结成员与成功缓存。评分标准升级时冻结新版本及Prompt，旧分数不解释为同一口径。
+
+## 程序派生的交付维度（不增加模型判断）
+
+类别复用Stage1；direct映射self_contained，clarification映射context_dependent（不输出fragments）。概率档high/mid/boundary映射分类难度trivial/moderate/hard，是聚类置信度代理；complexity映射任务难度simple/moderate/complex，是规则估计。
+
+这三项不参与四字段评分校验，不添加旧04字段联动。语义完整性的context_dependent表示需澄清，与问题类型的同名值并非同一判据。现有四字段LLM Prompt、枚举及评分标准保持不变。

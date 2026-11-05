@@ -7,6 +7,7 @@ import inspect
 import logging
 import math
 import time
+import os
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -1071,17 +1072,29 @@ def _branch_contract(
     }
 
 
+def _read_run_manifest(path: Path) -> JsonObject:
+    from .run_context import _load_manifest
+    return _load_manifest(path)
+
+
 def _set_branch_status(run_root: Path, set_name: str, status: str, **details: Any) -> None:
     manifest_path = run_root / "manifest.json"
     if not manifest_path.is_file():
         return
-    from .run_context import update_manifest
+    from .run_context import update_manifest, utc_now
 
     payload = {"status": status, **details}
     step = str(details.get("stage", ""))
     if step != "failed":
-        payload["phase"] = "stage2" if step.startswith("stage2") or step in {"export", "completed", "published"} else "stage1"
+        payload["phase"] = "stage2" if step.startswith("stage2") or step in {"export", "completed"} else "stage1"
     payload.setdefault("error", None)
+    current = _read_run_manifest(manifest_path)
+    previous = current.get("branches", {}).get(set_name, {})
+    if step in {"sampling", "adaptive"} and set_name not in current.get("frozen", {}) and "stage1_started_at" not in previous:
+        payload["stage1_started_at"] = utc_now()
+    if step.startswith("stage2") and "stage1_started_at" in previous and "stage1_elapsed_seconds" not in previous:
+        from datetime import datetime
+        payload["stage1_elapsed_seconds"] = max(0.0, (datetime.fromisoformat(utc_now()) - datetime.fromisoformat(previous["stage1_started_at"])).total_seconds())
     stages = {"stage2": {"status": "running"}} if step.startswith("stage2") else {}
     update_manifest(run_root, branches={set_name: payload}, stages=stages)
 
@@ -1106,11 +1119,11 @@ def _restore_completed_branch(
             raise ValueError(f"{set_name} 完成检查点产物缺失或已变化: {relative_path}")
     manifest_path = run_root / "manifest.json"
     manifest = (
-        json.loads(manifest_path.read_text(encoding="utf-8"))
+        _read_run_manifest(manifest_path)
         if manifest_path.is_file() else {}
     )
     prior = manifest.get("branches", {}).get(set_name, {})
-    status = "published" if prior.get("status") == "published" else "completed"
+    status = "completed"
     _set_branch_status(
         run_root, set_name, status, restored=True, records=len(records),
         stage=status, artifacts=dict(artifacts),
@@ -1167,7 +1180,7 @@ def _finalize_branch(
     )
     write_jsonl(branch_root / "dedup_audit.jsonl", dedup_audit)
 
-    risk_snapshot = json.loads((run_root / "risk_keywords.json").read_text(encoding="utf-8"))
+    risk_snapshot = json.loads((run_root / "snapshots/risk_keywords.json").read_text(encoding="utf-8"))
     records = tuple(
         build_screened_canonical_record(
             set_name,
@@ -1191,11 +1204,16 @@ def _finalize_branch(
             admission_task_id=_quality_task_id(quality_runner, "admission", candidate),
             admission_feature_task_id=_quality_task_id(quality_runner, "admission_features", candidate),
             admission_category_task_id=_quality_task_id(quality_runner, "admission_category", candidate),
-            run_id=run_root.name,
+            run_id=run_root.parent.name,
             candidate_sources=p2_metadata.get(candidate["source_identity_sha256"], {}),
         )
         for candidate in selected
     )
+    freeze_path = branch_root / "stage1.frozen.jsonl"
+    if freeze_path.exists():
+        records = tuple(load_jsonl(freeze_path))
+        if [r["candidate"] for r in records] != list(selected):
+            raise ValueError("冻结成员与恢复候选不一致")
     tasks = {
         str(task["task_id"]): task
         for task in load_jsonl(branch_root / "candidate_tasks.jsonl")
@@ -1204,18 +1222,16 @@ def _finalize_branch(
         set_name, records, expected_candidate_tasks=tasks, expected_final_count=len(selected)
     )
     freeze_path = branch_root / "stage1.frozen.jsonl"
-    freeze_report_path = branch_root / "stage1_freeze_report.json"
-    if freeze_path.exists():
-        if load_jsonl(freeze_path) != list(records):
-            raise ValueError("Stage1 冻结结果与续跑成员不一致")
-        if freeze_report_path.exists() and json.loads(freeze_report_path.read_text(encoding="utf-8")) != {
-            "stage": "stage1", "records": len(records), "sha256": sha256_file(freeze_path)
-        }:
-            raise ValueError("Stage1 冻结报告与成员哈希不一致")
-    else:
+    from .run_context import update_manifest
+    frozen_meta = {"stage": "stage1", "records": len(records), "sha256": None}
+    if not freeze_path.exists():
         write_jsonl(freeze_path, records)
-    if not freeze_report_path.exists():
-        write_json(freeze_report_path, {"stage": "stage1", "records": len(records), "sha256": sha256_file(freeze_path)})
+    frozen_meta["sha256"] = sha256_file(freeze_path)
+    manifest = _read_run_manifest(run_root / "manifest.json")
+    previous = manifest.get("frozen", {}).get(set_name)
+    if previous is not None and previous != frozen_meta:
+        raise ValueError("Stage1 冻结结果与 manifest 不一致")
+    update_manifest(run_root, frozen={set_name: frozen_meta})
     checkpoints.save("stage1_frozen", {
         "records": list(records), "sha256": sha256_file(freeze_path),
         "finalize_inputs": {
@@ -1240,7 +1256,6 @@ def _finalize_branch(
     final_audit = {
         **audit, "final": len(records),
     }
-    write_json(branch_root / "branch_audit.json", final_audit)
     write_json(
         branch_root / "branch_report.json",
         {
@@ -1253,19 +1268,13 @@ def _finalize_branch(
             "export": export_report,
         },
     )
-    artifact_paths = (
-        "screened.canonical.jsonl",
-        export_report["files"]["labeled"],
-        "export_provenance.jsonl",
-        "labeled_export_report.json",
-        "branch_audit.json",
-        "branch_report.json",
-        "stage1.frozen.jsonl", "stage1_freeze_report.json", *annotation_artifacts,
-    )
-    artifacts = {
-        name: sha256_file(branch_root / name)
-        for name in artifact_paths
-    }
+    from ..pipeline.layout import external_root
+    from ..delivery.labeled import LABELED_FILENAMES, base_filename
+    artifact_paths = [branch_root / name for name in (
+        "screened.canonical.jsonl", "export_provenance.jsonl", "branch_report.json", "stage1.frozen.jsonl",
+    )]
+    artifact_paths += [external_root(run_root) / path for path in (LABELED_FILENAMES[set_name], base_filename(set_name))]
+    artifacts = {os.path.relpath(path, branch_root): sha256_file(path) for path in artifact_paths}
     payload: JsonObject = {
         "set": set_name,
         "records": list(records),
@@ -1785,7 +1794,7 @@ def run_build(
     """Run P0/P1/P2 concurrently with branch-local checkpoints and failure isolation."""
     run_root.mkdir(parents=True, exist_ok=True)
     active_logger = logger or logging.getLogger(__name__)
-    idf_path = run_root / "dedup_idf.json"
+    idf_path = run_root / "snapshots/dedup_idf.json"
     frozen_idf = (
         dict(idf_snapshot) if idf_snapshot is not None
         else json.loads(idf_path.read_text(encoding="utf-8")) if idf_path.is_file()
@@ -1808,12 +1817,12 @@ def run_build(
         "dedup_rules_sha256": RULES_SHA256,
         "dedup_idf_sha256": frozen_idf["content_sha256"],
     }
-    contract_path = run_root / "p012_run_contract.json"
-    if contract_path.is_file():
-        if json.loads(contract_path.read_text(encoding="utf-8")) != run_contract:
-            raise ValueError("P012 运行目录与并发分支契约不兼容")
-    else:
-        write_json(contract_path, run_contract)
+    contract_path = run_root / "snapshots/config.json"
+    snapshot = json.loads(contract_path.read_text(encoding="utf-8"))
+    if "stage1_execution" in snapshot and snapshot["stage1_execution"] != run_contract:
+        raise ValueError("Stage1 配置与冻结运行契约不一致")
+    snapshot["stage1_execution"] = run_contract
+    write_json(contract_path, snapshot)
 
     runners = {"P0": _run_p0_branch, "P1": _run_p1_branch, "P2": _run_p2_branch}
     results: dict[str, JsonObject] = {}
@@ -1834,13 +1843,13 @@ def run_build(
                 duration_ms = round((time.monotonic_ns() - started[name]) / 1_000_000)
                 manifest_path = run_root / "manifest.json"
                 current_manifest = (
-                    json.loads(manifest_path.read_text(encoding="utf-8"))
+                    _read_run_manifest(manifest_path)
                     if manifest_path.is_file() else {}
                 )
                 current_status = (
                     current_manifest.get("branches", {}).get(name, {}).get("status")
                 )
-                terminal_status = "published" if current_status == "published" else "completed"
+                terminal_status = "completed"
                 _set_branch_status(
                     run_root, name, terminal_status, stage=terminal_status,
                     duration_ms=duration_ms, records=len(branch_result["records"]),
@@ -1861,29 +1870,18 @@ def run_build(
 
     summary = _aggregate_concurrent_results(config, results)
     summary["failed_sets"] = dict(errors)
-    write_json(run_root / "p012_build_summary.json", summary)
-    write_json(
-        run_root / "labeled_export_report.json",
-        {
-            "labeled_schema": LABELED_SCHEMA_NAME,
-            "labeled_mapping_version": LABELED_MAPPING_VERSION,
-            "sets": {name: value["export_report"] for name, value in results.items()},
-            "total_records": sum(len(value["records"]) for value in results.values()),
-            "lossy_enum_mappings": 0,
-            "failed_sets": dict(errors),
-        },
-    )
     output = {name: tuple(value["records"]) for name, value in results.items()}
+    (run_root / "reports").mkdir(exist_ok=True)
     if not errors:
         evaluated = {name: results[name]["evaluated_candidates"] for name in ("P0", "P1", "P2")}
         evaluation_rounds = {name: results[name]["evaluation_rounds"] for name in ("P0", "P1", "P2")}
         admission: dict[str, JsonObject] = {}
         for name in ("P0", "P1", "P2"):
             admission.update(results[name]["admission_results"])
-        if not (run_root / "screening_run_report.json").is_file():
+        if not (run_root / "reports/screening_run_report.json").is_file():
             write_run_report(
                 run_root,
-                run_id=run_root.name,
+                run_id=run_root.parent.name,
                 taxonomy=taxonomy,
                 evaluated_candidates=evaluated,
                 evaluation_rounds=evaluation_rounds,
@@ -1894,10 +1892,10 @@ def run_build(
             )
     else:
         write_json(
-            run_root / "screening_partial_report.json",
+            run_root / "reports/screening_partial_report.json",
             {
                 "report_schema_version": RUN_REPORT_SCHEMA_VERSION,
-                "run_id": run_root.name,
+                "run_id": run_root.parent.name,
                 "completed_sets": sorted(results),
                 "failed_sets": dict(errors),
                 "sets": {

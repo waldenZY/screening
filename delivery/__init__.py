@@ -1,1 +1,1 @@
-"""Validated screened output, compatibility export, and publication."""
+"""Validated internal records and downstream delivery packages."""

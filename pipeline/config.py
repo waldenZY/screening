@@ -14,7 +14,7 @@ from ..shared.json_io import JsonObject
 from .orchestrator import BUILD_CONFIG_VERSION, BuildConfig, parse_build_config
 
 
-PIPELINE_CONFIG_VERSION = 11
+PIPELINE_CONFIG_VERSION = 12
 LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 _TOP_LEVEL_FIELDS = {
@@ -26,7 +26,6 @@ _TOP_LEVEL_FIELDS = {
     "screening_policy",
     "index",
     "logging",
-    "publication",
     "sampling",
     "p1_supplement",
     "p2_supplement",
@@ -96,8 +95,6 @@ _OVERRIDE_FIELDS = {
     "index_reserve_free_space_gb",
     "verify_full_source_hash",
     "log_level",
-    "publication_enabled",
-    "publish_root",
 }
 
 
@@ -176,16 +173,6 @@ class IndexRuntimeConfig:
 
 
 @dataclass(frozen=True)
-class PublicationConfig:
-    enabled: bool
-    publish_root: Path | None
-
-    def __post_init__(self) -> None:
-        if type(self.enabled) is not bool:
-            raise ValueError("publication.enabled 必须是布尔值")
-
-
-@dataclass(frozen=True)
 class PipelineConfig:
     config_version: int
     config_path: Path
@@ -201,7 +188,6 @@ class PipelineConfig:
     quality: QualityRunConfig
     index: IndexRuntimeConfig
     log_level: str
-    publication: PublicationConfig
     build: BuildConfig
 
     @property
@@ -212,11 +198,7 @@ class PipelineConfig:
     def cache_root(self) -> Path:
         return self.index.cache_root or (self.output_root / "_canonical_cache").resolve()
 
-    @property
-    def publish_root(self) -> Path | None:
-        return self.publication.publish_root if self.publication.enabled else None
-
-    def validate_for_execution(self) -> None:
+    def validate_for_execution(self, *, require_risk_workbook: bool = True) -> None:
         for label, path in (
             ("inputs.source", self.source),
             ("inputs.taxonomy", self.taxonomy),
@@ -226,16 +208,16 @@ class PipelineConfig:
             ("prompts.challenge", self.challenge_prompt),
             ("prompts.quality_annotation", self.quality_annotation_prompt),
         ):
+            if label == "inputs.risk_keywords" and not require_risk_workbook:
+                continue
             if path is None:
                 raise ValueError(f"{label} 不能为空；请在配置文件中填写或使用 CLI 覆盖")
             if not path.is_file():
                 raise FileNotFoundError(f"{label} 文件不存在: {path}")
         if not self.screening_policy["require_category_exact"]:
             raise ValueError("生产链路必须要求类别 exact")
-        if self.publication.enabled and self.publication.publish_root is None:
-            raise ValueError("publication.enabled=true 时 publish_root 不能为空")
 
-    def manifest_value(self, *, run_id: str | None, new_run: bool, replace_files: bool) -> JsonObject:
+    def manifest_value(self, *, run_id: str | None, new_run: bool, stage1_from: str | None = None) -> JsonObject:
         """Return the effective, non-secret invocation settings for audit."""
         return {
             "pipeline_config_version": self.config_version,
@@ -264,19 +246,11 @@ class PipelineConfig:
                 "verify_full_source_hash": self.index.verify_full_source_hash,
             },
             "logging": {"level": self.log_level},
-            "publication": {
-                "enabled": self.publication.enabled,
-                "publish_root": (
-                    None
-                    if self.publication.publish_root is None
-                    else str(self.publication.publish_root)
-                ),
-            },
             "build_config": asdict(self.build),
             "one_shot": {
                 "run_id": run_id,
                 "new_run": new_run,
-                "replace": replace_files,
+                "stage1_from": stage1_from,
             },
         }
 
@@ -322,6 +296,8 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
     except json.JSONDecodeError as exc:
         raise ValueError(f"pipeline 配置不是合法 JSON: {config_path}") from exc
     value = _object(value, "pipeline 配置")
+    if "publication" in value:
+        raise ValueError("配置已升级到 v12：请删除 publication；交付自动写入本次 run 的 external")
     _exact_fields(value, _TOP_LEVEL_FIELDS, "pipeline 配置")
     if value["config_version"] != PIPELINE_CONFIG_VERSION:
         raise ValueError(
@@ -335,7 +311,6 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
     quality = _object(value["quality"], "quality")
     index = _object(value["index"], "index")
     logging_value = _object(value["logging"], "logging")
-    publication = _object(value["publication"], "publication")
     _exact_fields(inputs, {"source", "taxonomy", "risk_keywords"}, "inputs")
     _exact_fields(outputs, {"output_root"}, "outputs")
     _exact_fields(prompts, {"admission", "category", "challenge", "quality_annotation"}, "prompts")
@@ -354,7 +329,6 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
         "index",
     )
     _exact_fields(logging_value, {"level"}, "logging")
-    _exact_fields(publication, {"enabled", "publish_root"}, "publication")
 
     workers = _integer(quality["workers"], "quality.workers")
     max_retries = _integer(quality["max_retries"], "quality.max_retries")
@@ -362,8 +336,6 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
     level = logging_value["level"]
     if not isinstance(level, str) or level.upper() not in LOG_LEVELS:
         raise ValueError(f"logging.level 必须是以下枚举之一: {sorted(LOG_LEVELS)}")
-    if type(publication["enabled"]) is not bool:
-        raise ValueError("publication.enabled 必须是布尔值")
     if type(index["verify_full_source_hash"]) is not bool:
         raise ValueError("index.verify_full_source_hash 必须是布尔值")
 
@@ -399,15 +371,6 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
             verify_full_source_hash=index["verify_full_source_hash"],
         ),
         log_level=level.upper(),
-        publication=PublicationConfig(
-            enabled=publication["enabled"],
-            publish_root=_path(
-                publication["publish_root"],
-                "publication.publish_root",
-                base_dir,
-                optional=True,
-            ),
-        ),
         build=_parse_build(value),
     )
 
@@ -447,15 +410,6 @@ def apply_pipeline_overrides(
         ),
         verify_full_source_hash=values.get(
             "verify_full_source_hash", config.index.verify_full_source_hash
-        ),
-    )
-    publication = replace(
-        config.publication,
-        enabled=values.get("publication_enabled", config.publication.enabled),
-        publish_root=(
-            _path(values["publish_root"], "--publish-root", base_dir)
-            if "publish_root" in values
-            else config.publication.publish_root
         ),
     )
     level = values.get("log_level", config.log_level)
@@ -502,7 +456,6 @@ def apply_pipeline_overrides(
         quality=quality,
         index=index,
         log_level=level.upper(),
-        publication=publication,
     )
 
 

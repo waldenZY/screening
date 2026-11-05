@@ -91,20 +91,14 @@ def quality_report(rows: Sequence[Mapping[str, Any]]) -> JsonObject:
 
 def annotate_branch(runner, candidates: Sequence[JsonObject], branch_root: Path, branch: str):
     results = runner.run_additional_stage("quality_annotation", candidates, branch=branch) if candidates else {}
-    rows = [{"source_identity_sha256": c["source_identity_sha256"],
-             "task_id": runner.task_id("quality_annotation", c), "result": results[c["source_identity_sha256"]]}
-            for c in candidates]
-    folder = branch_root / "stage2"
-    folder.mkdir(parents=True, exist_ok=True)
-    write_jsonl(folder / "quality_annotations.jsonl", rows)
-    write_json(folder / "quality_report.json", quality_report(rows))
-    return results, ("stage2/quality_annotations.jsonl", "stage2/quality_report.json")
+    return results, ()
 
 
 def validate_branch(run_root: Path, branch: str, records, manifest, contract) -> JsonObject:
     """Rebuild task keys from the complete frozen admission input and check sidecars."""
     quality_root = run_root / "quality"
-    prompt = quality_root / "quality_annotation_prompt.md"
+    from ..pipeline.layout import prompt_path
+    prompt = prompt_path(run_root, "quality_annotation")
     if (contract.get("additional_stages") != ["quality_annotation"]
             or stable_hash(prompt.read_text(encoding="utf-8")) != contract["prompt_hashes"]["quality_annotation"]
             or sha256_file(prompt) != manifest["contract"]["prompts"]["quality_annotation_sha256"]):
@@ -116,13 +110,14 @@ def validate_branch(run_root: Path, branch: str, records, manifest, contract) ->
     if (None in tasks or None in results or len(tasks) != len(task_rows) or len(results) != len(result_rows)
             or any(r.get("stage") != "quality_annotation" for r in [*task_rows, *result_rows])):
         raise QualityResponseError("下游质量标注账本非法")
-    folder = run_root / branch / "stage2"
-    rows = load_jsonl(folder / "quality_annotations.jsonl")
-    frozen = load_jsonl(run_root / branch / "stage1.frozen.jsonl")
+    rows = [{"source_identity_sha256": r["candidate"]["source_identity_sha256"],
+             "task_id": r["provenance"]["quality_annotation_task_id"], "result": r["downstream_quality"]} for r in records]
+    frozen_path = run_root / branch / "stage1.frozen.jsonl"
+    frozen = load_jsonl(frozen_path)
     from ..delivery.screened import frozen_stage1_record
-    freeze_report = json.loads((run_root / branch / "stage1_freeze_report.json").read_text(encoding="utf-8"))
-    if (len(rows) != len(records) or frozen != [frozen_stage1_record(r) for r in records]
-            or freeze_report != {"stage": "stage1", "records": len(frozen), "sha256": sha256_file(run_root / branch / "stage1.frozen.jsonl")}):
+    freeze_report = manifest.get("frozen", {}).get(branch)
+    if (frozen != [frozen_stage1_record(r) for r in records]
+            or freeze_report != {"stage": "stage1", "records": len(frozen), "sha256": sha256_file(frozen_path)}):
         raise QualityResponseError("Stage1 冻结成员与交付记录不一致")
     for row, record in zip(rows, records):
         candidate = record["candidate"]
@@ -142,8 +137,4 @@ def validate_branch(run_root: Path, branch: str, records, manifest, contract) ->
                 or record["downstream_quality"] != results[key]
                 or record["provenance"]["quality_annotation_task_id"] != key):
             raise QualityResponseError("下游质量标注与成员、任务或结果账本不一致")
-    if json.loads((folder / "quality_report.json").read_text(encoding="utf-8")) != quality_report(rows):
-        raise QualityResponseError("下游质量标注报告与逐条结果不一致")
-    paths = {"results": folder / "quality_annotations.jsonl", "report": folder / "quality_report.json",
-             "frozen": run_root / branch / "stage1.frozen.jsonl", "freeze_report": run_root / branch / "stage1_freeze_report.json"}
-    return {name: {"path": path.relative_to(run_root).as_posix(), "sha256": sha256_file(path)} for name, path in paths.items()}
+    return {"frozen": {"path": frozen_path.relative_to(run_root).as_posix(), "sha256": sha256_file(frozen_path)}}

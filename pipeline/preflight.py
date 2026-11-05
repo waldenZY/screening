@@ -1,4 +1,4 @@
-"""Early operational checks; never submit dataset text or change published files."""
+"""Early operational checks; never submit dataset text."""
 
 from __future__ import annotations
 
@@ -91,34 +91,6 @@ def check_directory(path: Path, role: str, logger: logging.Logger) -> dict[str, 
     return result
 
 
-def check_publication_targets(root: Path, replace: bool, logger: logging.Logger) -> list[dict[str, Any]]:
-    """Report existing files; final content equivalence remains a publication gate."""
-    started = time.perf_counter()
-    existing = []
-    for set_name, relative in LABELED_FILENAMES.items():
-        destination = root / relative
-        try:
-            if not destination.exists():
-                continue
-            if not destination.is_file():
-                raise IsADirectoryError("publication destination must be a file")
-            with destination.open("rb") as handle:
-                handle.read(1)
-        except OSError as exc:
-            error = PreflightError("publication_targets", "inspect", type(exc).__name__,
-                                   path=destination, errno=exc.errno,
-                                   hint="check_destination_type_and_read_permissions")
-            _failed(logger, error, started)
-            raise error from None
-        item = {"set": set_name, "path": str(destination), "replace": replace,
-                "next_action": "compare_hashes_after_export"}
-        existing.append(item)
-        _log(logger, logging.WARNING, "publication_targets", "exists_unverified", **item)
-    _log(logger, logging.INFO, "publication_targets", "passed", existing_files=len(existing),
-         next_action="final_hash_check_before_publish")
-    return existing
-
-
 def check_llm(config: LlmConfig, llm_call: LlmCall, logger: logging.Logger) -> dict[str, Any]:
     """One genuine request with the configured protocol and options; no retries."""
     started = time.perf_counter()
@@ -157,7 +129,7 @@ def check_llm(config: LlmConfig, llm_call: LlmCall, logger: logging.Logger) -> d
 
 def run_preflight(config: PipelineConfig, *, prompts: Mapping[str, str],
                   llm_config: LlmConfig, llm_call: LlmCall,
-                  replace: bool, logger: logging.Logger) -> dict[str, Any]:
+                  logger: logging.Logger) -> dict[str, Any]:
     started = time.perf_counter()
     _log(logger, logging.INFO, "startup", "started")
     for stage, prompt in prompts.items():
@@ -168,20 +140,11 @@ def run_preflight(config: PipelineConfig, *, prompts: Mapping[str, str],
             raise error
     _log(logger, logging.INFO, "prompt", "passed", stages=sorted(prompts))
     directories = [check_directory(path, role, logger) for role, path in (
-        ("output", config.output_root), ("runs", config.output_root / "runs"),
+        ("output", config.output_root),
         ("cache", config.cache_root),
     )]
-    existing = []
-    if config.publish_root is not None:
-        directories.append(check_directory(config.publish_root, "publish", logger))
-        for set_name, relative in LABELED_FILENAMES.items():
-            directories.append(check_directory((config.publish_root / relative).parent,
-                                               f"publish_{set_name}", logger))
-        existing = check_publication_targets(config.publish_root, replace, logger)
-    else:
-        _log(logger, logging.INFO, "publication_targets", "skipped", reason="publication_disabled")
     llm = check_llm(llm_config, llm_call, logger)
-    result = {"status": "passed", "directories": directories, "existing_publication_files": existing,
+    result = {"status": "passed", "directories": directories,
               "llm": llm, "elapsed_ms": round((time.perf_counter() - started) * 1000, 2)}
     _log(logger, logging.INFO, "startup", "passed", elapsed_ms=result["elapsed_ms"])
     return result

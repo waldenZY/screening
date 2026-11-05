@@ -1,9 +1,8 @@
-"""Stage2 deterministic downstream_labeled_v1 export (fixed v4 filenames)."""
+"""Stage2 deterministic downstream_labeled_v2 export (fixed v4 filenames)."""
 
 from __future__ import annotations
 
 import math
-import copy
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -17,8 +16,8 @@ from .screened import (
 )
 
 
-LABELED_MAPPING_VERSION = 10
-LABELED_SCHEMA_NAME = "downstream_labeled_v1"
+LABELED_MAPPING_VERSION = 11
+LABELED_SCHEMA_NAME = "downstream_labeled_v2"
 LABELED_SET_VALUES = {
     "P0": "P0_smoke",
     "P1": "P1_benchmark",
@@ -29,13 +28,47 @@ LABELED_FILENAMES = {
     "P1": Path("P1-基准集") / "P1_benchmark_set_v4_labeled.jsonl",
     "P2": Path("P2-对抗集") / "P2_adversarial_set_v4_labeled.jsonl",
 }
-LABELED_FIELDS = (
+BASE_FIELDS = (
     "text", "raw_text", "context_text", "target_query", "turn_count", "sample_type",
     "L1", "L2", "cluster_id", "cluster_prob", "prob_band", "frequency", "freq_band",
-    "norm_freq", "relevance", "length_bin", "complexity", "formality", "session_id", "set",
-    "quality_category_fit", "quality_validity", "quality_intent_clarity",
-    "quality_issue_types", "quality_overall_score", "intent_label", "executable", "stage1", "provenance",
+    "norm_freq", "relevance_p0", "length_bin", "complexity", "formality", "session_id", "set",
+    "intent_label", "executable",
 )
+QUALITY_EXPORT_FIELDS = (
+    "quality_category_fit", "quality_semantic_completeness", "quality_intent_clarity",
+    "quality_validity", "quality_classification_difficulty", "quality_task_difficulty",
+    "quality_issue_types", "quality_overall_score",
+)
+LABELED_FIELDS = BASE_FIELDS + QUALITY_EXPORT_FIELDS
+
+
+def base_fields(set_name: str) -> tuple[str, ...]:
+    if set_name not in LABELED_SET_VALUES:
+        raise LabeledExportError(f"未知数据集: {set_name}")
+    fields = list(BASE_FIELDS)
+    if set_name == "P2":
+        fields.insert(fields.index("relevance_p0") + 1, "relevance_p2")
+    return tuple(fields)
+
+
+def base_filename(set_name: str) -> Path:
+    path = LABELED_FILENAMES[set_name]
+    return path.with_name(path.name.replace("_labeled", ""))
+
+
+def derived_quality(record: Mapping[str, Any]) -> JsonObject:
+    admission = record["quality"]["admission"]
+    route = admission["screening"]["route"]
+    band = record["candidate"]["features"]["probability_band"]
+    complexity = record["candidate"]["features"]["complexity"]
+    if route not in {"direct", "clarification"} or band not in {"high", "mid", "boundary"} or complexity not in {"simple", "moderate", "complex"}:
+        raise LabeledExportError("缺失或非法的质量映射输入")
+    return {
+        "quality_category_fit": admission["category"]["fit"],
+        "quality_semantic_completeness": {"direct": "self_contained", "clarification": "context_dependent"}[route],
+        "quality_classification_difficulty": {"high": "trivial", "mid": "moderate", "boundary": "hard"}[band],
+        "quality_task_difficulty": complexity,
+    }
 
 
 class LabeledExportError(ValueError):
@@ -43,10 +76,7 @@ class LabeledExportError(ValueError):
 
 
 def labeled_fields(set_name: str) -> tuple[str, ...]:
-    if set_name not in LABELED_SET_VALUES:
-        raise LabeledExportError(f"未知数据集: {set_name}")
-    relevance = "relevance_p2" if set_name == "P2" else "relevance_p0"
-    return tuple(relevance if field == "relevance" else field for field in LABELED_FIELDS)
+    return base_fields(set_name) + QUALITY_EXPORT_FIELDS
 
 
 def map_screened_to_labeled(record: Mapping[str, Any]) -> JsonObject:
@@ -72,13 +102,9 @@ def validate_labeled_record(
     *,
     canonical_record: Mapping[str, Any] | None = None,
 ) -> None:
-    """Independently check all 29 fields, types, enums and frozen source mapping."""
-    from ..quality.admission import validate_admission_result, mapped_intent_label
-    if not isinstance(record.get("stage1"), Mapping) or set(record["stage1"]) != {"admission", "selection", "challenge"}:
-        raise LabeledExportError("stage1 透传必须包含 admission、selection、challenge")
-    validate_admission_result({"admission": record["stage1"]["admission"]})
+    """Independently check all 30/31 fields, types, enums and frozen source mapping."""
     if tuple(record) != labeled_fields(set_name):
-        raise LabeledExportError("labeled 字段名称或顺序不符合 downstream_labeled_v1")
+        raise LabeledExportError("labeled 字段名称或顺序不符合 downstream_labeled_v2")
     if any(value is None for value in record.values()):
         raise LabeledExportError("labeled 必需字段不得为 null")
     for field in (
@@ -118,25 +144,22 @@ def validate_labeled_record(
                            ("formality", {"formal", "mixed", "colloquial"})):
         if record[field] not in choices:
             raise LabeledExportError(f"{field} 枚举非法")
-    relevance = "relevance_p2" if set_name == "P2" else "relevance_p0"
-    for field in ("norm_freq", relevance):
+    for field in ("norm_freq", "relevance_p0", *(("relevance_p2",) if set_name == "P2" else ())):
         if not _is_number(record[field]) or not 0 <= record[field] <= 1 or record[field] != round(record[field], 4):
             raise LabeledExportError(f"{field} 必须是四位小数精度的0～1数值")
     if record["sample_type"] != ("multi_turn" if record["turn_count"] > 1 else "single_turn"):
         raise LabeledExportError("sample_type 与轮数不一致")
-    admission = validate_admission_result({"admission": record["stage1"]["admission"]})["admission"]
-    if record["quality_category_fit"] != admission["category"]["fit"]:
-        raise LabeledExportError("quality_category_fit 必须来自类别核验")
-    if not isinstance(record["provenance"], Mapping) or not record["provenance"].get("run_id"):
-        raise LabeledExportError("provenance 缺少运行来源")
-    if record["intent_label"] != mapped_intent_label(admission["features"]):
-        raise LabeledExportError("labeled intent_label 必须映射自 准入评估")
-    if (not admission["screening"]["admitted"] or not admission["policy"]["require_category_exact"]
-            or admission["category"] != {"status": "reviewed", "fit": "exact"}):
-        raise LabeledExportError("交付包含未准入或未核验类别的样本")
-    if record["executable"] and (admission["screening"]["route"] != "direct"
+    if record["quality_category_fit"] != "exact":
+        raise LabeledExportError("生产交付类别必须来自 exact 准入结果")
+    if record["quality_semantic_completeness"] not in {"self_contained", "context_dependent"}:
+        raise LabeledExportError("语义完整性映射非法")
+    if record["quality_classification_difficulty"] != {"high":"trivial", "mid":"moderate", "boundary":"hard"}[record["prob_band"]]:
+        raise LabeledExportError("分类难度与概率档不一致")
+    if record["quality_task_difficulty"] != record["complexity"]:
+        raise LabeledExportError("任务难度与规则复杂度不一致")
+    if record["executable"] and (record["quality_semantic_completeness"] != "self_contained"
             or record["turn_count"] != 1 or len(record["target_query"]) <= 2):
-        raise LabeledExportError("executable 不符合单轮直接测试条件")
+        raise LabeledExportError("executable 不符合直接测试条件")
     if canonical_record is not None:
         expected = _labeled_values(canonical_record)
         if dict(record) != expected:
@@ -167,7 +190,8 @@ def _labeled_values(record: Mapping[str, Any]) -> JsonObject:
         "frequency": candidate["signals"]["frequency"],
         "freq_band": candidate["features"]["frequency_band"],
         "norm_freq": round(candidate["features"]["normalized_frequency"], 4),
-        ("relevance_p2" if set_name == "P2" else "relevance_p0"): round(record["sampling_scores"]["p2" if set_name == "P2" else "p0"], 4),
+        "relevance_p0": round(record["sampling_scores"]["p0"], 4),
+        **({"relevance_p2": round(record["sampling_scores"]["p2"], 4)} if set_name == "P2" else {}),
         "length_bin": candidate["features"]["length_band"],
         "complexity": candidate["features"]["complexity"],
         "formality": candidate["features"]["formality"],
@@ -175,10 +199,8 @@ def _labeled_values(record: Mapping[str, Any]) -> JsonObject:
         "set": LABELED_SET_VALUES[set_name],
         "intent_label": record["quality"]["intent_label"],
         "executable": record["delivery_labels"]["executable"],
-        "quality_category_fit": record["quality"]["admission"]["category"]["fit"],
+        **derived_quality(record),
         **annotation,
-        "stage1": copy.deepcopy({"admission": record["quality"]["admission"], "selection": record["selection"], "challenge": record["challenge"]}),
-        "provenance": copy.deepcopy(record["provenance"]),
     }
     return {field: direct[field] for field in labeled_fields(set_name)}
 
@@ -192,7 +214,12 @@ def export_labeled_branch(
     validate_screened_canonical_records(set_name, records)
     labeled_records = [map_screened_to_labeled(record) for record in records]
     canonical_path = branch_root / "screened.canonical.jsonl"
-    labeled_path = branch_root / LABELED_FILENAMES[set_name].name
+    from ..pipeline.layout import external_root
+    package = external_root(branch_root.parent)
+    labeled_path = package / LABELED_FILENAMES[set_name]
+    base_path = package / base_filename(set_name)
+    labeled_path.parent.mkdir(parents=True, exist_ok=True)
+    bases = [{key: row[key] for key in base_fields(set_name)} for row in labeled_records]
     provenance_path = branch_root / "export_provenance.jsonl"
     provenance = []
     for index, (canonical, labeled) in enumerate(zip(records, labeled_records), start=1):
@@ -200,6 +227,7 @@ def export_labeled_branch(
         selection = canonical["selection"]
         provenance.append({
             "output_index": index,
+            "base_record_sha256": stable_record_sha256(bases[index-1]),
             "source_identity_sha256": candidate["source_identity_sha256"],
             "source_record_sha256": candidate["source"]["record_sha256"],
             "canonical_record_sha256": stable_record_sha256(canonical),
@@ -211,6 +239,7 @@ def export_labeled_branch(
             "labeled_mapping_version": LABELED_MAPPING_VERSION,
         })
     write_jsonl(canonical_path, records)
+    write_jsonl(base_path, bases)
     write_jsonl(labeled_path, labeled_records)
     write_jsonl(provenance_path, provenance)
     report: JsonObject = {
@@ -223,12 +252,14 @@ def export_labeled_branch(
         "fields": list(labeled_fields(set_name)),
         "null_values": 0,
         "lossy_enum_mappings": 0,
-        "rounded_numeric_fields": ["norm_freq", "relevance_p2" if set_name == "P2" else "relevance_p0"],
+        "rounded_numeric_fields": ["norm_freq", "relevance_p0", *(("relevance_p2",) if set_name == "P2" else ())],
         "files": {
             "canonical": canonical_path.name,
-            "labeled": labeled_path.name,
+            "labeled": str(labeled_path.relative_to(package)),
+            "base": str(base_path.relative_to(package)),
             "provenance": provenance_path.name,
         },
     }
-    write_json(branch_root / "labeled_export_report.json", report)
+    from ..pipeline.run_context import update_manifest
+    update_manifest(branch_root.parent, exports={set_name: report})
     return report

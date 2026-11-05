@@ -16,7 +16,7 @@ from openpyxl import Workbook
 
 from screening.candidate.contract import compute_fixed_features, parse_conversation, _formality
 from screening.candidate.scoring import sampling_scores
-from screening.delivery.publish import collect_and_validate_artifacts, PublicationError
+from screening.delivery.validation import collect_and_validate_artifacts, ArtifactValidationError
 from screening.delivery.labeled import labeled_fields
 from screening.quality.annotation import QUALITY_FIELDS, ISSUE_TYPES, validate_quality_annotation, quality_annotation_input
 from screening.quality.admission import QualityResponseError, build_admission_result
@@ -74,10 +74,10 @@ class DownstreamQualityTests(unittest.TestCase):
         self.assertEqual(len(ISSUE_TYPES), 10)
         for set_name in ("P0", "P1", "P2"):
             fields = labeled_fields(set_name)
-            self.assertEqual(len(fields), 29)
-            self.assertEqual(len(set(fields)), 29)
+            self.assertEqual(len(fields), 31 if set_name == "P2" else 30)
+            self.assertEqual(len(set(fields)), len(fields))
             self.assertTrue(set(QUALITY_FIELDS).issubset(fields))
-            self.assertNotIn("quality_task_difficulty", fields)
+            self.assertIn("quality_task_difficulty", fields)
 
     def test_invalid_types_missing_fields_and_cross_field_contradictions(self):
         valid = annotation()
@@ -155,14 +155,14 @@ class StageBoundaryTests(unittest.TestCase):
         path=root/"pipeline.json";path.write_text(json.dumps(profile),encoding="utf-8")
         return path
 
-    def test_annotation_failure_freeze_independent_publication_and_resume(self):
+    def test_annotation_failure_freeze_independent_completion_and_resume(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td);profile=self._profile(root);calls=[];client=fake_client(calls)
             freeze_observed=[]
             def fail_one(messages, **kwargs):
                 prompt=messages[0]["content"]
                 if prompt.startswith("# 下游质量补充标注"):
-                    runs=list((root/"outputs/runs").iterdir())
+                    runs=list((root/"outputs").glob("*/internal"))
                     identity_payload=json.loads(prompt[prompt.rfind("\n{")+1:])
                     matching=[]
                     for name in ("P0","P1","P2"):
@@ -175,25 +175,25 @@ class StageBoundaryTests(unittest.TestCase):
                         raise RuntimeError("synthetic quality annotation failure")
                 return client(messages,**kwargs)
             with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
-                code=pipeline_main(["--config",str(profile),"--publish-root",str(root/"published")],llm_config_override=CONFIG,llm_call_override=fail_one)
+                code=pipeline_main(["--config",str(profile)],llm_config_override=CONFIG,llm_call_override=fail_one)
             self.assertEqual(code,2)
             self.assertTrue(freeze_observed and all(freeze_observed))
-            run=next((root/"outputs/runs").iterdir())
+            run=next((root/"outputs").glob("*/internal"))
             manifest=json.loads((run/"manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["branches"]["P0"]["status"],"published")
+            self.assertEqual(manifest["branches"]["P0"]["status"],"completed")
             self.assertEqual(manifest["branches"]["P1"]["status"],"failed")
             self.assertFalse(list((run/"P1").glob("*_labeled.jsonl")))
             frozen_before={name:(run/name/"stage1.frozen.jsonl").read_bytes() for name in ("P0","P1","P2")}
             old_counts=Counter(prompt.splitlines()[0] for prompt in calls)
             from screening.pipeline import orchestrator
             with patch.object(orchestrator,"_sample_branch",side_effect=AssertionError("frozen Stage1 must not resample")), patch.object(orchestrator,"_run_adaptive_p2",side_effect=AssertionError("frozen P2 must not rebuild")), contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
-                code=pipeline_main(["--config",str(profile),"--run-id",manifest["run_id"],"--publish-root",str(root/"published")],llm_config_override=CONFIG,llm_call_override=client)
+                code=pipeline_main(["--config",str(profile),"--run-id",manifest["run_id"]],llm_config_override=CONFIG,llm_call_override=client)
             self.assertEqual(code,0)
             self.assertEqual(frozen_before,{name:(run/name/"stage1.frozen.jsonl").read_bytes() for name in ("P0","P1","P2")})
             counts=Counter(prompt.splitlines()[0] for prompt in calls)
             for header in ("# 准入评估：评测目标、澄清点与必要依赖识别", "# 准入评估：独立类别核验"):
                 self.assertEqual(counts[header],old_counts[header])
-            self.assertEqual(len(list((root/"published").rglob("*_v4_labeled.jsonl"))),3)
+            self.assertEqual(len(list((run.parent/"external").rglob("*_v4_labeled.jsonl"))),3)
             collect_and_validate_artifacts(run)
             database=next((root/"outputs/_canonical_cache").rglob("canonical_candidate_index.sqlite"))
             with contextlib.closing(sqlite3.connect(database)) as conn:
@@ -203,7 +203,7 @@ class StageBoundaryTests(unittest.TestCase):
             rows=[json.loads(line) for line in before.decode("utf-8").splitlines()]
             rows[0]["selection"]["admission_feature_task_id"]="0"*64
             frozen.write_text("".join(json.dumps(row,ensure_ascii=False)+"\n" for row in rows),encoding="utf-8")
-            with self.assertRaises((PublicationError,QualityResponseError)):
+            with self.assertRaises((ArtifactValidationError,QualityResponseError)):
                 collect_and_validate_artifacts(run)
             frozen.write_bytes(before)
             with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):

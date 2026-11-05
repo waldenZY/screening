@@ -53,7 +53,7 @@ def build_quality_input(record: Any) -> dict[str, Any]:
         payload = build_admission_input(record)
         admission = validate_admission_result({"admission": record["stage1"].get("admission")})["admission"]
     else:
-        raise ValueError("需要准入复测results.jsonl、Stage1冻结成品、内部成品或含stage1.admission的下游文件；请先获取准入判断")
+        raise ValueError("新版 external 不包含准入依据；请使用对应 internal 的 stage1.frozen.jsonl、screened.canonical.jsonl 或准入复测 results.jsonl")
     category = payload["candidate_category"]
     if (any(not isinstance(category[key], str) or not category[key].strip() for key in ("L1", "L2"))
             or admission["category"]["status"] != "reviewed"):

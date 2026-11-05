@@ -46,7 +46,7 @@ python -m screening.module_tests.run_admission `
 
 - 准入工具产生的 results.jsonl：要求对应行成功、具备真实L1/L2和类别核验，校验原始输入、独立判断和哈希绑定。
 - 生产的 stage1.frozen.jsonl、screened.canonical.jsonl。
-- 包含 stage1.admission 的新版下游 *_v4_labeled.jsonl。
+- 历史包含 stage1.admission 的下游 *_v4_labeled.jsonl；新版 external 不再包含准入依据，必须使用对应 internal 文件。
 
 ~~~powershell
 python -m screening.module_tests.run_quality_annotation `
@@ -74,4 +74,12 @@ JSONL 保存 admission_group，Excel 分列展示类型、原因、澄清点、�
 
 退出码：0全部完成（可含正常排除）；2有单条工程失败；1配置、目录或文件错误；130用户中断。无人工真值，不报告准确率。这里的文本筛选不认证正式用例已就绪，正式测试仍需构建环境、判据和证据。
 
-生产 Stage2 默认必跑下游质量标注；原可选难度/语义障碍模块已[归档](../artifacts/archive/v4_pre_downstream/ARCHIVE.md)。准入独立复测不调用该标注。正式交付是 downstream_labeled_v1 的29字段；本工具的审阅 JSONL/Excel 保留自身明细，不等同于正式交付文件。新增下游契约、评分与冻结续跑验收见 tests/test_downstream.py。
+生产 Stage2 默认必跑下游质量标注；原可选难度/语义障碍模块已[归档](../artifacts/archive/v4_pre_downstream/ARCHIVE.md)。准入独立复测不调用该标注。正式交付是 downstream_labeled_v2：P0/P1基础22字段、标注30字段，P2基础23字段、标注31字段；本工具的审阅 JSONL/Excel 保留自身明细，不等同于正式交付文件。新增下游契约、评分与冻结续跑验收见 tests/test_downstream.py。
+
+## 新输出布局与验收
+
+生产输出为<output-root>/<run-id>/internal与external/evaluation-set-large，不再有runs层与独立发布目录。quality_annotation仍仅判断原有四字段，另三个维度由冻结信息规则映射，不增加模型请求。
+
+新版external删除stage1/provenance对象，不能单独重现完整质量模型输入。准入复测仍可用于观察文本，但质量复测请传internal/P0|P1|P2/stage1.frozen.jsonl或screened.canonical.jsonl。--stage1-from由生产入口执行，不等同于单模块复测。
+
+新增test_delivery_layout覆盖新目录、六文件对齐、全部映射档、报告和切片、缓存隔离、新旧v4来源、模型变更只补标、来源不变、失败恢复与篡改拒绝。测试使用moto、临时数据和模拟LLM。Windows受限环境可将TEMP/TMP设置到有写权限的临时目录；Git Bash需要正常的Windows进程/命名对象权限。

@@ -35,6 +35,8 @@ class QualityModuleTests(unittest.TestCase):
         candidate={"conversation":parsed,"taxonomy":{"l1":"设备","l2":"控制"}}
         admission={"admission":row["stage1"]["admission"]}
         self.assertEqual(quality.build_quality_input(row),quality_annotation_input(candidate,admission))
+        external=copy.deepcopy(row);external.pop("stage1")
+        self.assertEqual(run_admission.build_admission_input(external)["conversation_turns"],payload["conversation_turns"])
         wrong=copy.deepcopy(row);wrong["raw_text"]="先打开相机 | 删除照片"
         with self.assertRaises(ValueError):run_admission.build_admission_input(wrong)
 
@@ -109,19 +111,20 @@ class QualityModuleTests(unittest.TestCase):
         from screening.pipeline.cli import main as pipeline_main
         profile=StageBoundaryTests()._profile(self.root)
         with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
-            code=pipeline_main(["--config",str(profile),"--no-publish"],llm_config_override=CONFIG,llm_call_override=fake_client([]))
+            code=pipeline_main(["--config",str(profile)],llm_config_override=CONFIG,llm_call_override=fake_client([]))
         self.assertEqual(code,0)
-        run=next((self.root/"outputs/runs").iterdir())
+        run=next((self.root/"outputs").glob("*/internal"))
         for branch in ("P0","P1","P2"):
             freeze=[json.loads(line) for line in (run/branch/"stage1.frozen.jsonl").read_text(encoding="utf-8").splitlines()]
             internal=[json.loads(line) for line in (run/branch/"screened.canonical.jsonl").read_text(encoding="utf-8").splitlines()]
-            delivered=[json.loads(line) for line in next((run/branch).glob("*_v4_labeled.jsonl")).read_text(encoding="utf-8").splitlines()]
+            delivered=[json.loads(line) for line in next((run.parent/"external/evaluation-set-large").glob(branch+"*/*_v4_labeled.jsonl")).read_text(encoding="utf-8").splitlines()]
             self.assertTrue(freeze)
             for frozen,canonical,labeled in zip(freeze,internal,delivered):
                 expected=quality_annotation_input(frozen["candidate"],{"admission":frozen["quality"]["admission"]})
                 self.assertEqual(quality.build_quality_input(frozen),expected)
                 self.assertEqual(quality.build_quality_input(canonical),expected)
-                self.assertEqual(quality.build_quality_input(labeled),expected)
+                with self.assertRaisesRegex(ValueError, "external"):
+                    quality.build_quality_input(labeled)
                 self.assertEqual(run_admission.build_admission_input(frozen),{
                     key:expected[key] for key in ("sample_type","conversation_turns","candidate_category")})
 

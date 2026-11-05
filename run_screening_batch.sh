@@ -26,8 +26,6 @@ RISK_KEYWORDS="/data/common/risk_keywords.xlsx"
 # Relative paths in this block are resolved from the directory containing this
 # script, not from the shell's current working directory.
 OUTPUT_BASE="batch_outputs"
-PUBLISH_BASE="batch_publications"
-PUBLISH_SUBDIR="evaluation-set-large"
 CONFIG_FILE="artifacts/config/pipeline.default.json"
 PYTHON_BIN="${SCREENING_PYTHON:-python}"
 
@@ -51,7 +49,7 @@ usage() {
   cat <<'EOF'
 Usage: ./run_screening_batch.sh {check|run|start|status}
 
-  check   Validate Bash, Python dependencies, v11 config, four prompts and inputs; no LLM calls.
+  check   Validate Bash, Python dependencies, v12 config, four prompts and inputs; no LLM calls.
   run     Run the batch in the foreground and keep per-dataset logs.
   start   Start the batch with nohup so it survives an SSH disconnect.
   status  Show the latest batch, process state and success/failure counts.
@@ -89,15 +87,6 @@ dataset_id() {
   local value
   value="$(trim_trailing_slashes "$1")"
   basename -- "$value"
-}
-
-dataset_publish_root() {
-  local id="$1" base
-  base="$(resolve_from_script "$PUBLISH_BASE")/${id}"
-  if [[ -n "$PUBLISH_SUBDIR" ]]; then
-    base="${base}/${PUBLISH_SUBDIR}"
-  fi
-  printf '%s\n' "$base"
 }
 
 contains_unsafe_record_characters() {
@@ -288,7 +277,7 @@ check_dataset_inputs() {
 }
 
 check_all() {
-  local errors=0 raw id dir output_root publish_root
+  local errors=0 raw id dir output_root external_path
 
   validate_bash || errors=$((errors + 1))
   validate_common_configuration || errors=$((errors + $?))
@@ -299,9 +288,9 @@ check_all() {
     id="$(dataset_id "$raw")"
     dir="$(dataset_path "$raw")"
     output_root="$(resolve_from_script "$OUTPUT_BASE")/${id}"
-    publish_root="$(dataset_publish_root "$id")"
-    printf '  - %s\n    input:   %s\n    output:  %s\n    publish: %s\n' \
-      "$id" "$dir" "$output_root" "$publish_root"
+    external_path="<run-dir>/external/evaluation-set-large"
+    printf '  - %s\n    input:   %s\n    output:  %s\n    external: %s\n' \
+      "$id" "$dir" "$output_root" "$external_path"
     check_dataset_inputs "$raw" || errors=$((errors + $?))
   done
 
@@ -324,7 +313,7 @@ prepare_batch_dir() {
   mkdir -p -- "$batch_dir"
   printf '%s\n' "$batch_dir" > "$LATEST_FILE"
   : > "${batch_dir}/summary.tsv"
-  printf 'index\tdataset\tstatus\texit_code\tsource\ttaxonomy\toutput_root\tpublish_root\tlog\n' \
+  printf 'index\tdataset\tstatus\texit_code\tsource\ttaxonomy\toutput_root\trun_path\texternal_path\tcompletion_status\tlog\n' \
     >> "${batch_dir}/summary.tsv"
   printf 'started_at\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" > "${batch_dir}/summary.txt"
   write_status "$batch_dir" "RUNNING"
@@ -332,16 +321,16 @@ prepare_batch_dir() {
 
 append_summary_row() {
   local batch_dir="$1" index="$2" id="$3" result="$4" rc="$5"
-  local source="$6" taxonomy="$7" output_root="$8" publish_root="$9" item_log="${10}"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  local source="$6" taxonomy="$7" output_root="$8" run_path="$9" external_path="${10}" completion_status="${11}" item_log="${12}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$index" "$id" "$result" "$rc" "$source" "$taxonomy" \
-    "$output_root" "$publish_root" "$item_log" >> "${batch_dir}/summary.tsv"
+    "$output_root" "$run_path" "$external_path" "$completion_status" "$item_log" >> "${batch_dir}/summary.tsv"
 }
 
 run_one_dataset() {
   local batch_dir="$1" index="$2" raw="$3"
-  local id dir source taxonomy output_root publish_root risk_keywords config_file item_log
-  local rc result
+  local id dir source taxonomy output_root external_path risk_keywords config_file item_log
+  local rc result run_path="" completion_status="incomplete" line
   local -a command
 
   id="$(dataset_id "$raw")"
@@ -349,14 +338,14 @@ run_one_dataset() {
   source="${dir}/${SOURCE_FILENAME}"
   taxonomy="${dir}/${TAXONOMY_FILENAME}"
   output_root="$(resolve_from_script "$OUTPUT_BASE")/${id}"
-  publish_root="$(dataset_publish_root "$id")"
+  external_path=""
   risk_keywords="$(resolve_from_script "$RISK_KEYWORDS")"
   config_file="$(resolve_from_script "$CONFIG_FILE")"
   item_log="${batch_dir}/$(printf '%03d' "$index")-${id}.log"
 
   {
-    printf 'dataset=%s\nsource=%s\ntaxonomy=%s\noutput_root=%s\npublish_root=%s\n' \
-      "$id" "$source" "$taxonomy" "$output_root" "$publish_root"
+    printf 'dataset=%s\nsource=%s\ntaxonomy=%s\noutput_root=%s\nexternal_path=%s\n' \
+      "$id" "$source" "$taxonomy" "$output_root" "$external_path"
   } > "$item_log"
 
   if ! check_dataset_inputs "$raw" >> "$item_log" 2>&1; then
@@ -364,7 +353,7 @@ run_one_dataset() {
     result="FAILED_INPUT"
     printf 'result=%s exit_code=%s\n' "$result" "$rc" >> "$item_log"
     append_summary_row "$batch_dir" "$index" "$id" "$result" "$rc" \
-      "$source" "$taxonomy" "$output_root" "$publish_root" "$item_log"
+      "$source" "$taxonomy" "$output_root" "$run_path" "$external_path" "$completion_status" "$item_log"
     log "[$index/${#DATASET_DIRS[@]}] $id failed input validation; continuing"
     return 1
   fi
@@ -376,7 +365,6 @@ run_one_dataset() {
     --taxonomy "$taxonomy"
     --risk-keywords "$risk_keywords"
     --output-root "$output_root"
-    --publish-root "$publish_root"
   )
 
   {
@@ -391,6 +379,14 @@ run_one_dataset() {
     "${command[@]}"
   ) >> "$item_log" 2>&1
   rc=$?
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    case "$line" in
+      run_path=*) run_path="${line#run_path=}" ;;
+      external_path=*) external_path="${line#external_path=}" ;;
+      completion_status=*) completion_status="${line#completion_status=}" ;;
+    esac
+  done < "$item_log"
 
   if (( rc == 0 )); then
     result="SUCCESS"
@@ -402,7 +398,7 @@ run_one_dataset() {
   printf 'finished_at=%s\nresult=%s\nexit_code=%s\n' \
     "$(date '+%Y-%m-%d %H:%M:%S')" "$result" "$rc" >> "$item_log"
   append_summary_row "$batch_dir" "$index" "$id" "$result" "$rc" \
-    "$source" "$taxonomy" "$output_root" "$publish_root" "$item_log"
+    "$source" "$taxonomy" "$output_root" "$run_path" "$external_path" "$completion_status" "$item_log"
   (( rc == 0 ))
 }
 

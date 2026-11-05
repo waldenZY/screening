@@ -1,5 +1,5 @@
 {
-  "config_version": 11,
+  "config_version": 12,
   "inputs": {
     "source": "",
     "taxonomy": "",
@@ -30,10 +30,6 @@
   },
   "logging": {
     "level": "INFO"
-  },
-  "publication": {
-    "enabled": false,
-    "publish_root": null
   },
   "sampling": {
     "p0": {

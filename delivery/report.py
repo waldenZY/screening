@@ -21,9 +21,9 @@ from ..shared.taxonomy import TaxonomyMappings
 from .screened import validate_screened_canonical_record
 
 
-RUN_REPORT_SCHEMA_VERSION = 14
-RUN_REPORT_JSON = "screening_run_report.json"
-RUN_REPORT_MARKDOWN = "screening_run_report.md"
+RUN_REPORT_SCHEMA_VERSION = 15
+RUN_REPORT_JSON = "reports/screening_run_report.json"
+RUN_REPORT_MARKDOWN = "reports/screening_run_report.md"
 SET_NAMES = ("P0", "P1", "P2")
 _CATEGORY_FIT_VALUES = ("exact", "partial", "mismatch", "not_provided")
 _SENSITIVE_KEYS = frozenset({"text", "raw_text", "target_query", "context_turns", "conversation_turns", "full_text"})
@@ -478,6 +478,7 @@ def build_run_report(
         total_final += int(set_counts["final_count"])
 
     report: JsonObject = {
+        "build_summary": dict(build_summary),
         "report_schema_version": RUN_REPORT_SCHEMA_VERSION,
         "run_id": run_id,
         "metric_notice": (
@@ -557,6 +558,7 @@ def _reject_sensitive_keys(value: Any) -> None:
 def validate_run_report(report: Mapping[str, Any]) -> None:
     """Strictly validate report totals, ratios, hierarchy, and privacy."""
     expected_top = {
+        "build_summary",
         "report_schema_version",
         "run_id",
         "metric_notice",
